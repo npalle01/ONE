@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-BRM Tool – Single Integrated Version (Fully Enhanced + Fixes)
+BRM Tool – Single Integrated Version (Fully Enhanced)
 Supports:
   • ODBC or In-Memory SQLite
   • Login with seeded users
@@ -13,7 +13,7 @@ Supports:
   • Group Management & User Management (admin only)
   • Global/Critical Admin (enhanced with cycle prevention & re-approvals)
   • Control Tables
-  • Fixed status-filter logic for potential None/Boolean mismatch
+  • Uses "1=1" as a default WHERE clause (to avoid Boolean errors in some SQL engines).
 """
 
 import sys
@@ -27,7 +27,7 @@ from email.mime.text import MIMEText
 from datetime import datetime
 from collections import deque
 
-# Attempt to import pyodbc for ODBC usage
+# Attempt pyodbc import for ODBC usage
 try:
     import pyodbc
 except ImportError:
@@ -45,7 +45,7 @@ from PyQt5.QtWidgets import (
     QSplitter, QCheckBox, QTreeView, QListWidget, QListWidgetItem
 )
 
-# We use pyqtgraph for rule analytics
+# We use pyqtgraph for analytics charts
 import pyqtgraph as pg
 
 ###############################################################################
@@ -66,7 +66,7 @@ EMAIL_CONFIG = {
     "sender_email": "noreply@example.com"
 }
 
-USE_ODBC = False  # Toggled if user picks ODBC connection
+USE_ODBC = False  # Will set this to True if the user picks ODBC
 
 ###############################################################################
 # DB UTILITIES
@@ -115,6 +115,7 @@ class DatabaseConnectionDialog(QDialog):
         self.conn_type_combo = QComboBox()
         self.conn_type_combo.addItem("In-Memory SQLite", "memory")
 
+        # If pyodbc is installed, enumerate SQL Server DSNs
         if pyodbc:
             try:
                 dsn_dict = pyodbc.dataSources()
@@ -352,7 +353,6 @@ def create_tables_and_seed(conn):
     );
     """)
 
-    # Seed data
     groups = [
         ("Admin","Admin group","admin@example.com"),
         ("BG1","Group1","bg1@example.com"),
@@ -391,7 +391,6 @@ def create_tables_and_seed(conn):
     c.execute("INSERT OR IGNORE INTO BUSINESS_GROUP_APPROVERS(GROUP_NAME,USERNAME) VALUES('BG2','bg2_user')")
     c.execute("INSERT OR IGNORE INTO BUSINESS_GROUP_APPROVERS(GROUP_NAME,USERNAME) VALUES('BG3','bg3_user')")
 
-    # Example rule groups
     c.execute("INSERT OR IGNORE INTO BRM_RULE_GROUPS(GROUP_NAME,DESCRIPTION) VALUES('Finance Rules','Finance data rules')")
     c.execute("INSERT OR IGNORE INTO BRM_RULE_GROUPS(GROUP_NAME,DESCRIPTION) VALUES('HR Rules','HR data rules')")
 
@@ -405,13 +404,26 @@ def add_audit_log(conn, action, table_name, record_id, action_by, old_data, new_
     c.execute("""
     INSERT INTO BRM_AUDIT_LOG(ACTION,TABLE_NAME,RECORD_ID,ACTION_BY,OLD_DATA,NEW_DATA)
     VALUES(?,?,?,?,?,?)
-    """,(action,table_name,str(record_id),action_by,
-         json.dumps(old_data) if old_data else None,
-         json.dumps(new_data) if new_data else None))
+    """,(
+        action,
+        table_name,
+        str(record_id),
+        action_by,
+        json.dumps(old_data) if old_data else None,
+        json.dumps(new_data) if new_data else None
+    ))
     conn.commit()
 
 ###############################################################################
-# RULE UTILS (Add, Update, Delete, etc.) + BFS Execution
+# HELPER: BUILD FILTER WHERE CLAUSE
+###############################################################################
+def build_filter_where_clause(filters):
+    if not filters:
+        return "1=1"  # Instead of plain "1", which can cause issues in some SQL engines
+    return " AND ".join(filters)
+
+###############################################################################
+# RULE UTILS (Add, Update, Delete, BFS Execution, etc.)
 ###############################################################################
 def get_op_type_from_sql(sql_text: str) -> str:
     txt = sql_text.strip().upper()
@@ -430,7 +442,7 @@ def extract_tables(sql_text: str):
     tokens = re.split(r"\s+", sql_text.strip())
     for i, t in enumerate(tokens):
         if t.upper() in ("FROM", "JOIN"):
-            if i+1 < len(tokens):
+            if i + 1 < len(tokens):
                 tbl = re.sub(r"[;(),]", "", tokens[i+1])
                 found.append(("", tbl))
     return list(set(found))
@@ -445,7 +457,7 @@ def run_rule_sql(conn, rule_sql):
         pass_fail = list(row.values())[0]
         return (pass_fail == 1)
     except Exception as ex:
-        logger.error("Rule execution error: "+str(ex))
+        logger.error("Rule execution error: " + str(ex))
         return False
 
 def build_rule_adjacency(conn):
@@ -481,7 +493,7 @@ def get_all_rules_as_dict(conn):
     c = conn.cursor()
     c.execute("SELECT * FROM BRM_RULES")
     rows = get_cursor_rows(c)
-    return {r["RULE_ID"]:r for r in rows}
+    return {r["RULE_ID"]: r for r in rows}
 
 def skip_descendants(child_id, children_map, skipped):
     stack = [child_id]
@@ -496,7 +508,7 @@ def skip_descendants(child_id, children_map, skipped):
 def execute_rules_in_order(conn):
     """
     BFS-based rule execution that stops children if a rule fails
-    and is marked critical/global with scope != NONE.
+    and the rule is critical/global with scope != NONE.
     """
     children_map, root_rules = build_rule_adjacency(conn)
     gcr_links = load_global_critical_links(conn)
@@ -510,7 +522,7 @@ def execute_rules_in_order(conn):
         if rid in skipped:
             continue
         if rid not in rule_lookup:
-            logger.warning("Rule not found: "+str(rid))
+            logger.warning("Rule not found: " + str(rid))
             continue
 
         rinfo = rule_lookup[rid]
@@ -570,7 +582,7 @@ def create_multistep_approvals(conn, rule_id, impacted_bg_list):
     c = conn.cursor()
     stage_counter = 1
     stage_list = []
-    MULTISTEP_ORDER = ["BG1","BG2","BG3","FINAL"]
+    MULTISTEP_ORDER = ["BG1", "BG2", "BG3", "FINAL"]
     for step in MULTISTEP_ORDER:
         if step == "FINAL":
             stage_list.append((step, stage_counter))
@@ -762,7 +774,6 @@ def update_rule(conn, rule_data, updated_by, user_group):
     add_audit_log(conn, "UPDATE", "BRM_RULES", rule_data["RULE_ID"], updated_by, old_data, new_data)
     conn.commit()
 
-    # If rule was global or is now global => skip multi-step approvals
     if old["IS_GLOBAL"] == 1 or rule_data.get("IS_GLOBAL", 0) == 1:
         logger.info("Skipping multi-step approvals for global rule update.")
     else:
@@ -955,11 +966,11 @@ class RuleEditorDialog(QDialog):
         left_layout.addRow("Critical Rule?", self.critical_checkbox)
 
         self.scope_combo = QComboBox()
-        self.scope_combo.addItems(["NONE", "GROUP", "CLUSTER", "GLOBAL"])
+        self.scope_combo.addItems(["NONE","GROUP","CLUSTER","GLOBAL"])
         left_layout.addRow("Critical Scope:", self.scope_combo)
 
         self.cdc_combo = QComboBox()
-        self.cdc_combo.addItems(["NONE", "FULL_LOAD", "INCREMENTAL", "INSERT_ONLY", "UPSERT"])
+        self.cdc_combo.addItems(["NONE","FULL_LOAD","INCREMENTAL","INSERT_ONLY","UPSERT"])
         left_layout.addRow("CDC Type:", self.cdc_combo)
 
         main_layout.addWidget(left_box)
@@ -1003,38 +1014,32 @@ class RuleEditorDialog(QDialog):
             if idx2 >= 0:
                 self.parent_rule_combo.setCurrentIndex(idx2)
         self.name_edit.setText(rd["RULE_NAME"])
-
-        # Match rule type
+        # rule type
         for nm, tid in self.rule_types.items():
             if tid == rd["RULE_TYPE_ID"]:
                 i = self.type_combo.findText(nm)
                 if i >= 0:
                     self.type_combo.setCurrentIndex(i)
                 break
-
         st = rd["STATUS"]
         i_st = self.status_combo.findText(st)
         if i_st >= 0:
             self.status_combo.setCurrentIndex(i_st)
-
         try:
             sdt = datetime.strptime(rd["EFFECTIVE_START_DATE"], "%Y-%m-%d %H:%M:%S")
             self.start_dt.setDateTime(QtCore.QDateTime(sdt))
         except:
             pass
-
         if rd["EFFECTIVE_END_DATE"]:
             try:
                 edt = datetime.strptime(rd["EFFECTIVE_END_DATE"], "%Y-%m-%d %H:%M:%S")
                 self.end_dt.setDateTime(QtCore.QDateTime(edt))
             except:
                 pass
-
         og = rd["OWNER_GROUP"]
         iog = self.owner_grp_combo.findText(og)
         if iog >= 0:
             self.owner_grp_combo.setCurrentIndex(iog)
-
         self.sql_editor.setPlainText(rd["RULE_SQL"] or "")
         if rd.get("DESCRIPTION"):
             self.description_edit.setText(rd["DESCRIPTION"])
@@ -1113,7 +1118,7 @@ class RuleAnalyticsDialog(QDialog):
         super().__init__(parent)
         self.connection = connection
         self.setWindowTitle("Rule Analytics")
-        self.resize(800,600)
+        self.resize(800, 600)
 
         layout = QVBoxLayout(self)
         chart_hbox = QHBoxLayout()
@@ -1155,7 +1160,6 @@ class RuleAnalyticsDialog(QDialog):
         if drow:
             status_counts["DELETED"] = drow["delcnt"]
 
-        # Bar chart
         self.bar_chart.clear()
         if creators:
             sorted_creators = sorted(creators.items(), key=lambda x: x[1], reverse=True)
@@ -1169,13 +1173,12 @@ class RuleAnalyticsDialog(QDialog):
             self.bar_chart.setLabel("bottom", "Created By")
             self.bar_chart.showGrid(x=True, y=True)
 
-        # Pie chart
         self.pie_chart.clear()
         total = sum(status_counts.values())
         if total > 0:
-            angles = [360*(v/total) for v in status_counts.values()]
+            angles = [360 * (v / total) for v in status_counts.values()]
             start = 90
-            color_map = {"ACTIVE":"green","INACTIVE":"red","DELETED":"gray"}
+            color_map = {"ACTIVE": "green", "INACTIVE": "red", "DELETED": "gray"}
             scene = self.pie_chart.scene()
             if not scene:
                 from PyQt5.QtWidgets import QGraphicsScene
@@ -1187,26 +1190,23 @@ class RuleAnalyticsDialog(QDialog):
                 k = keys[i]
                 if ang > 0:
                     wedge = QtGui.QPainterPath()
-                    wedge.moveTo(0,0)
-                    wedge.arcTo(-100,-100,200,200,start,ang)
+                    wedge.moveTo(0, 0)
+                    wedge.arcTo(-100, -100, 200, 200, start, ang)
                     wedge.closeSubpath()
-                    brush = QtGui.QBrush(QtGui.QColor(color_map.get(k,"blue")))
+                    brush = QtGui.QBrush(QtGui.QColor(color_map.get(k, "blue")))
                     path_item = pg.QtWidgets.QGraphicsPathItem(wedge)
                     path_item.setBrush(brush)
                     path_item.setPen(pg.mkPen("black"))
                     scene.addItem(path_item)
-
-                    mid = start + (ang/2)
-                    rad = (mid*math.pi)/180
-                    xx = 50*math.cos(rad)
-                    yy = 50*math.sin(rad)
-                    perc = int((ang/360)*100)
-                    lab = pg.TextItem(f"{k} ({perc}%)", anchor=(0.5,0.5))
-                    lab.setPos(xx,yy)
+                    mid = start + (ang / 2)
+                    rad = (mid * math.pi) / 180
+                    xx = 50 * math.cos(rad)
+                    yy = 50 * math.sin(rad)
+                    perc = int((ang / 360) * 100)
+                    lab = pg.TextItem(f"{k} ({perc}%)", anchor=(0.5, 0.5))
+                    lab.setPos(xx, yy)
                     scene.addItem(lab)
-
                     start += ang
-
             self.pie_chart.setAspectLocked(True)
 
 ###############################################################################
@@ -1218,7 +1218,7 @@ class AuditLogViewer(QDialog):
         self.connection = connection
         self.user_group = user_group
         self.setWindowTitle("Audit Logs")
-        self.resize(800,600)
+        self.resize(800, 600)
 
         layout = QVBoxLayout(self)
 
@@ -1230,7 +1230,7 @@ class AuditLogViewer(QDialog):
         top_h.addWidget(self.search_edit)
         layout.addLayout(top_h)
 
-        self.audit_table = QTableWidget(0,8)
+        self.audit_table = QTableWidget(0, 8)
         self.audit_table.setHorizontalHeaderLabels(["Audit ID","Action","Table","Record ID","Action By","Old Data","New Data","Timestamp"])
         self.audit_table.horizontalHeader().setStretchLastSection(True)
         self.audit_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1257,11 +1257,11 @@ class AuditLogViewer(QDialog):
         for row in rows:
             r = self.audit_table.rowCount()
             self.audit_table.insertRow(r)
-            self.audit_table.setItem(r,0,QTableWidgetItem(str(row["AUDIT_ID"])))
-            self.audit_table.setItem(r,1,QTableWidgetItem(row["ACTION"]))
-            self.audit_table.setItem(r,2,QTableWidgetItem(row["TABLE_NAME"]))
-            self.audit_table.setItem(r,3,QTableWidgetItem(row["RECORD_ID"]))
-            self.audit_table.setItem(r,4,QTableWidgetItem(row["ACTION_BY"]))
+            self.audit_table.setItem(r, 0, QTableWidgetItem(str(row["AUDIT_ID"])))
+            self.audit_table.setItem(r, 1, QTableWidgetItem(row["ACTION"]))
+            self.audit_table.setItem(r, 2, QTableWidgetItem(row["TABLE_NAME"]))
+            self.audit_table.setItem(r, 3, QTableWidgetItem(row["RECORD_ID"]))
+            self.audit_table.setItem(r, 4, QTableWidgetItem(row["ACTION_BY"]))
 
             oldtxt = ""
             if row["OLD_DATA"]:
@@ -1270,7 +1270,7 @@ class AuditLogViewer(QDialog):
                     oldtxt = json.dumps(p, indent=2)
                 except:
                     oldtxt = row["OLD_DATA"]
-            self.audit_table.setItem(r,5,QTableWidgetItem(oldtxt))
+            self.audit_table.setItem(r, 5, QTableWidgetItem(oldtxt))
 
             newtxt = ""
             if row["NEW_DATA"]:
@@ -1279,17 +1279,16 @@ class AuditLogViewer(QDialog):
                     newtxt = json.dumps(p2, indent=2)
                 except:
                     newtxt = row["NEW_DATA"]
-            self.audit_table.setItem(r,6,QTableWidgetItem(newtxt))
+            self.audit_table.setItem(r, 6, QTableWidgetItem(newtxt))
 
-            self.audit_table.setItem(r,7,QTableWidgetItem(str(row["ACTION_TIMESTAMP"])))
+            self.audit_table.setItem(r, 7, QTableWidgetItem(str(row["ACTION_TIMESTAMP"])))
 
     def perform_search(self, text):
         txt_l = text.lower()
         for row in range(self.audit_table.rowCount()):
             match = False
-            # Searching in columns Action (1), Table (2), Action By (4)
-            for col in (1,2,4):
-                it = self.audit_table.item(row,col)
+            for col in (1, 2, 4):
+                it = self.audit_table.item(row, col)
                 if it and txt_l in it.text().lower():
                     match = True
                     break
@@ -1339,7 +1338,7 @@ class SearchRuleDialog(QDialog):
             WHERE (RULE_NAME LIKE ? OR RULE_SQL LIKE ?)
             ORDER BY RULE_ID DESC
             LIMIT 1000
-            """,(f"%{txt}%", f"%{txt}%"))
+            """, (f"%{txt}%", f"%{txt}%"))
         else:
             c.execute("""
             SELECT RULE_ID,RULE_NAME,RULE_SQL,STATUS,VERSION,CREATED_BY
@@ -1352,12 +1351,12 @@ class SearchRuleDialog(QDialog):
         for row in rows:
             r = self.res_table.rowCount()
             self.res_table.insertRow(r)
-            self.res_table.setItem(r,0,QTableWidgetItem(str(row["RULE_ID"])))
-            self.res_table.setItem(r,1,QTableWidgetItem(row["RULE_NAME"]))
-            self.res_table.setItem(r,2,QTableWidgetItem(row["RULE_SQL"]))
-            self.res_table.setItem(r,3,QTableWidgetItem(row["STATUS"]))
-            self.res_table.setItem(r,4,QTableWidgetItem(str(row["VERSION"])))
-            self.res_table.setItem(r,5,QTableWidgetItem(row["CREATED_BY"]))
+            self.res_table.setItem(r, 0, QTableWidgetItem(str(row["RULE_ID"])))
+            self.res_table.setItem(r, 1, QTableWidgetItem(row["RULE_NAME"]))
+            self.res_table.setItem(r, 2, QTableWidgetItem(row["RULE_SQL"]))
+            self.res_table.setItem(r, 3, QTableWidgetItem(row["STATUS"]))
+            self.res_table.setItem(r, 4, QTableWidgetItem(str(row["VERSION"])))
+            self.res_table.setItem(r, 5, QTableWidgetItem(row["CREATED_BY"]))
 
 ###############################################################################
 # RULE DASHBOARD (list, pagination, run ETL)
@@ -1382,11 +1381,10 @@ class RuleDashboard(QGroupBox):
         top_h.addWidget(self.search_edit)
 
         self.status_filter = QComboBox()
-        # We'll store all statuses as *strings* to avoid the None/Boolean mismatch
         self.status_filter.addItem("All Statuses", None)
-        self.status_filter.addItem("ACTIVE", "ACTIVE")
-        self.status_filter.addItem("INACTIVE", "INACTIVE")
-        self.status_filter.addItem("DELETED", "DELETED")
+        self.status_filter.addItem("ACTIVE","ACTIVE")
+        self.status_filter.addItem("INACTIVE","INACTIVE")
+        self.status_filter.addItem("DELETED","DELETED")
         top_h.addWidget(QLabel("Status:"))
         top_h.addWidget(self.status_filter)
 
@@ -1436,7 +1434,7 @@ class RuleDashboard(QGroupBox):
     def run_etl(self):
         executed, skipped = execute_rules_in_order(self.connection)
         msg = f"ETL finished.\nExecuted: {executed}\nSkipped: {list(skipped)}"
-        QMessageBox.information(self,"ETL",msg)
+        QMessageBox.information(self,"ETL", msg)
         self.load_rules()
 
     def show_analytics(self):
@@ -1446,24 +1444,21 @@ class RuleDashboard(QGroupBox):
     def build_filter_query(self):
         filters = []
         params = []
+
         txt = self.search_edit.text().strip()
         if txt:
             filters.append("(RULE_NAME LIKE ? OR RULE_SQL LIKE ?)")
             params.extend([f"%{txt}%", f"%{txt}%"])
 
         st = self.status_filter.currentData()
-        # st could be None or a string like "ACTIVE"/"INACTIVE"/"DELETED"
-        if isinstance(st, str):
-            # If user picked "DELETED"
-            if st.upper() == "DELETED":
+        if st:
+            if str(st).upper() == "DELETED":
                 filters.append("RULE_ID IN (SELECT RECORD_ID FROM BRM_AUDIT_LOG WHERE ACTION='DELETE')")
             else:
-                # "ACTIVE" or "INACTIVE"
                 filters.append("STATUS=?")
                 params.append(st)
-        # If st is None => "All Statuses," do nothing
 
-        clause = " AND ".join(filters) if filters else "1"
+        clause = build_filter_where_clause(filters)  # uses "1=1" if no filters
         return clause, params
 
     def load_rules(self):
@@ -1493,19 +1488,19 @@ class RuleDashboard(QGroupBox):
         for rd in rows:
             r = self.rule_table.rowCount()
             self.rule_table.insertRow(r)
-            self.rule_table.setItem(r,0,QTableWidgetItem(str(rd["RULE_ID"])))
-            self.rule_table.setItem(r,1,QTableWidgetItem(rd["RULE_NAME"]))
-            self.rule_table.setItem(r,2,QTableWidgetItem(rd["RULE_SQL"]))
+            self.rule_table.setItem(r, 0, QTableWidgetItem(str(rd["RULE_ID"])))
+            self.rule_table.setItem(r, 1, QTableWidgetItem(rd["RULE_NAME"]))
+            self.rule_table.setItem(r, 2, QTableWidgetItem(rd["RULE_SQL"]))
             st_item = QTableWidgetItem(rd["STATUS"])
             if rd["STATUS"].lower() == "active":
                 st_item.setBackground(QColor(144,238,144))
             else:
                 st_item.setBackground(QColor(255,182,193))
-            self.rule_table.setItem(r,3, st_item)
-            self.rule_table.setItem(r,4,QTableWidgetItem(str(rd["VERSION"])))
-            self.rule_table.setItem(r,5,QTableWidgetItem(rd["OWNER_GROUP"]))
-            self.rule_table.setItem(r,6,QTableWidgetItem(str(rd["CREATED_TIMESTAMP"])))
-            self.rule_table.setItem(r,7,QTableWidgetItem(rd["APPROVAL_STATUS"]))
+            self.rule_table.setItem(r, 3, st_item)
+            self.rule_table.setItem(r, 4, QTableWidgetItem(str(rd["VERSION"])))
+            self.rule_table.setItem(r, 5, QTableWidgetItem(rd["OWNER_GROUP"]))
+            self.rule_table.setItem(r, 6, QTableWidgetItem(str(rd["CREATED_TIMESTAMP"])))
+            self.rule_table.setItem(r, 7, QTableWidgetItem(rd["APPROVAL_STATUS"]))
 
     def update_selected_rule_id(self):
         sel = self.rule_table.selectedItems()
@@ -1513,7 +1508,7 @@ class RuleDashboard(QGroupBox):
             self.selected_rule_id = None
             return
         row = sel[0].row()
-        it = self.rule_table.item(row,0)
+        it = self.rule_table.item(row, 0)
         if it:
             self.selected_rule_id = int(it.text())
         else:
@@ -1524,7 +1519,7 @@ class RuleDashboard(QGroupBox):
         rids = []
         for i in idxs:
             row = i.row()
-            it = self.rule_table.item(row,0)
+            it = self.rule_table.item(row, 0)
             if it:
                 rids.append(int(it.text()))
         return rids
@@ -1595,13 +1590,13 @@ class BusinessRuleManagementTab(QWidget):
     def on_update_rule(self):
         rid = self.rule_dash.selected_rule_id
         if not rid:
-            QMessageBox.warning(self,"No Selection","Select a rule first.")
+            QMessageBox.warning(self, "No Selection", "Select a rule first.")
             return
         c = self.connection.cursor()
         c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rid,))
         row = get_cursor_one(c)
         if not row:
-            QMessageBox.warning(self,"Not Found","No rule with that ID.")
+            QMessageBox.warning(self, "Not Found", "No rule with that ID.")
             return
         rule_data = dict(row)
         rtypes = self.main_app.get_rule_types()
@@ -1612,7 +1607,7 @@ class BusinessRuleManagementTab(QWidget):
     def on_deactivate_rules(self):
         rids = self.rule_dash.get_selected_rule_ids()
         if not rids:
-            QMessageBox.warning(self,"None","No rules selected.")
+            QMessageBox.warning(self, "None", "No rules selected.")
             return
         success = 0
         fails = []
@@ -1625,15 +1620,15 @@ class BusinessRuleManagementTab(QWidget):
         msg = f"Deactivation done. success={success}"
         if fails:
             msg += "\nFails:\n" + "\n".join(fails)
-        QMessageBox.information(self,"Deactivate", msg)
+        QMessageBox.information(self, "Deactivate", msg)
         self.rule_dash.load_rules()
 
     def on_delete_rule(self):
         rids = self.rule_dash.get_selected_rule_ids()
         if not rids:
-            QMessageBox.warning(self,"None","No rule(s) selected.")
+            QMessageBox.warning(self, "None", "No rule(s) selected.")
             return
-        confirm = QMessageBox.question(self,"Confirm", f"Delete {len(rids)} rule(s)?")
+        confirm = QMessageBox.question(self, "Confirm", f"Delete {len(rids)} rule(s)?")
         if confirm != QMessageBox.Yes:
             return
         success = 0
@@ -1647,7 +1642,7 @@ class BusinessRuleManagementTab(QWidget):
         msg = f"Deletion done. success={success}"
         if fails:
             msg += "\nFails:\n" + "\n".join(fails)
-        QMessageBox.information(self,"Delete", msg)
+        QMessageBox.information(self, "Delete", msg)
         self.rule_dash.load_rules()
 
 ###############################################################################
@@ -1864,44 +1859,43 @@ class GroupManagementTab(QWidget):
         idx = self.groups_table.currentRow()
         if idx < 0:
             return None
-        it = self.groups_table.item(idx,0)
+        it = self.groups_table.item(idx, 0)
         if not it:
             return None
         return it.text().strip()
 
     def on_add_group(self):
-        name,ok = QInputDialog.getText(self,"Add Group","Group Name:")
+        name, ok = QInputDialog.getText(self, "Add Group", "Group Name:")
         if not ok or not name.strip():
             return
-        desc, ok2 = QInputDialog.getText(self,"Add Group","Description:")
+        desc, ok2 = QInputDialog.getText(self, "Add Group", "Description:")
         if not ok2:
-            desc=""
-        email, ok3 = QInputDialog.getText(self,"Add Group","Email:")
+            desc = ""
+        email, ok3 = QInputDialog.getText(self, "Add Group", "Email:")
         if not ok3:
-            email=""
+            email = ""
         c = self.connection.cursor()
         c.execute("SELECT * FROM BUSINESS_GROUPS WHERE GROUP_NAME=?", (name.strip(),))
         if get_cursor_one(c):
-            QMessageBox.warning(self,"Error","Group already exists.")
+            QMessageBox.warning(self, "Error", "Group already exists.")
             return
-        c.execute("INSERT INTO BUSINESS_GROUPS(GROUP_NAME,DESCRIPTION,EMAIL) VALUES(?,?,?)",
-                  (name.strip(),desc.strip(),email.strip()))
+        c.execute("INSERT INTO BUSINESS_GROUPS(GROUP_NAME,DESCRIPTION,EMAIL) VALUES(?,?,?)",(name.strip(), desc.strip(), email.strip()))
         self.connection.commit()
-        QMessageBox.information(self,"Success","Group added.")
+        QMessageBox.information(self, "Success", "Group added.")
         self.load_data()
 
     def on_rename_group(self):
         grp = self.get_selected_group()
         if not grp:
-            QMessageBox.warning(self,"No selection","No group selected.")
+            QMessageBox.warning(self, "No selection", "No group selected.")
             return
-        new_name, ok = QInputDialog.getText(self,"Rename Group","New group name:")
+        new_name, ok = QInputDialog.getText(self, "Rename Group", "New group name:")
         if not ok or not new_name.strip():
             return
         c = self.connection.cursor()
         c.execute("SELECT * FROM BUSINESS_GROUPS WHERE GROUP_NAME=?", (new_name.strip(),))
         if get_cursor_one(c):
-            QMessageBox.warning(self,"Error","New group name already exists.")
+            QMessageBox.warning(self, "Error", "New group name already exists.")
             return
         try:
             c.execute("BEGIN")
@@ -1909,13 +1903,13 @@ class GroupManagementTab(QWidget):
             c.execute("UPDATE BRM_RULES SET OWNER_GROUP=? WHERE OWNER_GROUP=?", (new_name.strip(), grp))
             c.execute("UPDATE BRM_RULE_GROUPS SET GROUP_NAME=? WHERE GROUP_NAME=?", (new_name.strip(), grp))
             c.execute("COMMIT")
-            add_audit_log(self.connection, "RENAME_GROUP", "BUSINESS_GROUPS", grp, "Admin",
-                          {"old_group_name": grp}, {"new_group_name": new_name.strip()})
-            QMessageBox.information(self,"Renamed",f"Renamed to {new_name}")
+            add_audit_log(self.connection,"RENAME_GROUP","BUSINESS_GROUPS",grp,"Admin",
+                          {"old_group_name": grp},{"new_group_name": new_name.strip()})
+            QMessageBox.information(self, "Renamed", f"Renamed to {new_name}")
             self.load_data()
         except Exception as ex:
             c.execute("ROLLBACK")
-            QMessageBox.critical(self,"Error",str(ex))
+            QMessageBox.critical(self, "Error", str(ex))
 
     def on_delete_group(self):
         grp = self.get_selected_group()
@@ -1932,7 +1926,7 @@ class GroupManagementTab(QWidget):
             QMessageBox.information(self,"Deleted","Group deleted.")
             self.load_data()
         except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
+            QMessageBox.critical(self,"Error", str(ex))
 
     def on_backup_group(self):
         grp = self.get_selected_group()
@@ -1951,14 +1945,13 @@ class GroupManagementTab(QWidget):
             QMessageBox.warning(self,"No selection","No group selected.")
             return
         c = self.connection.cursor()
-        c.execute("SELECT BACKUP_VERSION,BACKUP_TIMESTAMP FROM BRM_GROUP_BACKUPS WHERE GROUP_NAME=? ORDER BY BACKUP_VERSION DESC",
-                  (grp,))
+        c.execute("SELECT BACKUP_VERSION,BACKUP_TIMESTAMP FROM BRM_GROUP_BACKUPS WHERE GROUP_NAME=? ORDER BY BACKUP_VERSION DESC", (grp,))
         rows = get_cursor_rows(c)
         if not rows:
             QMessageBox.information(self,"None",f"No backups for {grp}")
             return
         items = [f"Version {r['BACKUP_VERSION']} (ts {r['BACKUP_TIMESTAMP']})" for r in rows]
-        sel, ok = QInputDialog.getItem(self,"Restore Group","Choose version:",items,0,False)
+        sel, ok = QInputDialog.getItem(self,"Restore Group","Choose version:", items, 0, False)
         if not ok:
             return
         m = re.search(r"Version\s+(\d+)", sel)
@@ -1979,7 +1972,7 @@ class GroupManagementTab(QWidget):
         rr = self.users_table.currentRow()
         if rr < 0:
             return None
-        it = self.users_table.item(rr,0)
+        it = self.users_table.item(rr, 0)
         if not it:
             return None
         return int(it.text())
@@ -2074,8 +2067,7 @@ class GroupManagementTab(QWidget):
         if not row:
             QMessageBox.warning(self,"Error","User not found.")
             return
-        c.execute("INSERT OR IGNORE INTO BUSINESS_GROUP_APPROVERS(GROUP_NAME,USERNAME) VALUES(?,?)",
-                  (grp.strip(), username.strip()))
+        c.execute("INSERT OR IGNORE INTO BUSINESS_GROUP_APPROVERS(GROUP_NAME,USERNAME) VALUES(?,?)",(grp.strip(), username.strip()))
         self.connection.commit()
         QMessageBox.information(self,"Added",f"{username} => {grp}")
         self.load_approvers()
@@ -2123,7 +2115,7 @@ class BackupRestoreHelpers:
             rd["column_mappings"] = get_cursor_rows(c)
             data["rules"].append(rd)
         js = json.dumps(data, default=str)
-        c.execute("SELECT COALESCE(MAX(BACKUP_VERSION),0) as mv FROM BRM_GROUP_BACKUPS WHERE GROUP_NAME=?", (group_name,))
+        c.execute("SELECT COALESCE(MAX(BACKUP_VERSION), 0) as mv FROM BRM_GROUP_BACKUPS WHERE GROUP_NAME=?", (group_name,))
         row = get_cursor_one(c)
         nextv = row["mv"] + 1
         c.execute("INSERT INTO BRM_GROUP_BACKUPS(GROUP_NAME,BACKUP_VERSION,BACKUP_JSON) VALUES(?,?,?)",(group_name, nextv, js))
@@ -2147,7 +2139,7 @@ class BackupRestoreHelpers:
         c.execute("DELETE FROM BRM_RULE_LINEAGE WHERE RULE_ID IN (SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=?)",(group_name,))
         c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID IN (SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=?)",(group_name,))
         c.execute("DELETE FROM BRM_COLUMN_MAPPING WHERE RULE_ID IN (SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=?)",(group_name,))
-        c.execute("DELETE FROM BRM_RULES WHERE OWNER_GROUP=?", (group_name,))
+        c.execute("DELETE FROM BRM_RULES WHERE OWNER_GROUP=?",(group_name,))
 
         for rdict in data["rules"]:
             c.execute("""
@@ -2159,13 +2151,13 @@ class BackupRestoreHelpers:
                 IS_GLOBAL,CRITICAL_RULE,CRITICAL_SCOPE,CDC_TYPE
             )
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,(
+            """, (
                 rdict["RULE_ID"], rdict["PARENT_RULE_ID"], rdict["RULE_TYPE_ID"],
                 rdict["RULE_NAME"], rdict["RULE_SQL"], rdict["EFFECTIVE_START_DATE"],
                 rdict["EFFECTIVE_END_DATE"], rdict["STATUS"], rdict["VERSION"],
                 rdict["CREATED_BY"], rdict["DESCRIPTION"], rdict["OPERATION_TYPE"],
                 rdict["BUSINESS_JUSTIFICATION"], rdict["CREATED_TIMESTAMP"], rdict["UPDATED_BY"],
-                rdict["OWNER_GROUP"], rdict.get("CLUSTER_NAME",""), rdict.get("GROUP_ID",None),
+                rdict["OWNER_GROUP"], rdict.get("CLUSTER_NAME",""), rdict.get("GROUP_ID", None),
                 rdict.get("APPROVAL_STATUS","DRAFT"), rdict.get("IS_GLOBAL",0),
                 rdict.get("CRITICAL_RULE",0), rdict.get("CRITICAL_SCOPE","NONE"),
                 rdict.get("CDC_TYPE","NONE")
@@ -2176,13 +2168,13 @@ class BackupRestoreHelpers:
                 INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
                     DEPENDENCY_ID,RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME
                 ) VALUES(?,?,?,?,?)
-                """,(d["DEPENDENCY_ID"], rid, d["DATABASE_NAME"], d["TABLE_NAME"], d["COLUMN_NAME"]))
+                """, (d["DEPENDENCY_ID"], rid, d["DATABASE_NAME"], d["TABLE_NAME"], d["COLUMN_NAME"]))
             for l_ in rdict.get("lineage", []):
                 c.execute("""
                 INSERT INTO BRM_RULE_LINEAGE(
                     LINEAGE_ID,RULE_ID,SOURCE_INFO,TARGET_INFO,TRANSFORMATION_DETAILS,CREATED_TIMESTAMP
                 ) VALUES(?,?,?,?,?,?)
-                """,(l_["LINEAGE_ID"], rid, l_["SOURCE_INFO"], l_["TARGET_INFO"], l_["TRANSFORMATION_DETAILS"], l_["CREATED_TIMESTAMP"]))
+                """, (l_["LINEAGE_ID"], rid, l_["SOURCE_INFO"], l_["TARGET_INFO"], l_["TRANSFORMATION_DETAILS"], l_["CREATED_TIMESTAMP"]))
             for m_ in rdict.get("column_mappings", []):
                 c.execute("""
                 INSERT INTO BRM_COLUMN_MAPPING(
@@ -2191,8 +2183,7 @@ class BackupRestoreHelpers:
                 """,(m_["MAPPING_ID"], m_["RULE_ID"], m_["SOURCE_RULE_ID"], m_["SOURCE_COLUMN_NAME"], m_["TARGET_COLUMN_NAME"]))
 
         conn.commit()
-        add_audit_log(conn,"RESTORE","BRM_RULES",group_name,action_by,
-                      {"group":group_name,"version":backup_version},None)
+        add_audit_log(conn,"RESTORE","BRM_RULES",group_name,action_by,{"group":group_name,"version":backup_version},None)
 
     @staticmethod
     def backup_custom_group(conn, custom_group_id, action_by="System"):
@@ -2238,10 +2229,9 @@ class BackupRestoreHelpers:
         c.execute("""
         INSERT INTO BRM_CUSTOM_GROUP_BACKUPS(CUSTOM_GROUP_ID,BACKUP_VERSION,BACKUP_JSON)
         VALUES(?,?,?)
-        """,(custom_group_id, nextv, js))
+        """, (custom_group_id, nextv, js))
         conn.commit()
-        add_audit_log(conn,"BACKUP_CUSTOM_GROUP","BRM_CUSTOM_GROUP_BACKUPS",custom_group_id,action_by,
-                      {"cgid":custom_group_id},{"version":nextv})
+        add_audit_log(conn,"BACKUP_CUSTOM_GROUP","BRM_CUSTOM_GROUP_BACKUPS",custom_group_id,action_by,{"cgid":custom_group_id},{"version":nextv})
         return nextv
 
     @staticmethod
@@ -2291,7 +2281,7 @@ class BackupRestoreHelpers:
                 APPROVAL_STATUS,IS_GLOBAL,CRITICAL_RULE,CRITICAL_SCOPE,CDC_TYPE
             )
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,(
+            """, (
                 rd["RULE_ID"], rd["PARENT_RULE_ID"], rd["RULE_TYPE_ID"], rd["RULE_NAME"], rd["RULE_SQL"],
                 rd["EFFECTIVE_START_DATE"], rd["EFFECTIVE_END_DATE"], rd["STATUS"], rd["VERSION"],
                 rd["CREATED_BY"], rd["DESCRIPTION"], rd["OPERATION_TYPE"], rd.get("BUSINESS_JUSTIFICATION",""),
@@ -2301,28 +2291,28 @@ class BackupRestoreHelpers:
                 rd.get("CRITICAL_SCOPE","NONE"), rd.get("CDC_TYPE","NONE")
             ))
             rid = rd["RULE_ID"]
-            for d_ in rd.get("dependencies",[]):
+            for d_ in rd.get("dependencies", []):
                 c.execute("""
-                INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(DEPENDENCY_ID,RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME)
-                VALUES(?,?,?,?,?)
+                INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+                    DEPENDENCY_ID,RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME
+                ) VALUES(?,?,?,?,?)
                 """,(d_["DEPENDENCY_ID"], rid, d_["DATABASE_NAME"], d_["TABLE_NAME"], d_["COLUMN_NAME"]))
-            for l_ in rd.get("lineage",[]):
+            for l_ in rd.get("lineage", []):
                 c.execute("""
                 INSERT INTO BRM_RULE_LINEAGE(
                     LINEAGE_ID,RULE_ID,SOURCE_INFO,TARGET_INFO,TRANSFORMATION_DETAILS,CREATED_TIMESTAMP
                 ) VALUES(?,?,?,?,?,?)
                 """,(l_["LINEAGE_ID"], rid, l_["SOURCE_INFO"], l_["TARGET_INFO"], l_["TRANSFORMATION_DETAILS"], l_["CREATED_TIMESTAMP"]))
-            for m_ in rd.get("column_mappings",[]):
+            for m_ in rd.get("column_mappings", []):
                 c.execute("""
-                INSERT INTO BRM_COLUMN_MAPPING(MAPPING_ID,RULE_ID,SOURCE_RULE_ID,SOURCE_COLUMN_NAME,TARGET_COLUMN_NAME)
-                VALUES(?,?,?,?,?)
-                """,(m_["MAPPING_ID"], m_["RULE_ID"], m_["SOURCE_RULE_ID"],
-                     m_["SOURCE_COLUMN_NAME"], m_["TARGET_COLUMN_NAME"]))
+                INSERT INTO BRM_COLUMN_MAPPING(
+                    MAPPING_ID,RULE_ID,SOURCE_RULE_ID,SOURCE_COLUMN_NAME,TARGET_COLUMN_NAME
+                ) VALUES(?,?,?,?,?)
+                """,(m_["MAPPING_ID"], m_["RULE_ID"], m_["SOURCE_RULE_ID"], m_["SOURCE_COLUMN_NAME"], m_["TARGET_COLUMN_NAME"]))
             c.execute("INSERT OR IGNORE INTO BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID,RULE_ID) VALUES(?,?)",(custom_group_id, rid))
 
         conn.commit()
-        add_audit_log(conn,"RESTORE_CUSTOM_GROUP","BRM_RULE_GROUPS", custom_group_id, action_by,
-                      {"cgid":custom_group_id,"version":backup_version}, None)
+        add_audit_log(conn,"RESTORE_CUSTOM_GROUP","BRM_RULE_GROUPS",custom_group_id,action_by,{"cgid":custom_group_id,"version":backup_version}, None)
 
 ###############################################################################
 # USER MANAGEMENT TAB (ADMIN)
@@ -2398,7 +2388,7 @@ class UserManagementTab(QWidget):
             return
         c = self.connection.cursor()
         try:
-            c.execute("INSERT INTO USERS(USERNAME,PASSWORD,USER_GROUP) VALUES(?,?,?)",(uname.strip(),pw.strip(),grp.strip()))
+            c.execute("INSERT INTO USERS(USERNAME,PASSWORD,USER_GROUP) VALUES(?,?,?)",(uname.strip(), pw.strip(), grp.strip()))
             self.connection.commit()
             QMessageBox.information(self,"Success","User added.")
             self.load_users()
@@ -2430,8 +2420,7 @@ class UserManagementTab(QWidget):
         if not ok3 or not new_grp.strip():
             return
         try:
-            c.execute("UPDATE USERS SET USERNAME=?,PASSWORD=?,USER_GROUP=? WHERE USER_ID=?",
-                      (new_un.strip(), new_pw.strip(), new_grp.strip(), uid))
+            c.execute("UPDATE USERS SET USERNAME=?,PASSWORD=?,USER_GROUP=? WHERE USER_ID=?",(new_un.strip(), new_pw.strip(), new_grp.strip(), uid))
             self.connection.commit()
             QMessageBox.information(self,"Success","User updated.")
             self.load_users()
@@ -2500,7 +2489,7 @@ class HierarchyViewTab(QWidget):
             ungroup = []
             for rr in arr:
                 if rr["GROUP_ID"]:
-                    group_buckets.setdefault(rr["GROUP_ID"],[]).append(rr)
+                    group_buckets.setdefault(rr["GROUP_ID"], []).append(rr)
                 else:
                     ungroup.append(rr)
 
@@ -2526,11 +2515,11 @@ class HierarchyViewTab(QWidget):
                 for r_ in subrules:
                     pid = r_["PARENT_RULE_ID"]
                     if pid and any(x["RULE_ID"] == pid for x in subrules):
-                        submap.setdefault(pid,[]).append(r_)
+                        submap.setdefault(pid, []).append(r_)
 
                 arr_ids = set(x["RULE_ID"] for x in subrules)
                 child_ids = set()
-                for k,v in submap.items():
+                for k, v in submap.items():
                     for x_ in v:
                         child_ids.add(x_["RULE_ID"])
                 real_roots = arr_ids - child_ids
@@ -2545,12 +2534,11 @@ class HierarchyViewTab(QWidget):
                 submap2 = {}
                 for rr2 in ungroup:
                     pid = rr2["PARENT_RULE_ID"]
-                    if pid and any(x["RULE_ID"]==pid for x in ungroup):
-                        submap2.setdefault(pid,[]).append(rr2)
-
+                    if pid and any(x["RULE_ID"] == pid for x in ungroup):
+                        submap2.setdefault(pid, []).append(rr2)
                 arr_ids = set(x["RULE_ID"] for x in ungroup)
                 child_ids = set()
-                for k,v in submap2.items():
+                for k, v in submap2.items():
                     for x_ in v:
                         child_ids.add(x_["RULE_ID"])
                 real_roots = arr_ids - child_ids
@@ -2674,14 +2662,12 @@ class CustomRuleGroupEnhancedTab(QWidget):
             FROM BRM_RULES
             WHERE RULE_NAME LIKE ? OR RULE_SQL LIKE ?
             ORDER BY RULE_ID DESC
-            """, (f"%{txt}%", f"%{txt}%"))
+            """,(f"%{txt}%", f"%{txt}%"))
         else:
             c.execute("SELECT RULE_ID,RULE_NAME,OWNER_GROUP FROM BRM_RULES ORDER BY RULE_ID DESC")
         rows = get_cursor_rows(c)
-
         c.execute("SELECT DISTINCT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS")
         assigned = set(x["RULE_ID"] for x in get_cursor_rows(c))
-
         for r in rows:
             if r["RULE_ID"] in assigned:
                 continue
@@ -2737,8 +2723,7 @@ class CustomRuleGroupEnhancedTab(QWidget):
             return
         c = self.connection.cursor()
         try:
-            c.execute("UPDATE BRM_CUSTOM_RULE_GROUPS SET CUSTOM_GROUP_NAME=? WHERE CUSTOM_GROUP_ID=?",
-                      (new_name.strip(), gid))
+            c.execute("UPDATE BRM_CUSTOM_RULE_GROUPS SET CUSTOM_GROUP_NAME=? WHERE CUSTOM_GROUP_ID=?", (new_name.strip(), gid))
             self.connection.commit()
             QMessageBox.information(self,"Renamed","Group renamed.")
             self.refresh_all()
@@ -2802,7 +2787,7 @@ class CustomRuleGroupEnhancedTab(QWidget):
             QMessageBox.information(self,"None","No backups found.")
             return
         items = [f"Version {r['BACKUP_VERSION']} (ts {r['BACKUP_TIMESTAMP']})" for r in rows]
-        sel, ok = QInputDialog.getItem(self,"Restore","Pick version:", items,0,False)
+        sel, ok = QInputDialog.getItem(self,"Restore","Pick version:", items, 0, False)
         if not ok:
             return
         m = re.search(r"Version\s+(\d+)", sel)
@@ -2838,7 +2823,7 @@ class CustomRuleGroupEnhancedTab(QWidget):
         for it in sel_rules:
             rid = it.data(Qt.UserRole)
             try:
-                c.execute("INSERT OR IGNORE INTO BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID,RULE_ID) VALUES(?,?)",(gid,rid))
+                c.execute("INSERT OR IGNORE INTO BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID,RULE_ID) VALUES(?,?)",(gid, rid))
                 count += 1
             except:
                 pass
@@ -2847,7 +2832,7 @@ class CustomRuleGroupEnhancedTab(QWidget):
         self.refresh_all()
 
 ###############################################################################
-# APPROVAL PIPELINE + MULTISTEP TAB
+# APPROVAL PIPELINE WIDGET
 ###############################################################################
 class ApprovalPipelineWidget(QWidget):
     def __init__(self, stage_status_map, parent=None):
@@ -2872,6 +2857,9 @@ class ApprovalPipelineWidget(QWidget):
             circle.setToolTip(f"{st}: {status}")
             self.layout().addWidget(circle)
 
+###############################################################################
+# MULTI-STEP APPROVAL TAB
+###############################################################################
 class MultiStepApprovalTab(QWidget):
     def __init__(self, connection, logged_in_username, user_group, parent=None):
         super().__init__(parent)
@@ -2948,7 +2936,7 @@ class MultiStepApprovalTab(QWidget):
             approve_btn.clicked.connect(lambda _, row_idx=r: self.do_approve(row_idx))
             self.appr_table.setCellWidget(r,5,approve_btn)
 
-            pipe_map = pipeline_data.get(rd["RULE_ID"],{"BG1":"NotStarted","BG2":"NotStarted","BG3":"NotStarted","FINAL":"NotStarted"})
+            pipe_map = pipeline_data.get(rd["RULE_ID"], {"BG1":"NotStarted","BG2":"NotStarted","BG3":"NotStarted","FINAL":"NotStarted"})
             pipe_widget = ApprovalPipelineWidget(pipe_map)
             self.appr_table.setCellWidget(r,6,pipe_widget)
 
@@ -2964,14 +2952,13 @@ class MultiStepApprovalTab(QWidget):
         UPDATE BRM_RULE_APPROVALS
         SET APPROVED_FLAG=1, APPROVED_TIMESTAMP=CURRENT_TIMESTAMP
         WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=?
-        """, (rule_id, grp, self.logged_in_username))
+        """,(rule_id, grp, self.logged_in_username))
         nxt = get_current_approval_stage(self.connection, rule_id)
         if nxt is None:
             c.execute("UPDATE BRM_RULES SET APPROVAL_STATUS='APPROVED',STATUS='ACTIVE' WHERE RULE_ID=?", (rule_id,))
         else:
             c.execute("UPDATE BRM_RULES SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS',STATUS='INACTIVE' WHERE RULE_ID=?", (rule_id,))
-        add_audit_log(self.connection,"UPDATE","BRM_RULE_APPROVALS", rule_id, self.logged_in_username,
-                      {"APPROVED_FLAG":0}, {"APPROVED_FLAG":1})
+        add_audit_log(self.connection,"UPDATE","BRM_RULE_APPROVALS", rule_id, self.logged_in_username, {"APPROVED_FLAG":0}, {"APPROVED_FLAG":1})
         self.connection.commit()
         QMessageBox.information(self,"Approved",f"You approved rule {rule_id}.")
         self.load_approvals()
@@ -2980,11 +2967,6 @@ class MultiStepApprovalTab(QWidget):
 # ENHANCED LINEAGE GRAPH
 ###############################################################################
 class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
-    """
-    BFS-based lineage graph with rectangle items (DQ) or ellipse (DM).
-    Color-coded for active/inactive, plus global/critical. Also includes naive table nodes.
-    Searching by rule name, SQL, description, justification, or table/column.
-    """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
@@ -3047,12 +3029,12 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
             x = depth * 220
             y = c_so_far * 120
             node_item = self.create_node(rinfo)
-            node_item.setPos(x,y)
+            node_item.setPos(x, y)
             self.scene.addItem(node_item)
             self.node_map[rid] = node_item
             if rid in self.children_map:
                 for ch in self.children_map[rid]:
-                    queue.append((ch, depth+1))
+                    queue.append((ch, depth + 1))
 
         for r in rules:
             pid = r["PARENT_RULE_ID"]
@@ -3072,7 +3054,6 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
                 t_item.setPos(800, len(table_nodes)*60)
                 self.scene.addItem(t_item)
                 table_nodes[key] = t_item
-
             rule_id = dep["RULE_ID"]
             if rule_id in self.node_map:
                 self.draw_edge(self.node_map[rule_id], table_nodes[key], color=QtGui.QColor("darkmagenta"))
@@ -3119,7 +3100,7 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
         p1 = r1.center()
         p2 = r2.center()
         line = QtWidgets.QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
-        line.setPen(QtGui.QPen(color, 2))
+        line.setPen(QtGui.QPen(color,2))
         self.scene.addItem(line)
 
     def resetView(self):
@@ -3129,7 +3110,7 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             item = self.itemAt(event.pos())
-            if isinstance(item,(QtWidgets.QGraphicsRectItem, QtWidgets.QGraphicsEllipseItem)):
+            if isinstance(item, (QtWidgets.QGraphicsRectItem, QtWidgets.QGraphicsEllipseItem)):
                 self.show_rule_details(item.toolTip())
         super().mousePressEvent(event)
 
@@ -3150,7 +3131,7 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
            OR LOWER(DESCRIPTION) LIKE ?
            OR LOWER(BUSINESS_JUSTIFICATION) LIKE ?
            OR CAST(RULE_ID AS TEXT) LIKE ?
-        """,(f"%{ql}%",f"%{ql}%",f"%{ql}%",f"%{ql}%",f"%{ql}%"))
+        """,(f"%{ql}%", f"%{ql}%", f"%{ql}%", f"%{ql}%", f"%{ql}%"))
         rows = get_cursor_rows(c)
         for r in rows:
             found.add(r["RULE_ID"])
@@ -3174,7 +3155,7 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
             found.add(r3["RULE_ID"])
 
         if not found:
-            QMessageBox.information(self,"No Match", f"No match for '{query}'")
+            QMessageBox.information(self,"No Match",f"No match for '{query}'")
             return
 
         for rid in found:
@@ -3280,19 +3261,9 @@ class CtrlTablesTab(QWidget):
                 self.table_view.setItem(r,j,QTableWidgetItem(str(val) if val is not None else ""))
 
 ###############################################################################
-# ENHANCED GLOBAL/CRITICAL ADMIN TAB (FULLY INTEGRATED)
+# ENHANCED GLOBAL/CRITICAL ADMIN TAB (with cycle prevention, re-approvals, etc.)
 ###############################################################################
 class GlobalCriticalAdminTab(QWidget):
-    """
-    Enhanced Global/Critical Admin tab with cycle prevention and re-approvals:
-      - Filter for only G/C or show all
-      - Set IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE at once
-      - If rule was previously approved but is now critical => re-init approvals
-      - If newly set to global => skip approvals
-      - BFS cycle check for link parent->child
-      - “Show Impacted Descendants” to see how many child rules get skipped if it fails
-      - Logging link/unlink
-    """
     def __init__(self, main_app, connection, user_group, parent=None):
         super().__init__(parent)
         self.main_app = main_app
@@ -3492,7 +3463,7 @@ class GlobalCriticalAdminTab(QWidget):
                 continue
 
             new_data = dict(old)
-            old_status = old.get("APPROVAL_STATUS", "DRAFT")
+            old_status = old.get("APPROVAL_STATUS","DRAFT")
 
             new_data["IS_GLOBAL"] = is_global
             new_data["CRITICAL_RULE"] = is_critical
@@ -3510,7 +3481,7 @@ class GlobalCriticalAdminTab(QWidget):
                 c2 = self.connection.cursor()
                 c2.execute("""
                 UPDATE BRM_RULES
-                SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS',STATUS='INACTIVE'
+                SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS', STATUS='INACTIVE'
                 WHERE RULE_ID=?
                 """,(rid,))
                 c2.execute("DELETE FROM BRM_RULE_APPROVALS WHERE RULE_ID=?", (rid,))
@@ -3521,7 +3492,7 @@ class GlobalCriticalAdminTab(QWidget):
                     create_multistep_approvals(self.connection, rid, impacted)
                     logger.info(f"Rule {rid}: re-initiated approvals after turning critical.")
                 else:
-                    logger.info(f"Rule {rid} set to global => skipping multi-step approvals (by design).")
+                    logger.info(f"Rule {rid} set to global => skipping multi-step approvals.")
 
         QMessageBox.information(self,"Done","Global/Critical/Scope updated.")
         self.load_rule_list()
@@ -3559,7 +3530,7 @@ class GlobalCriticalAdminTab(QWidget):
         c.execute("SELECT IS_GLOBAL,CRITICAL_RULE FROM BRM_RULES WHERE RULE_ID=?", (pid,))
         rowp = c.fetchone()
         if not rowp:
-            QMessageBox.warning(self,"No Parent Found", f"Rule {pid} not found.")
+            QMessageBox.warning(self,"No Parent Found",f"Rule {pid} not found.")
             return
         if rowp[0] != 1 and rowp[1] != 1:
             QMessageBox.warning(self,"Invalid Parent","Selected rule is neither global nor critical.")
@@ -3595,8 +3566,7 @@ class GlobalCriticalAdminTab(QWidget):
 
         try:
             c.execute("INSERT OR IGNORE INTO BRM_GLOBAL_CRITICAL_LINKS(GCR_RULE_ID, TARGET_RULE_ID) VALUES(?,?)",(pid,cid))
-            add_audit_log(self.connection, "LINK_GCR", "BRM_GLOBAL_CRITICAL_LINKS", f"{pid}->{cid}", "Admin",
-                          None, {"parent_id":pid, "child_id":cid})
+            add_audit_log(self.connection,"LINK_GCR","BRM_GLOBAL_CRITICAL_LINKS",f"{pid}->{cid}","Admin",None,{"parent_id": pid,"child_id": cid})
             self.connection.commit()
             QMessageBox.information(self,"Linked",f"Child {cid} => parent {pid}")
         except Exception as ex:
@@ -3618,9 +3588,8 @@ class GlobalCriticalAdminTab(QWidget):
             return
         c = self.connection.cursor()
         try:
-            c.execute("DELETE FROM BRM_GLOBAL_CRITICAL_LINKS WHERE GCR_RULE_ID=? AND TARGET_RULE_ID=?", (pid,cid))
-            add_audit_log(self.connection, "UNLINK_GCR", "BRM_GLOBAL_CRITICAL_LINKS", f"{pid}->{cid}", "Admin",
-                          {"parent_id":pid, "child_id":cid}, None)
+            c.execute("DELETE FROM BRM_GLOBAL_CRITICAL_LINKS WHERE GCR_RULE_ID=? AND TARGET_RULE_ID=?",(pid,cid))
+            add_audit_log(self.connection,"UNLINK_GCR","BRM_GLOBAL_CRITICAL_LINKS",f"{pid}->{cid}","Admin",{"parent_id": pid,"child_id": cid},None)
             self.connection.commit()
             QMessageBox.information(self,"Unlinked",f"Child {cid} from parent {pid}")
         except Exception as ex:
@@ -3633,8 +3602,8 @@ class GlobalCriticalAdminTab(QWidget):
 class BRMTool(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BRM Tool – Full Integrated Enhanced Version (Fixed)")
-        self.resize(1200,800)
+        self.setWindowTitle("BRM Tool – Full Integrated Enhanced Version")
+        self.resize(1200, 800)
 
         self.connection = None
         dlg = DatabaseConnectionDialog()
@@ -3649,10 +3618,12 @@ class BRMTool(QMainWindow):
         if self.login_dialog.exec_() != QDialog.Accepted:
             sys.exit(0)
         self.user_id = self.login_dialog.user_id
+
         c = self.connection.cursor()
         c.execute("SELECT USERNAME FROM USERS WHERE USER_ID=?", (self.user_id,))
         rowu = get_cursor_one(c)
         self.logged_in_username = rowu["USERNAME"] if rowu else "Unknown"
+
         c.execute("SELECT USER_GROUP FROM USERS WHERE USER_ID=?", (self.user_id,))
         rowg = get_cursor_one(c)
         self.user_group = rowg["USER_GROUP"] if rowg else "Unknown"
@@ -3695,6 +3666,7 @@ class BRMTool(QMainWindow):
         lb.setStyleSheet("font-weight:bold;")
         lw_lay.addWidget(lb)
         lw_lay.addWidget(self.lineage_tab)
+
         s_h = QHBoxLayout()
         self.lineage_search = QLineEdit()
         self.lineage_search.setPlaceholderText("Search rule/desc/col/db/table...")
@@ -3704,6 +3676,7 @@ class BRMTool(QMainWindow):
         rst_btn.clicked.connect(self.lineage_tab.resetView)
         ref_btn = QPushButton("Refresh Graph")
         ref_btn.clicked.connect(self.lineage_tab.populate_graph)
+
         s_h.addWidget(self.lineage_search)
         s_h.addWidget(s_btn)
         s_h.addWidget(rst_btn)
@@ -3775,6 +3748,7 @@ class BRMTool(QMainWindow):
         lb.setStyleSheet("font-weight:bold;")
         lw_lay.addWidget(lb)
         lw_lay.addWidget(self.lineage_tab)
+
         s_h = QHBoxLayout()
         self.lineage_search = QLineEdit()
         self.lineage_search.setPlaceholderText("Search rule/desc/col/db/table...")
@@ -3784,6 +3758,7 @@ class BRMTool(QMainWindow):
         rst_btn.clicked.connect(self.lineage_tab.resetView)
         ref_btn = QPushButton("Refresh Graph")
         ref_btn.clicked.connect(self.lineage_tab.populate_graph)
+
         s_h.addWidget(self.lineage_search)
         s_h.addWidget(s_btn)
         s_h.addWidget(rst_btn)
