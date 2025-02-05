@@ -6,8 +6,9 @@ import json
 app = Flask(__name__)
 
 ###############################################################################
-# DOMAIN MAP (Replace with your actual table/column mappings)
+# 1) DOMAIN MAP
 ###############################################################################
+# Replace these mappings with whatever table/column names you need.
 DOMAIN_MAP = {
     "tables": {
         "financial_risk_table": "the Financial Risk data store"
@@ -15,16 +16,17 @@ DOMAIN_MAP = {
     "columns": {
         "customer_id": "Customer Identifier",
         "exposure_amount": "Exposure Amount (USD)",
-        "rating": "Credit Rating"
+        "rating": "Credit Rating",
+        "total_exposure": "Total Exposure (USD)"
     }
 }
 
 ###############################################################################
-# HELPER FUNCTIONS
+# 2) HELPER FUNCTIONS
 ###############################################################################
 def get_domain_name(identifier: str, domain_map: dict, is_table=False) -> str:
     """
-    Map raw identifier -> business-friendly name if present in domain_map.
+    Convert a raw table/column identifier into a business-friendly name if available.
     """
     if not identifier:
         return identifier
@@ -34,43 +36,43 @@ def get_domain_name(identifier: str, domain_map: dict, is_table=False) -> str:
     else:
         return domain_map["columns"].get(key, identifier)
 
-
 def explain_expression(expr, domain_map):
     """
-    Convert a sqlglot Expression node into a user-friendly string,
-    applying domain_map for columns/tables if relevant.
+    Recursively interpret a sqlglot Expression node into a user-friendly string.
     """
     if isinstance(expr, exp.Column):
+        # e.g. "table.column" or just "column"
         return get_domain_name(expr.name, domain_map, is_table=False)
     elif isinstance(expr, exp.Func):
-        # E.g. SUM(...), COUNT(...), etc.
+        # e.g. SUM(...), COUNT(...), etc.
         func_name = expr.name.upper()
-        args = expr.args.get("expressions", [])
-        return f"{func_name}({', '.join(explain_expression(a, domain_map) for a in args)})"
+        arg_exprs = expr.args.get("expressions", [])
+        arg_texts = [explain_expression(a, domain_map) for a in arg_exprs]
+        return f"{func_name}({', '.join(arg_texts)})"
     elif isinstance(expr, exp.Literal):
-        # E.g. 'BBB' or 10
+        # e.g. 'BBB' or 10
         return str(expr.value).strip("'")
     elif isinstance(expr, exp.Alias):
         # e.g. "SUM(exposure_amount) AS total_exposure"
         alias_name = expr.alias
-        child = expr.this
-        return f"{explain_expression(child, domain_map)} AS {alias_name}"
-    return str(expr)
+        child_expr = expr.this
+        return f"{explain_expression(child_expr, domain_map)} AS {alias_name}"
+    return str(expr)  # fallback if not recognized
 
-
-def parse_and_explain(sql_query: str) -> (str, str):
+def parse_and_explain(sql_query: str):
     """
-    1. Parse the SQL with sqlglot
-    2. Build a basic English explanation
-    3. Return (explanation_text, ast_json)
+    1. Parse the SQL with sqlglot (dialect='generic' so no "unknown dialect ansi" errors).
+    2. Build a short English explanation.
+    3. Return (explanation_text, ast_json).
     """
     try:
-        ast = sqlglot.parse_one(sql_query, read='ansi')
+        # Use 'generic' to avoid "unknown dialect ansi" issues in some sqlglot versions
+        ast = sqlglot.parse_one(sql_query, read="generic")
     except Exception as e:
         return (f"Error parsing SQL: {e}", "{}")
 
     if not isinstance(ast, exp.Select):
-        return ("Not a valid SELECT statement or unrecognized query.", "{}")
+        return ("Not a valid SELECT statement or unsupported query type.", "{}")
 
     explanation_parts = []
 
@@ -83,9 +85,7 @@ def parse_and_explain(sql_query: str) -> (str, str):
     # SELECT
     select_expressions = ast.select_expressions
     if select_expressions:
-        columns = []
-        for s in select_expressions:
-            columns.append(explain_expression(s, DOMAIN_MAP))
+        columns = [explain_expression(col, DOMAIN_MAP) for col in select_expressions]
         explanation_parts.append("It selects: " + ", ".join(columns) + ".")
 
     # WHERE
@@ -95,20 +95,22 @@ def parse_and_explain(sql_query: str) -> (str, str):
 
     # GROUP BY
     if ast.args.get("group"):
-        group_expressions = ast.args["group"].args.get("expressions", [])
-        group_cols = [explain_expression(g, DOMAIN_MAP) for g in group_expressions]
-        explanation_parts.append("Results are grouped by **" + ", ".join(group_cols) + "**.")
+        group_exprs = ast.args["group"].args.get("expressions", [])
+        group_texts = [explain_expression(g, DOMAIN_MAP) for g in group_exprs]
+        if group_texts:
+            explanation_parts.append("Results are grouped by **" + ", ".join(group_texts) + "**.")
 
     # ORDER BY
     if ast.args.get("order"):
-        order_expressions = ast.args["order"].args.get("expressions", [])
-        order_list = []
-        for o in order_expressions:
+        order_exprs = ast.args["order"].args.get("expressions", [])
+        order_texts = []
+        for o in order_exprs:
             col_text = explain_expression(o.this, DOMAIN_MAP)
             desc_flag = o.args.get("desc", False)
             direction = "DESC" if desc_flag else "ASC"
-            order_list.append(f"{col_text} {direction}")
-        explanation_parts.append("It is then sorted by **" + ", ".join(order_list) + "**.")
+            order_texts.append(f"{col_text} {direction}")
+        if order_texts:
+            explanation_parts.append("It is then sorted by **" + ", ".join(order_texts) + "**.")
 
     # LIMIT
     if ast.args.get("limit"):
@@ -117,74 +119,76 @@ def parse_and_explain(sql_query: str) -> (str, str):
             explanation_parts.append(f"Finally, it returns only the first **{limit_expr}** rows.")
 
     if not explanation_parts:
-        return ("No explanation found; the query might be empty or too complex.", "{}")
+        return ("No explanation could be formed; possibly an empty or overly complex query.", "{}")
 
-    explanation_text = " ".join(explanation_parts)
-    # Also produce AST JSON for debugging
+    final_explanation = " ".join(explanation_parts)
+    # Also produce AST JSON for debugging or insight
     ast_json = ast.to_json()
-    return (explanation_text, ast_json)
+    return (final_explanation, ast_json)
 
 
 ###############################################################################
-# BASIC HTML TEMPLATE
+# 3) BASIC HTML PAGE (Jinja-like syntax, but we'll inline it here)
 ###############################################################################
 HTML_TEMPLATE = """
 <!doctype html>
 <html>
 <head>
-    <title>SQL-to-English (Flask Demo)</title>
+    <title>SQL-to-English (Flask + sqlglot generic)</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 1.5rem; }
-        h1, h2 { color: #333; }
+        body { font-family: Arial, sans-serif; margin: 1rem; }
+        .container { max-width: 800px; margin: auto; }
+        h1 { color: #444; }
         textarea { width: 100%; height: 150px; }
-        .result { background: #f8f8f8; padding: 1rem; border: 1px solid #ddd; margin-top: 1rem; }
-        pre { background: #f0f0f0; padding: 0.5rem; overflow: auto; }
+        .result { background: #f4f4f4; padding: 1rem; margin-top: 1rem; border: 1px solid #ddd; }
+        pre { background: #fafafa; padding: 1rem; overflow: auto; }
     </style>
 </head>
 <body>
+<div class="container">
     <h1>SQL-to-English (Flask + sqlglot)</h1>
+    <p>Dialect set to "generic" to avoid "unknown dialect" errors.</p>
     <form method="POST">
-        <label for="sql_query"><strong>Enter SQL Query:</strong></label><br>
-        <textarea id="sql_query" name="sql_query">{{ sql_query }}</textarea><br><br>
+        <label><strong>Enter SQL Query:</strong></label><br>
+        <textarea name="sql_query">{{ sql_query }}</textarea><br><br>
         <button type="submit">Translate</button>
     </form>
 
     {% if explanation %}
     <div class="result">
         <h2>Explanation</h2>
-        <div style="white-space: pre-wrap;">
-            {{ explanation | safe }}
-        </div>
-        <br>
+        <div style="white-space: pre-wrap;">{{ explanation | safe }}</div>
+        <hr>
         <h2>AST (JSON)</h2>
         <pre>{{ ast_json }}</pre>
     </div>
     {% endif %}
+</div>
 </body>
 </html>
 """
 
 ###############################################################################
-# FLASK ROUTE
+# 4) FLASK ROUTE
 ###############################################################################
 @app.route("/", methods=["GET", "POST"])
 def index():
     sql_query = ""
-    explanation = None
-    ast_json = None
-
+    explanation = ""
+    ast_json = ""
     if request.method == "POST":
         sql_query = request.form.get("sql_query", "").strip()
         explanation, ast_json = parse_and_explain(sql_query)
 
     return render_template_string(
-        HTML_TEMPLATE, 
+        HTML_TEMPLATE,
         sql_query=sql_query,
         explanation=explanation,
         ast_json=ast_json
     )
 
-
+###############################################################################
+# 5) RUN THE FLASK APP
+###############################################################################
 if __name__ == "__main__":
-    # Run Flask in debug mode for local development
     app.run(debug=True)
