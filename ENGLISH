@@ -1,75 +1,32 @@
 import streamlit as st
-import sqlite3
-from moz_sql_parser import parse, ParseException
+import sqlglot
+from sqlglot import exp
 import json
 
-###############################################################################
-# 1. INITIALIZE IN-MEMORY SQLITE DB & POPULATE BUSINESS DEFINITIONS
-###############################################################################
-def init_in_memory_db():
-    """
-    Creates an in-memory SQLite database and inserts some sample domain mappings.
-    Returns a connection object.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.execute("""
-    CREATE TABLE business_definitions (
-        entity_type    TEXT NOT NULL,  -- 'TABLE' or 'COLUMN'
-        tech_name      TEXT NOT NULL,  -- e.g. 'financial_risk_table', 'rating'
-        business_name  TEXT NOT NULL,  -- e.g. 'Financial Risk data store'
-        active_flag    TEXT DEFAULT 'Y'
-    )
-    """)
-
-    sample_data = [
-        ('TABLE',  'financial_risk_table', 'the Financial Risk data store', 'Y'),
-        ('TABLE',  'customer_info',        'the Customer Information table', 'Y'),
-        ('COLUMN', 'customer_id',          'Customer Identifier', 'Y'),
-        ('COLUMN', 'exposure_amount',      'Exposure Amount (USD)', 'Y'),
-        ('COLUMN', 'rating',               'Credit Rating', 'Y'),
-        ('COLUMN', 'cusip_id',            'CUSIP Identifier', 'Y'),
-        ('COLUMN', 'customer_name',       'Customer Name', 'Y'),
-        ('COLUMN', 'total_exposure',      'Total Exposure (USD)', 'Y')
-    ]
-    conn.executemany("""
-        INSERT INTO business_definitions (entity_type, tech_name, business_name, active_flag)
-        VALUES (?, ?, ?, ?)
-    """, sample_data)
-    conn.commit()
-    return conn
-
-###############################################################################
-# 2. LOAD DOMAIN MAPPING
-###############################################################################
-def load_domain_map_from_db(conn):
-    """
-    Reads rows from 'business_definitions' and returns a dict like:
-    {
-      "tables":   { "financial_risk_table": "the Financial Risk data store", ... },
-      "columns":  { "customer_id": "Customer Identifier", ... }
+################################################################################
+# 1) DEFINE A SIMPLE DOMAIN MAP
+################################################################################
+# In a real system, you might load these from a database table (as shown in earlier demos).
+DOMAIN_MAP = {
+    "tables": {
+        "financial_risk_table": "the Financial Risk data store"
+    },
+    "columns": {
+        "customer_id": "Customer Identifier",
+        "exposure_amount": "Exposure Amount (USD)",
+        "rating": "Credit Rating",
+        "total_exposure": "Total Exposure (USD)"
     }
-    """
-    domain_map = {"tables": {}, "columns": {}}
-    query = """
-    SELECT entity_type, LOWER(tech_name) AS tech_name, business_name
-      FROM business_definitions
-     WHERE active_flag = 'Y'
-    """
-    for row in conn.execute(query).fetchall():
-        entity_type, tech_name, business_name = row
-        entity_type = entity_type.upper()
-        if entity_type == 'TABLE':
-            domain_map['tables'][tech_name] = business_name
-        elif entity_type == 'COLUMN':
-            domain_map['columns'][tech_name] = business_name
-    return domain_map
+}
 
-###############################################################################
-# 3. HELPER FUNCTIONS FOR SQL -> EXPLANATION
-###############################################################################
-def get_domain_name(identifier, domain_map, is_table=False):
+
+################################################################################
+# 2) HELPER FUNCTIONS FOR DOMAIN NAME LOOKUP
+################################################################################
+def get_domain_name(identifier: str, domain_map: dict, is_table=False) -> str:
     """
-    Map a raw identifier to a user-friendly name if present in the domain map.
+    Lookup an identifier in the domain map. If is_table=True, look in 'tables';
+    otherwise, look in 'columns'.
     """
     if not identifier:
         return identifier
@@ -79,198 +36,254 @@ def get_domain_name(identifier, domain_map, is_table=False):
     else:
         return domain_map["columns"].get(key, identifier)
 
-def explain_value(val):
-    """
-    Strips single quotes for string literals, otherwise returns val as string.
-    """
-    if isinstance(val, str):
-        return val.strip("'")
-    return str(val)
 
-def explain_select_clause(select_clause, domain_map, detail_level="concise"):
+################################################################################
+# 3) EXPLAINING THE SQL PARTS
+################################################################################
+
+def explain_select_clause(select_expressions, domain_map):
     """
-    Convert the SELECT list into a readable string. 
-    'detail_level' can be "concise" or "detailed" if you want to add extra text.
+    Takes a list of Expression objects from sqlglot for the SELECT clause.
+    Returns a comma-separated string describing them in business-friendly terms.
     """
-    if not select_clause:
-        return ""
     parts = []
-    for item in select_clause:
-        if isinstance(item, str):
-            parts.append(get_domain_name(item, domain_map, is_table=False))
-        elif isinstance(item, dict) and "value" in item:
-            val = item["value"]
-            alias = item.get("name")
-            if isinstance(val, dict) and len(val) == 1:
-                # e.g. {"sum": "exposure_amount"}
-                func, col = list(val.items())[0]
-                col_name = get_domain_name(col, domain_map, is_table=False)
-                text = f"{func.upper()}({col_name})"
-            else:
-                text = str(val)
-            if alias:
-                text += f" AS **{alias}**"
-            parts.append(text)
+    for expr in select_expressions:
+        # Each expr might be a Column, an Alias, a Function, etc.
+        if isinstance(expr, exp.Alias):
+            # E.g., SUM(exposure_amount) AS total_exposure
+            alias_name = expr.alias
+            child = expr.this  # The underlying expression
+            child_text = explain_expression(child, domain_map)
+            parts.append(f"{child_text} AS **{alias_name}**")
         else:
-            parts.append(str(item))
-    # Example formatting: bold each part or add bullet points
-    if detail_level == "detailed":
-        joined = "; ".join(parts)
-    else:
-        joined = ", ".join(parts)
-    return joined
-
-def explain_conditions(condition, domain_map, detail_level="concise"):
-    """
-    Build a string for WHERE conditions (handles AND, OR, =, <, etc.). 
-    'detail_level' can be used for more verbose text if desired.
-    """
-    if not condition:
-        return ""
-    if not isinstance(condition, dict):
-        return str(condition)
-
-    for op, val in condition.items():
-        op_lower = op.lower()
-        if op_lower in ("and", "or"):
-            # val is list of subconditions
-            sub_exps = [explain_conditions(v, domain_map, detail_level) for v in val]
-            joiner = " AND " if op_lower == "and" else " OR "
-            return f"({joiner.join(sub_exps)})"
-        elif op_lower in ("=", "<", ">", "<=", ">=", "<>", "!="):
-            left, right = val
-            left_str = get_domain_name(left, domain_map, is_table=False)
-            right_str = explain_value(right)
-            return f"{left_str} {op} {right_str}"
-        elif op_lower == "between":
-            col, low, high = val
-            col_str = get_domain_name(col, domain_map, is_table=False)
-            return f"{col_str} BETWEEN {low} AND {high}"
-        elif op_lower == "in":
-            col = val[0]
-            in_list = val[1]
-            col_str = get_domain_name(col, domain_map, is_table=False)
-            in_vals = ", ".join(str(explain_value(x)) for x in in_list)
-            return f"{col_str} IN ({in_vals})"
-        elif op_lower == "like":
-            col, pattern = val
-            col_str = get_domain_name(col, domain_map, is_table=False)
-            pat = explain_value(pattern)
-            return f"{col_str} LIKE {pat}"
-        else:
-            return f"{op} {val}"
-    return ""
-
-def explain_orderby_clause(orderby_clause, domain_map):
-    """
-    e.g. [{'value': 'total_exposure', 'sort': 'DESC'}]
-    """
-    if not orderby_clause:
-        return ""
-    if not isinstance(orderby_clause, list):
-        orderby_clause = [orderby_clause]
-    parts = []
-    for entry in orderby_clause:
-        col = entry.get("value")
-        direction = entry.get("sort", "ASC")
-        col_text = get_domain_name(col, domain_map, is_table=False)
-        parts.append(f"{col_text} {direction}")
+            parts.append(explain_expression(expr, domain_map))
     return ", ".join(parts)
 
-def build_explanation(parsed_sql, domain_map, detail_level="concise"):
+
+def explain_expression(expression, domain_map):
     """
-    Orchestrates final text. 
-    'detail_level' can be "concise" or "detailed".
+    Convert a single Expression node into a human-friendly string,
+    applying the domain map for columns/tables if relevant.
     """
-    lines = []
+    if isinstance(expression, exp.Column):
+        # A Column node typically has .table and .name
+        col_name = expression.name
+        return get_domain_name(col_name, domain_map, is_table=False)
+
+    elif isinstance(expression, exp.Identifier):
+        # Could be a reference to a table or column
+        return expression.name
+
+    elif isinstance(expression, exp.Func):
+        # e.g. SUM(...), COUNT(...), etc.
+        func_name = expression.name.upper()
+        args = expression.args.get("expressions", [])
+        arg_texts = [explain_expression(arg, domain_map) for arg in args]
+        arg_str = ", ".join(arg_texts)
+        return f"{func_name}({arg_str})"
+
+    elif isinstance(expression, exp.Literal):
+        # A literal value, e.g. 'BBB' or 10
+        return str(expression.value).strip("'")
+
+    elif isinstance(expression, exp.Alias):
+        # E.g. (some expression) AS alias
+        return explain_expression(expression.this, domain_map)
+
+    else:
+        # Fallback for unhandled expression types
+        return str(expression)
+
+
+def explain_from_clause(ast, domain_map):
+    """
+    Identify the FROM table(s). This demonstration handles a single-table scenario
+    or a basic reference. For multi-table joins or subqueries, you'd need a more
+    thorough traversal.
+    """
+    table_expr = ast.args.get("from")
+    if not table_expr:
+        return ""
+    # table_expr might be a Table, a Join, or a Subquery, etc.
+    # For simplicity, let's assume a single table reference:
+    if isinstance(table_expr, exp.Table):
+        table_name = table_expr.name
+        return get_domain_name(table_name, domain_map, is_table=True)
+    else:
+        # Possibly a join or subquery. We can do a short fallback.
+        return "multiple sources or a subquery"
+
+
+def explain_where_clause(ast, domain_map):
+    """
+    Return a string describing the WHERE condition if present.
+    We recursively handle AND, OR, basic operators, etc.
+    """
+    where_expr = ast.args.get("where")
+    if not where_expr:
+        return ""
+    condition = where_expr.this  # The actual condition expression
+    return explain_condition(condition, domain_map)
+
+
+def explain_condition(expr_node, domain_map):
+    """
+    Recursively explain a condition expression (AND, OR, =, <, etc.).
+    """
+    if isinstance(expr_node, exp.Binary):
+        # A binary operation: expr_node.op in ("=", "<", ">", "<=", ">=", "<>", "!=")
+        left_text = explain_condition(expr_node.left, domain_map)
+        right_text = explain_condition(expr_node.right, domain_map)
+        return f"{left_text} {expr_node.op} {right_text}"
+
+    elif isinstance(expr_node, exp.And):
+        left_text = explain_condition(expr_node.left, domain_map)
+        right_text = explain_condition(expr_node.right, domain_map)
+        return f"({left_text} AND {right_text})"
+
+    elif isinstance(expr_node, exp.Or):
+        left_text = explain_condition(expr_node.left, domain_map)
+        right_text = explain_condition(expr_node.right, domain_map)
+        return f"({left_text} OR {right_text})"
+
+    elif isinstance(expr_node, exp.Column):
+        return get_domain_name(expr_node.name, domain_map, is_table=False)
+
+    elif isinstance(expr_node, exp.Literal):
+        return str(expr_node.value).strip("'")
+
+    # For function calls or other expressions in the WHERE
+    elif isinstance(expr_node, exp.Func):
+        func_name = expr_node.name.upper()
+        args = expr_node.args.get("expressions", [])
+        arg_texts = [explain_condition(a, domain_map) for a in args]
+        return f"{func_name}({', '.join(arg_texts)})"
+
+    # Fallback
+    return str(expr_node)
+
+
+def explain_groupby_clause(ast, domain_map):
+    group_expr = ast.args.get("group")
+    if not group_expr:
+        return ""
+    # group_expr is typically a Group node containing expressions
+    columns = [explain_expression(c, domain_map) for c in group_expr.args.get("expressions", [])]
+    return ", ".join(columns)
+
+
+def explain_orderby_clause(ast, domain_map):
+    order_expr = ast.args.get("order")
+    if not order_expr:
+        return ""
+    # order_expr is typically an Order node. Each child is an OrderItem, which has .this (the expression) and .args['desc'] = True/False
+    items = []
+    for item in order_expr.args.get("expressions", []):
+        col_text = explain_expression(item.this, domain_map)
+        desc_flag = item.args.get("desc", False)
+        direction = "DESC" if desc_flag else "ASC"
+        items.append(f"{col_text} {direction}")
+    return ", ".join(items)
+
+
+def explain_limit_clause(ast):
+    limit_expr = ast.args.get("limit")
+    if not limit_expr:
+        return ""
+    # limit_expr might be an expression or integer
+    # If it's e.g. LIMIT 10, you'll see an expression with .this = '10'
+    if limit_expr.args.get("expression"):
+        return str(limit_expr.args["expression"])
+    return ""
+
+
+def build_explanation(ast, domain_map):
+    """
+    Main function: gather SELECT, FROM, WHERE, GROUP, ORDER, LIMIT,
+    and produce a cohesive English explanation.
+    """
+    if not ast or not isinstance(ast, exp.Select):
+        return "Not a SELECT query or unrecognized format."
+
+    explanation_parts = []
 
     # FROM
-    from_clause = parsed_sql.get("from")
-    if from_clause:
-        if isinstance(from_clause, str):
-            # Single table
-            table_name = get_domain_name(from_clause, domain_map, is_table=True)
-            lines.append(f"This query accesses data from **{table_name}**.")
-        else:
-            # Possibly a join or subquery
-            lines.append("This query accesses data from **multiple sources** or a subquery.")
+    table_text = explain_from_clause(ast, domain_map)
+    if table_text:
+        explanation_parts.append(f"This query retrieves data from **{table_text}**.")
+
     # SELECT
-    select_clause = parsed_sql.get("select", [])
-    select_text = explain_select_clause(select_clause, domain_map, detail_level)
-    if select_text:
-        lines.append(f"It selects: {select_text}.")
+    select_expressions = ast.select_expressions
+    if select_expressions:
+        sel_text = explain_select_clause(select_expressions, domain_map)
+        explanation_parts.append(f"It selects: {sel_text}.")
 
     # WHERE
-    where_clause = parsed_sql.get("where")
-    if where_clause:
-        cond_text = explain_conditions(where_clause, domain_map, detail_level)
-        if cond_text:
-            lines.append(f"It is filtered to rows where **{cond_text}**.")
+    where_text = explain_where_clause(ast, domain_map)
+    if where_text:
+        explanation_parts.append(f"It is filtered to rows where **{where_text}**.")
 
     # GROUP BY
-    groupby = parsed_sql.get("groupby")
-    if groupby:
-        if isinstance(groupby, list):
-            gb_list = [get_domain_name(g, domain_map, is_table=False) for g in groupby]
-            gb_text = ", ".join(gb_list)
-        else:
-            gb_text = get_domain_name(groupby, domain_map, is_table=False)
-        lines.append(f"Results are grouped by **{gb_text}**.")
+    group_text = explain_groupby_clause(ast, domain_map)
+    if group_text:
+        explanation_parts.append(f"Results are grouped by **{group_text}**.")
 
     # ORDER BY
-    orderby = parsed_sql.get("orderby")
-    if orderby:
-        ob_text = explain_orderby_clause(orderby, domain_map)
-        if ob_text:
-            lines.append(f"It is then sorted by **{ob_text}**.")
+    order_text = explain_orderby_clause(ast, domain_map)
+    if order_text:
+        explanation_parts.append(f"It is then sorted by **{order_text}**.")
 
     # LIMIT
-    limit_val = parsed_sql.get("limit")
-    if limit_val is not None:
-        lines.append(f"Finally, it returns only the first **{limit_val}** row(s).")
+    limit_text = explain_limit_clause(ast)
+    if limit_text:
+        explanation_parts.append(f"Finally, it returns only the first **{limit_text}** row(s).")
 
-    if not lines:
-        return "No explanation could be generated or query is very complex."
-    # Join them into a paragraph
-    explanation = " ".join(lines)
-    return explanation
+    if not explanation_parts:
+        return "No explanation found (query may be empty or too complex)."
 
-def translate_sql_to_english(sql_query, domain_map, detail_level="concise"):
+    return " ".join(explanation_parts)
+
+
+def translate_sql_to_english(sql_query: str, domain_map: dict) -> (str, str):
     """
-    High-level function to parse and build an explanation.
+    - Parse the SQL with sqlglot.
+    - Build an English explanation from the AST.
+    - Return (explanation, ast_json_string)
     """
-    if not sql_query.strip():
-        return "Please enter a valid SQL query."
+    sql_query = sql_query.strip()
+    if not sql_query:
+        return ("Please provide a valid SQL query.", "")
+
+    # Attempt parse
     try:
-        parsed = parse(sql_query)
-    except ParseException as pe:
-        return f"**Error parsing SQL**: {pe}"
+        # parse_one returns the AST for the first statement
+        ast = sqlglot.parse_one(sql_query, read='ansi')
     except Exception as e:
-        return f"**Unexpected error**: {e}"
+        return (f"Error parsing SQL: {e}", "")
 
-    explanation = build_explanation(parsed, domain_map, detail_level)
-    return explanation, parsed  # Return both the explanation and the parsed structure
+    # Build the explanation
+    explanation = build_explanation(ast, domain_map)
 
-###############################################################################
-# 4. STREAMLIT APP WITH ENHANCED UI
-###############################################################################
+    # Also provide a JSON-like representation of the AST (for debugging)
+    ast_json = ast.to_json()
+    return (explanation, ast_json)
+
+
+################################################################################
+# 4) STREAMLIT UI
+################################################################################
 def main():
-    st.set_page_config(page_title="Enhanced SQL-to-English Demo", layout="wide")
-    st.title("Enhanced SQL-to-English Translator")
+    st.title("SQL-to-English using sqlglot")
+
     st.markdown("""
-    A **demo** showing how you can provide a more **polished UI**:
-    - Sidebar for input & settings
-    - Tabs for explanation, parse tree, domain dictionary
-    - Optional detail levels (concise vs. detailed)
-    - Basic Markdown formatting for highlights
+    This demo **parses** your SQL with [sqlglot](https://github.com/tobymao/sqlglot),
+    walks the resulting **abstract syntax tree (AST)**, and produces a simplified,
+    **business-friendly** explanation.
+    
+    **Domain Map**: We replace known tables and columns with more user-friendly names.
     """)
 
-    # 1) Set up the in-memory DB and load domain map
-    conn = init_in_memory_db()
-    domain_map = load_domain_map_from_db(conn)
-
-    # -- SIDEBAR --
-    st.sidebar.header("SQL Input & Settings")
+    # Provide a default example
     default_sql = """
 SELECT
     customer_id,
@@ -281,73 +294,18 @@ GROUP BY customer_id
 ORDER BY total_exposure DESC
 LIMIT 10
 """
-    sql_query = st.sidebar.text_area("Enter your SQL query:", value=default_sql, height=200)
-    detail_level = st.sidebar.radio("Explanation Detail", options=["concise", "detailed"], index=0)
-    if st.sidebar.button("Translate"):
-        explanation, parsed_sql = translate_sql_to_english(sql_query, domain_map, detail_level)
-        st.session_state["explanation"] = explanation
-        st.session_state["parsed_sql"] = parsed_sql
-        st.session_state["sql_query"] = sql_query
+
+    user_sql = st.text_area("Enter your SQL:", default_sql, height=200)
+
+    if st.button("Translate"):
+        explanation, ast_json = translate_sql_to_english(user_sql, DOMAIN_MAP)
+        st.subheader("Explanation")
+        st.markdown(explanation)
+
+        with st.expander("View AST JSON"):
+            st.json(json.loads(ast_json))
     else:
-        # If user hasn't pressed "Translate" yet, or changed the query after translation
-        if "explanation" not in st.session_state:
-            st.session_state["explanation"] = "Awaiting input..."
-            st.session_state["parsed_sql"] = {}
-            st.session_state["sql_query"] = sql_query
-
-    # -- MAIN TABS --
-    tab1, tab2, tab3 = st.tabs(["Explanation", "Parsed SQL", "Domain Dictionary"])
-
-    # TAB 1: Explanation
-    with tab1:
-        st.subheader("Business-Friendly Explanation")
-        st.markdown(st.session_state["explanation"])
-
-        # Expand/collapse for short vs. more detail:
-        if st.session_state["explanation"] != "Awaiting input...":
-            with st.expander("Show Additional Details"):
-                st.write("""
-                You can imagine more verbose content here—like a line-by-line breakdown:
-                - This query accesses data from...
-                - It selects these columns...
-                - Filters by rating < 'BBB'...
-                and so on.
-                """)
-
-    # TAB 2: Parsed SQL
-    with tab2:
-        st.subheader("Parsed SQL (JSON-like)")
-        if st.session_state["parsed_sql"]:
-            st.json(st.session_state["parsed_sql"])
-        else:
-            st.write("No parsed SQL available yet.")
-
-    # TAB 3: Domain Dictionary
-    with tab3:
-        st.subheader("Current Domain Mappings")
-        st.markdown("""
-        These mappings power the translation from technical names 
-        (e.g., 'financial_risk_table') to friendly names ('the Financial Risk data store').
-        """)
-        # Let's display the rows from the DB in a table:
-        rows = conn.execute("""
-        SELECT entity_type, tech_name, business_name, active_flag
-          FROM business_definitions
-        ORDER BY entity_type, tech_name
-        """).fetchall()
-        if rows:
-            # Convert to a list of dicts for streamlit
-            data = []
-            for r in rows:
-                data.append({
-                    "Entity Type": r[0],
-                    "Technical Name": r[1],
-                    "Business Name": r[2],
-                    "Active?": r[3]
-                })
-            st.dataframe(data)
-        else:
-            st.write("No domain mappings found in the DB.")
+        st.info("Awaiting query...")
 
 if __name__ == "__main__":
     main()
