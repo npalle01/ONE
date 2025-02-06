@@ -1,11 +1,10 @@
-import sqlglot
-from sqlglot import exp
-from collections import deque
+import sqlparse
+from sqlparse.tokens import Keyword, DML, Name, Whitespace, Punctuation
 
 ###############################################################################
 # 1) DOMAIN MAP
 ###############################################################################
-# Extend or change these as needed for your environment.
+# Replace these entries with real table/column names in your environment.
 DOMAIN_MAP = {
     "tables": {
         "financial_risk_table": "the Financial Risk data store",
@@ -21,283 +20,285 @@ DOMAIN_MAP = {
     }
 }
 
-def get_domain_name(identifier: str, is_table=False) -> str:
-    if not identifier:
-        return identifier
-    lower_id = identifier.lower().strip()
-    if is_table:
-        return DOMAIN_MAP["tables"].get(lower_id, identifier)
-    else:
-        return DOMAIN_MAP["columns"].get(lower_id, identifier)
+def get_domain_table_name(raw_name: str) -> str:
+    """Look up a table name in the domain map, or return as-is if not found."""
+    key = raw_name.lower().strip()
+    return DOMAIN_MAP["tables"].get(key, raw_name)
+
+def get_domain_column_name(raw_name: str) -> str:
+    """Look up a column name in the domain map, or return as-is if not found."""
+    key = raw_name.lower().strip()
+    return DOMAIN_MAP["columns"].get(key, raw_name)
+
 
 ###############################################################################
-# 2) HELPER: BFS TRAVERSAL
+# 2) TOKEN-BASED PARSING LOGIC
 ###############################################################################
-def bfs_nodes(root):
+def parse_sql_statement(sql_query: str) -> dict:
     """
-    Breadth-first traversal of the sqlglot AST.
-    Yields each node (Expression).
+    Uses sqlparse to tokenize the query. We'll do naive scanning for:
+    SELECT columns, FROM table, WHERE condition, GROUP BY, ORDER BY, LIMIT.
+    
+    Returns a dictionary with keys:
+      {
+        "columns": [...],
+        "table": ...,
+        "where": ...,
+        "group_by": [...],
+        "order_by": [...],
+        "limit": ...
+      }
+    This approach is simplified and may not handle all edge cases.
     """
-    queue = deque([root])
-    while queue:
-        node = queue.popleft()
-        yield node
-        for child in node.children:
-            queue.append(child)
+    result = {
+        "columns": [],
+        "table": None,
+        "where": None,
+        "group_by": [],
+        "order_by": [],
+        "limit": None
+    }
+
+    # 1) Parse using sqlparse
+    parsed = sqlparse.parse(sql_query)
+    if not parsed:
+        return result  # empty or invalid
+    statement = parsed[0]  # We'll assume only one statement
+    
+    # Flatten tokens for easier scanning
+    tokens = [t for t in statement.tokens if not t.is_whitespace]
+
+    # We'll track which "clause" we're in
+    mode = None
+
+    # A helper function to handle comma-separated items
+    def split_by_comma(token_list):
+        # E.g. "customer_id, SUM(exposure_amount) AS total_exposure"
+        # We'll just re-split on commas (very naive).
+        combined = "".join(t.value for t in token_list).strip()
+        parts = [p.strip() for p in combined.split(",")]
+        return parts
+
+    # We'll accumulate tokens for the current clause
+    buffer = []
+
+    i = 0
+    n = len(tokens)
+    while i < n:
+        token = tokens[i]
+        ttype = token.ttype
+        tval = token.value.upper()
+
+        if token.is_keyword or ttype == DML:
+            # Identify clauses by keywords
+            if tval == "SELECT":
+                # Finish any previous buffer
+                if buffer:
+                    buffer = []
+                mode = "SELECT"
+            elif tval == "FROM":
+                # If we have leftover in buffer, let's parse them as columns
+                if mode == "SELECT" and buffer:
+                    cols = split_by_comma(buffer)
+                    result["columns"].extend(cols)
+                buffer = []
+                mode = "FROM"
+            elif tval == "WHERE":
+                # finalize FROM
+                if mode == "FROM" and buffer:
+                    # The last token in buffer might be table name/alias
+                    table_name = "".join(t.value for t in buffer).strip()
+                    result["table"] = table_name
+                # finalize SELECT if somehow not done
+                if mode == "SELECT" and buffer:
+                    cols = split_by_comma(buffer)
+                    result["columns"].extend(cols)
+                buffer = []
+                mode = "WHERE"
+            elif tval == "GROUP" and i + 1 < n and tokens[i+1].value.upper() == "BY":
+                # finalize FROM or WHERE
+                if mode == "FROM" and buffer:
+                    result["table"] = "".join(t.value for t in buffer).strip()
+                if mode == "WHERE" and buffer:
+                    result["where"] = "".join(t.value for t in buffer).strip()
+                # skip the "BY" token
+                i += 1
+                buffer = []
+                mode = "GROUP BY"
+            elif tval == "ORDER" and i + 1 < n and tokens[i+1].value.upper() == "BY":
+                # finalize previous mode
+                if mode == "FROM" and buffer:
+                    result["table"] = "".join(t.value for t in buffer).strip()
+                if mode == "WHERE" and buffer:
+                    result["where"] = "".join(t.value for t in buffer).strip()
+                if mode == "GROUP BY" and buffer:
+                    group_cols = split_by_comma(buffer)
+                    result["group_by"].extend(group_cols)
+                # skip the "BY" token
+                i += 1
+                buffer = []
+                mode = "ORDER BY"
+            elif tval == "LIMIT":
+                # finalize previous clause
+                if mode == "FROM" and buffer:
+                    result["table"] = "".join(t.value for t in buffer).strip()
+                if mode == "WHERE" and buffer:
+                    result["where"] = "".join(t.value for t in buffer).strip()
+                if mode == "GROUP BY" and buffer:
+                    group_cols = split_by_comma(buffer)
+                    result["group_by"].extend(group_cols)
+                if mode == "ORDER BY" and buffer:
+                    order_parts = split_by_comma(buffer)
+                    result["order_by"].extend(order_parts)
+                buffer = []
+                mode = "LIMIT"
+            else:
+                # Some other keyword, e.g. "JOIN", "ON", "HAVING" etc.
+                # We'll just add it to buffer
+                buffer.append(token)
+        else:
+            # Not a significant keyword, add to current buffer
+            buffer.append(token)
+
+        i += 1
+
+    # End of tokens, finalize last buffer
+    if mode == "SELECT" and buffer:
+        cols = split_by_comma(buffer)
+        result["columns"].extend(cols)
+    elif mode == "FROM" and buffer:
+        table_name = "".join(t.value for t in buffer).strip()
+        result["table"] = table_name
+    elif mode == "WHERE" and buffer:
+        result["where"] = "".join(t.value for t in buffer).strip()
+    elif mode == "GROUP BY" and buffer:
+        group_cols = split_by_comma(buffer)
+        result["group_by"].extend(group_cols)
+    elif mode == "ORDER BY" and buffer:
+        order_parts = split_by_comma(buffer)
+        result["order_by"].extend(order_parts)
+    elif mode == "LIMIT" and buffer:
+        limit_val = "".join(t.value for t in buffer).strip()
+        result["limit"] = limit_val
+
+    return result
 
 ###############################################################################
-# 3) PARSE SQL
+# 3) BUILD ENGLISH EXPLANATION
 ###############################################################################
-def parse_sql(sql_query: str):
+def build_explanation(parsed_info: dict) -> str:
     """
-    Use sqlglot to parse the query with the 'generic' dialect if possible.
-    If that fails, try without specifying the dialect.
+    Takes the dictionary from parse_sql_statement(...) and
+    produces a domain-aware English explanation.
     """
-    sql_query = sql_query.strip()
-    if not sql_query:
-        return None
-
-    try:
-        # 'generic' avoids unknown dialect errors in many versions,
-        # but if your older version doesn't support it, we fallback below.
-        return sqlglot.parse_one(sql_query, read="generic")
-    except Exception:
-        # Fallback: let sqlglot guess the dialect
-        try:
-            return sqlglot.parse_one(sql_query)
-        except Exception as e:
-            print(f"[Error parsing SQL] {e}")
-            return None
-
-###############################################################################
-# 4) EXPLAIN NODES - BFS + DETECTION
-###############################################################################
-def build_explanation(ast):
-    """
-    Constructs a more robust explanation by scanning for:
-    - WITH (CTEs)
-    - Table references / Joins / Subqueries
-    - Columns in SELECT
-    - WHERE conditions
-    - GROUP BY
-    - ORDER BY
-    - LIMIT
-    """
-    if not ast:
-        return "Empty or null AST (nothing to explain)."
-
-    # If it's not a SELECT or WITH statement, we handle it briefly
-    if not isinstance(ast, (exp.Select, exp.With)):
-        return "This query is not recognized as a standard SELECT or WITH statement."
+    # domain_map usage
+    columns = parsed_info.get("columns", [])
+    table = parsed_info.get("table")
+    where = parsed_info.get("where")
+    group_by = parsed_info.get("group_by", [])
+    order_by = parsed_info.get("order_by", [])
+    limit = parsed_info.get("limit")
 
     explanation_parts = []
 
-    # We'll gather info in these structures:
-    ctes_used = []
-    from_tables = []       # For each table in FROM or JOIN
-    join_details = []       # For each join
-    subqueries = []         # For subqueries or table subqueries
-    selected_cols = []
-    where_clauses = []
-    group_cols = []
-    order_cols = []
-    limit_val = None
+    # Table
+    if table:
+        # Could contain alias or multiple tokens if naive. Let's assume the first token is the real table name
+        # We'll do a quick parse for the first word
+        table_name_raw = table.split()[0].strip()
+        table_name = get_domain_table_name(table_name_raw)
+        explanation_parts.append(f"This query retrieves data from {table_name}.")
 
-    # BFS to find relevant node types
-    for node in bfs_nodes(ast):
-        # 1) With/CTE
-        if isinstance(node, exp.With):
-            # node.args['expressions'] might hold the ctes
-            # Each cte is an exp.Expression with an alias. We'll just note that WITH is used
-            ctes_used.append("Common Table Expression (CTE) block found")
-
-        # 2) Table references (FROM or JOIN)
-        elif isinstance(node, exp.Table):
-            # e.g. Table(this='financial_risk_table')
-            table_name = get_domain_name(node.name, is_table=True)
-            from_tables.append(table_name)
-
-        # 3) Joins
-        elif isinstance(node, exp.Join):
-            # node.this => left side, node.args.get('join') => right side, but older versions might differ
-            # We'll attempt a simpler approach:
-            kind = node.args.get("kind")
-            join_type = kind.upper() if kind else "JOIN"
-            # node.left => typically the left relation, node.right => the right relation
-            left_table = find_table_name(node.left)
-            right_table = find_table_name(node.right)
-            # Join condition might be in node.args.get('on')
-            on_expr = node.args.get("on")
-            if on_expr:
-                on_str = explain_condition(on_expr.this)
-                join_details.append(f"{join_type} between {left_table} and {right_table} on ({on_str})")
-            else:
-                join_details.append(f"{join_type} between {left_table} and {right_table} (no condition)")
-
-        # 4) Subqueries
-        elif isinstance(node, (exp.Subquery, exp.TableSubquery)):
-            # We'll note that there's a subquery. 
-            # If you want a recursive explanation, you'd parse node.this with build_explanation again.
-            subqueries.append("A subquery is used here")
-
-        # 5) Columns
-        elif isinstance(node, exp.Column):
-            col_name = get_domain_name(node.name, is_table=False)
-            # We'll store it as a potential "SELECT" usage, though columns might appear in WHERE too.
-            selected_cols.append(col_name)
-
-        # 6) Where
-        elif isinstance(node, exp.Where):
-            # node.this is the condition
-            condition_str = explain_condition(node.this)
-            where_clauses.append(condition_str)
-
-        # 7) Group
-        elif isinstance(node, exp.Group):
-            # group by expressions in node.args.get("expressions", [])
-            for g in node.args.get("expressions", []):
-                group_cols.append(explain_condition(g))
-
-        # 8) Order
-        elif isinstance(node, exp.Order):
-            for order_item in node.args.get("expressions", []):
-                col_text = explain_condition(order_item.this)
-                desc_flag = order_item.args.get("desc", False)
-                direction = "DESC" if desc_flag else "ASC"
-                order_cols.append(f"{col_text} {direction}")
-
-        # 9) Limit
-        elif isinstance(node, exp.Limit):
-            # e.g. Limit(expression=Literal(this='10'))
-            limit_expr = node.args.get("expression")
-            if limit_expr and isinstance(limit_expr, exp.Literal):
-                limit_val = limit_expr.value.strip("'")
-
-    #--- Construct Explanation ---
-    # If we found CTE usage
-    if ctes_used:
-        explanation_parts.append("This query uses a WITH clause (CTE).")
-
-    # If we found any table references but no explicit join objects:
-    if from_tables:
-        # Could be multiple if subqueries or many FROM references
-        distinct_tables = list(dict.fromkeys(from_tables))
-        if len(distinct_tables) == 1:
-            explanation_parts.append(f"It retrieves data from {distinct_tables[0]}.")
-        else:
-            explanation_parts.append("It retrieves data from multiple tables: " + ", ".join(distinct_tables) + ".")
-
-    # If we found explicit JOIN details
-    if join_details:
-        for jd in join_details:
-            explanation_parts.append(f"It has a {jd}.")
-
-    # If subqueries were detected
-    if subqueries:
-        # Could be multiple
-        for sq in subqueries:
-            explanation_parts.append(sq)
-
-    # SELECT columns
-    if selected_cols:
-        # We'll deduplicate them but keep order
-        unique_cols = list(dict.fromkeys(selected_cols))
-        explanation_parts.append("It selects: " + ", ".join(unique_cols) + ".")
+    # Columns
+    if columns:
+        # We'll attempt to domain-map each column or expression
+        mapped_cols = []
+        for col in columns:
+            # If it has AS, we skip to the left side or parse the alias
+            # e.g. "SUM(exposure_amount) AS total_exposure"
+            mapped_cols.append(domain_map_column_expression(col))
+        joined_cols = ", ".join(mapped_cols)
+        explanation_parts.append(f"It selects: {joined_cols}.")
 
     # WHERE
-    if where_clauses:
-        # Possibly multiple conditions
-        if len(where_clauses) == 1:
-            explanation_parts.append(f"It is filtered by {where_clauses[0]}.")
-        else:
-            combined = " AND ".join(where_clauses)
-            explanation_parts.append(f"It is filtered by {combined}.")
+    if where:
+        explanation_parts.append(f"It is filtered by {where}.")
 
     # GROUP BY
-    if group_cols:
-        explanation_parts.append("Results are grouped by " + ", ".join(group_cols) + ".")
+    if group_by:
+        # domain-map each group expression
+        mapped_g = [domain_map_column_expression(g) for g in group_by]
+        explanation_parts.append("Results are grouped by " + ", ".join(mapped_g) + ".")
 
     # ORDER BY
-    if order_cols:
-        explanation_parts.append("It is then sorted by " + ", ".join(order_cols) + ".")
+    if order_by:
+        # We might see e.g. ["total_exposure DESC"] or separate tokens. We'll keep it simple:
+        mapped_o = [domain_map_column_expression(o.strip()) for o in order_by]
+        explanation_parts.append("It is then sorted by " + ", ".join(mapped_o) + ".")
 
     # LIMIT
-    if limit_val:
-        explanation_parts.append(f"Finally, it returns only the first {limit_val} rows.")
+    if limit:
+        explanation_parts.append(f"Finally, it returns only the first {limit} rows.")
 
     if not explanation_parts:
-        return "No recognizable clauses; the query may be empty or too complex."
+        return "No explanation found. The query might be empty or too complex for this simple parser."
     return " ".join(explanation_parts)
 
-def find_table_name(node):
+def domain_map_column_expression(expr: str) -> str:
     """
-    Safely find the table name from a node. If the node is a Table, return domain name.
-    If it's something else, just return 'an unknown source'.
-    This helps for Join detection.
+    Attempt to domain-map known columns in the expression.
+    e.g. "SUM(exposure_amount) AS total_exposure" -> "SUM(Exposure Amount (USD)) AS total_exposure"
     """
-    if isinstance(node, exp.Table):
-        return get_domain_name(node.name, is_table=True)
-    elif isinstance(node, exp.Identifier):
-        # Some versions might store a direct identifier
-        return get_domain_name(node.name, is_table=True)
-    elif isinstance(node, (exp.Subquery, exp.TableSubquery)):
-        return "a subquery"
-    return "an unknown source"
+    # Very naive approach: find tokens that might be columns
+    # We'll look for a token that doesn't contain '(' or ')' or function, etc.
+    # If we see "exposure_amount", we replace with "Exposure Amount (USD)"
+    # If we see "financial_risk_table.customer_id", we'll map the right side
+    # This is just a simplistic approach for demonstration.
+    tokens = expr.replace(",", "").split()
+    replaced = []
+    for t in tokens:
+        # Remove possible punctuation
+        tt = t.strip("(),")
+        # If it's uppercase function name like SUM, we skip domain map
+        # If it's "AS", skip domain map
+        if tt.upper() in ("SUM", "COUNT", "MIN", "MAX", "AVG", "AS", "DESC", "ASC"):
+            replaced.append(t)
+            continue
+
+        if "." in tt:  
+            # e.g. "table.column"
+            parts = tt.split(".")
+            if len(parts) == 2:
+                col_mapped = get_domain_column_name(parts[1])
+                replaced.append(t.replace(parts[1], col_mapped))
+            else:
+                replaced.append(t)
+        else:
+            # single token
+            col_mapped = get_domain_column_name(tt)
+            # keep original punctuation
+            replaced.append(t.replace(tt, col_mapped))
+
+    return " ".join(replaced)
 
 ###############################################################################
-# Condition Explanation
-###############################################################################
-def explain_condition(expr):
-    """
-    Recursively convert condition expressions (Binary ops, funcs, columns, etc.)
-    into short strings. This is simplistic but handles basic cases in older versions.
-    """
-    if isinstance(expr, exp.Binary):
-        left_str = explain_condition(expr.left)
-        right_str = explain_condition(expr.right)
-        return f"({left_str} {expr.op} {right_str})"
-    elif isinstance(expr, exp.Column):
-        return get_domain_name(expr.name, is_table=False)
-    elif isinstance(expr, exp.Literal):
-        return str(expr.value).strip("'")
-    elif isinstance(expr, exp.Func):
-        func_name = expr.name.upper()
-        arg_texts = [explain_condition(a) for a in expr.args.get("expressions", [])]
-        return f"{func_name}({', '.join(arg_texts)})"
-    elif isinstance(expr, exp.Paren):
-        return f"({explain_condition(expr.this)})"
-    elif isinstance(expr, exp.Alias):
-        return explain_condition(expr.this)
-    elif isinstance(expr, exp.And) or expr.op == "AND":
-        # Some older versions might store AND/OR as separate classes or as Binary with .op
-        left_str = explain_condition(expr.left)
-        right_str = explain_condition(expr.right)
-        return f"({left_str} AND {right_str})"
-    elif isinstance(expr, exp.Or) or expr.op == "OR":
-        left_str = explain_condition(expr.left)
-        right_str = explain_condition(expr.right)
-        return f"({left_str} OR {right_str})"
-    return str(expr)
-
-###############################################################################
-# 5) MAIN - CONSOLE LOOP
+# 4) MAIN LOOP (STANDALONE CONSOLE APP)
 ###############################################################################
 def main():
-    print("Enhanced Standalone SQL-to-English Tool (sqlglot BFS).")
-    print("Type or paste SQL queries. Type 'exit' or 'quit' to end.\n")
+    print("Standalone SQL-to-English tool (using sqlparse).")
+    print("Type or paste your SQL. Type 'exit' or 'quit' to stop.\n")
 
     while True:
         user_sql = input("SQL> ").strip()
-        if user_sql.lower() in ("quit", "exit"):
+        if user_sql.lower() in ("exit", "quit"):
             print("Goodbye!")
             break
 
-        ast = parse_sql(user_sql)
-        if not ast:
-            print("\n[No valid AST for the query or parse error occurred.]\n")
+        if not user_sql:
             continue
 
-        explanation = build_explanation(ast)
+        parsed_dict = parse_sql_statement(user_sql)
+        explanation = build_explanation(parsed_dict)
         print("\n--- EXPLANATION ---")
         print(explanation)
         print("-------------------\n")
