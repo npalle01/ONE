@@ -2,8 +2,8 @@
 """
 BRM Tool – Full Integrated Enhanced Version
 Supports:
-  • SQL Server ODBC (pyodbc)
-  • Login with seeded users (from your SQL Server schema)
+  • SQL Server ODBC (pyodbc) OR In‐Memory SQLite (controlled by global flag USE_ODBC)
+  • Login with seeded users (from your SQL Server or SQLite schema)
   • Business Rule Management (CRUD)
   • Multi‐step approvals (with Approve and Reject)
   • BFS‐based lineage graph with search (for rules and tables)
@@ -13,6 +13,7 @@ Supports:
   • Group Management & User Management (admin only)
   • Global/Critical Admin (with cycle prevention and re‐approvals)
   • Control Tables viewer
+
 Additionally, new features include:
   1. Advanced SQL parsing using sqlparse (for complex SQL)
   2. Rule Simulation (dry‐run) dialog
@@ -39,13 +40,18 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit, QSplitter, QCheckBox, QTreeView, QListWidget, QListWidgetItem, QMenu, QFileDialog
 )
 import pyqtgraph as pg
-import pyodbc
+
+# Attempt to import pyodbc and sqlparse
+try:
+    import pyodbc
+except ImportError:
+    pyodbc = None
 import sqlparse
 from sqlparse.sql import IdentifierList, Identifier
 from sqlparse.tokens import Keyword, DML
 
 ###############################################################################
-# Global Flag – set to True for ODBC (SQL Server) usage.
+# Global Flag – if True then we are using SQL Server via pyodbc; if False then use SQLite.
 ###############################################################################
 USE_ODBC = True
 
@@ -96,10 +102,6 @@ def extract_from_part(parsed):
             from_seen = True
 
 def extract_tables(sql_text: str):
-    """
-    Extract table names from SQL using sqlparse.
-    Returns a list of table names.
-    """
     parsed_statements = sqlparse.parse(sql_text)
     tables = []
     for statement in parsed_statements:
@@ -109,7 +111,16 @@ def extract_tables(sql_text: str):
     return tables
 
 ###############################################################################
-# DB UTILITIES
+# Helper for Pagination Clause
+###############################################################################
+def get_pagination_clause(limit, offset):
+    if USE_ODBC:
+        return "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", (offset, limit)
+    else:
+        return "LIMIT ? OFFSET ?", (limit, offset)
+
+###############################################################################
+# DB Utilities
 ###############################################################################
 def get_cursor_rows(cursor):
     try:
@@ -130,9 +141,9 @@ def get_cursor_one(cursor):
 
 def send_email_notification(subject, body, recipients):
     try:
-        msg = MIMEText(body, 'plain')
+        msg = smtplib.email.mime.text.MIMEText(body, 'plain')
     except Exception:
-        msg = MIMEText(body, 'plain')
+        msg = smtplib.email.mime.text.MIMEText(body, 'plain')
     msg['Subject'] = subject
     msg['From'] = EMAIL_CONFIG['sender_email']
     msg['To'] = ", ".join(recipients)
@@ -405,7 +416,7 @@ def add_rule(conn, rule_data, created_by, user_group):
     INSERT INTO BRM_RULES(
         GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
         EFFECTIVE_START_DATE, EFFECTIVE_END_DATE, STATUS, VERSION, CREATED_BY,
-        DESCRIPTION, OPERATION_TYPE, BUSINESS_JUSTIFICATION, OWNER_GROUP,
+        DESCRIPTION, OPERATION_TYPE, BUSINESS_JUSTification, OWNER_GROUP,
         APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE, CDC_TYPE,
         CREATED_TIMESTAMP, UPDATED_BY, CLUSTER_NAME
     )
@@ -423,7 +434,7 @@ def add_rule(conn, rule_data, created_by, user_group):
         created_by,
         rule_data.get("DESCRIPTION"),
         rule_data.get("OPERATION_TYPE"),
-        rule_data.get("BUSINESS_JUSTIFICATION", ""),
+        rule_data.get("BUSINESS_JUSTification", ""),
         rule_data["OWNER_GROUP"],
         "APPROVAL_IN_PROGRESS",
         is_global,
@@ -495,7 +506,7 @@ def update_rule(conn, rule_data, updated_by, user_group):
       UPDATED_BY = ?,
       DESCRIPTION = ?,
       OPERATION_TYPE = ?,
-      BUSINESS_JUSTIFICATION = ?,
+      BUSINESS_JUSTification = ?,
       OWNER_GROUP = ?,
       APPROVAL_STATUS = 'APPROVAL_IN_PROGRESS',
       IS_GLOBAL = ?,
@@ -514,7 +525,7 @@ def update_rule(conn, rule_data, updated_by, user_group):
         updated_by,
         rule_data.get("DESCRIPTION"),
         rule_data.get("OPERATION_TYPE"),
-        rule_data.get("BUSINESS_JUSTIFICATION", ""),
+        rule_data.get("BUSINESS_JUSTification", ""),
         new_owner,
         rule_data.get("IS_GLOBAL", old["IS_GLOBAL"]),
         rule_data.get("CRITICAL_RULE", old["CRITICAL_RULE"]),
@@ -803,12 +814,11 @@ class ScheduleManagementTab(QWidget):
         self.load_schedules()
     def load_schedules(self):
         c = self.connection.cursor()
-        c.execute("""
-        SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS
-        FROM RULE_SCHEDULES
-        ORDER BY SCHEDULE_TIME DESC
-        OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
-        """)
+        if USE_ODBC:
+            query = "SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS FROM RULE_SCHEDULES ORDER BY SCHEDULE_TIME DESC OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY"
+        else:
+            query = "SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS FROM RULE_SCHEDULES ORDER BY SCHEDULE_TIME DESC LIMIT 1000"
+        c.execute(query)
         rows = get_cursor_rows(c)
         self.schedule_table.setRowCount(0)
         for row in rows:
@@ -838,11 +848,7 @@ class MetricsDashboardTab(QWidget):
         self.load_metrics()
     def load_metrics(self):
         c = self.connection.cursor()
-        c.execute("""
-        SELECT STATUS, COUNT(*) as count
-        FROM BRM_RULES
-        GROUP BY STATUS
-        """)
+        c.execute("SELECT STATUS, COUNT(*) as count FROM BRM_RULES GROUP BY STATUS")
         rows = get_cursor_rows(c)
         statuses = [r["STATUS"] for r in rows]
         counts = [r["count"] for r in rows]
@@ -1031,8 +1037,8 @@ class RuleEditorDialog(QDialog):
         self.sql_editor.setPlainText(rd["RULE_SQL"] or "")
         if rd.get("DESCRIPTION"):
             self.description_edit.setText(rd["DESCRIPTION"])
-        if rd.get("BUSINESS_JUSTIFICATION"):
-            self.justification_edit.setText(rd["BUSINESS_JUSTIFICATION"])
+        if rd.get("BUSINESS_JUSTification"):
+            self.justification_edit.setText(rd["BUSINESS_JUSTification"])
         if self.global_checkbox and rd.get("IS_GLOBAL", 0) == 1:
             self.global_checkbox.setChecked(True)
         if rd.get("CRITICAL_RULE", 0) == 1:
@@ -1065,7 +1071,7 @@ class RuleEditorDialog(QDialog):
             "STATUS": self.status_combo.currentText(),
             "DESCRIPTION": self.description_edit.toPlainText().strip(),
             "OPERATION_TYPE": op_type,
-            "BUSINESS_JUSTIFICATION": self.justification_edit.toPlainText().strip(),
+            "BUSINESS_JUSTification": self.justification_edit.toPlainText().strip(),
             "OWNER_GROUP": self.owner_grp_combo.currentText().strip(),
             "IS_GLOBAL": 1 if (self.global_checkbox and self.global_checkbox.isChecked()) else 0,
             "CRITICAL_RULE": 1 if self.critical_checkbox.isChecked() else 0,
@@ -1217,12 +1223,20 @@ class AuditLogViewer(QDialog):
         self.load_logs()
     def load_logs(self):
         c = self.connection.cursor()
-        query = """
-        SELECT AUDIT_ID, ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
-        FROM BRM_AUDIT_LOG
-        ORDER BY ACTION_TIMESTAMP DESC
-        OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
-        """
+        if USE_ODBC:
+            query = """
+            SELECT AUDIT_ID, ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
+            FROM BRM_AUDIT_LOG
+            ORDER BY ACTION_TIMESTAMP DESC
+            OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
+            """
+        else:
+            query = """
+            SELECT AUDIT_ID, ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
+            FROM BRM_AUDIT_LOG
+            ORDER BY ACTION_TIMESTAMP DESC
+            LIMIT 1000
+            """
         c.execute(query)
         rows = get_cursor_rows(c)
         self.audit_table.setRowCount(0)
@@ -1313,21 +1327,38 @@ class SearchRuleDialog(QDialog):
         c = self.connection.cursor()
         txt = self.search_edit.text().strip()
         if txt:
-            query = """
-            SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, CREATED_BY
-            FROM BRM_RULES
-            WHERE (RULE_NAME LIKE ? OR RULE_SQL LIKE ?)
-            ORDER BY RULE_ID DESC
-            OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
-            """
+            if USE_ODBC:
+                query = """
+                SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, CREATED_BY
+                FROM BRM_RULES
+                WHERE (RULE_NAME LIKE ? OR RULE_SQL LIKE ?)
+                ORDER BY RULE_ID DESC
+                OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
+                """
+            else:
+                query = """
+                SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, CREATED_BY
+                FROM BRM_RULES
+                WHERE (RULE_NAME LIKE ? OR RULE_SQL LIKE ?)
+                ORDER BY RULE_ID DESC
+                LIMIT 1000
+                """
             c.execute(query, (f"%{txt}%", f"%{txt}%"))
         else:
-            query = """
-            SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, CREATED_BY
-            FROM BRM_RULES
-            ORDER BY RULE_ID DESC
-            OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
-            """
+            if USE_ODBC:
+                query = """
+                SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, CREATED_BY
+                FROM BRM_RULES
+                ORDER BY RULE_ID DESC
+                OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
+                """
+            else:
+                query = """
+                SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, CREATED_BY
+                FROM BRM_RULES
+                ORDER BY RULE_ID DESC
+                LIMIT 1000
+                """
             c.execute(query)
         rows = get_cursor_rows(c)
         self.res_table.setRowCount(0)
@@ -1435,9 +1466,7 @@ class RuleDashboard(QGroupBox):
             else:
                 filters.append("STATUS=?")
                 params.append(st)
-        clause = " AND ".join(filters)
-        if not clause:
-            clause = "1=1"
+        clause = " AND ".join(filters) if filters else "1=1"
         return clause, params
     def load_rules(self):
         c = self.connection.cursor()
@@ -1452,16 +1481,15 @@ class RuleDashboard(QGroupBox):
         elif self.current_page < 1:
             self.current_page = 1
         self.page_label.setText(f"Page {self.current_page}/{self.total_pages}")
-        offset = (self.current_page - 1) * self.records_per_page
+        pagination_clause, pag_params = get_pagination_clause(self.records_per_page, (self.current_page - 1)*self.records_per_page)
         data_query = f"""
-        SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, OWNER_GROUP,
-               CREATED_TIMESTAMP, APPROVAL_STATUS
+        SELECT RULE_ID, RULE_NAME, RULE_SQL, STATUS, VERSION, OWNER_GROUP, CREATED_TIMESTAMP, APPROVAL_STATUS
         FROM BRM_RULES
         WHERE {clause}
         ORDER BY RULE_ID DESC
-        OFFSET ? ROWS FETCH NEXT ? ROWS ONLY
+        {pagination_clause}
         """
-        c.execute(data_query, (*params, offset, self.records_per_page))
+        c.execute(data_query, (*params, *pag_params))
         rows = get_cursor_rows(c)
         self.rule_table.setRowCount(0)
         for rd in rows:
@@ -1645,6 +1673,7 @@ class GroupManagementTab(QWidget):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
+        # Groups & Membership tab
         gm_tab = QWidget()
         gm_layout = QVBoxLayout(gm_tab)
         grp_box = QGroupBox("Group Details")
@@ -1689,6 +1718,7 @@ class GroupManagementTab(QWidget):
         membership_layout.addLayout(memb_btn_h)
         gm_layout.addWidget(membership_box)
         self.tabs.addTab(gm_tab, "Groups & Membership")
+        # Permissions tab
         perm_tab = QWidget()
         perm_layout = QVBoxLayout(perm_tab)
         perm_box = QGroupBox("Group Permissions")
@@ -1714,6 +1744,7 @@ class GroupManagementTab(QWidget):
         perm_box_layout.addLayout(pbtn_h)
         perm_layout.addWidget(perm_box)
         self.tabs.addTab(perm_tab, "Group Permissions")
+        # Approvers tab
         appr_tab = QWidget()
         appr_layout = QVBoxLayout(appr_tab)
         ah = QHBoxLayout()
@@ -2015,7 +2046,7 @@ class BackupRestoreHelpers:
                 rdict["RULE_ID"], rdict["PARENT_RULE_ID"], rdict["RULE_TYPE_ID"],
                 rdict["RULE_NAME"], rdict["RULE_SQL"], rdict["EFFECTIVE_START_DATE"],
                 rdict["EFFECTIVE_END_DATE"], rdict["STATUS"], rdict["VERSION"], rdict["CREATED_BY"],
-                rdict.get("DESCRIPTION"), rdict.get("OPERATION_TYPE"), rdict.get("BUSINESS_JUSTification", ""),
+                rdict.get("DESCRIPTION"), rdict.get("OPERATION_TYPE"), rdict.get("BUSINESS_Justification", ""),
                 rdict.get("CREATED_TIMESTAMP"), rdict.get("UPDATED_BY"), rdict["OWNER_GROUP"],
                 rdict.get("CLUSTER_NAME", ""), rdict.get("GROUP_ID", None), rdict.get("APPROVAL_STATUS", "DRAFT"),
                 rdict.get("IS_GLOBAL", 0), rdict.get("CRITICAL_RULE", 0), rdict.get("CRITICAL_SCOPE", "NONE"),
@@ -2119,7 +2150,7 @@ class BackupRestoreHelpers:
             """, (
                 rd["RULE_ID"], rd["PARENT_RULE_ID"], rd["RULE_TYPE_ID"], rd["RULE_NAME"], rd["RULE_SQL"],
                 rd["EFFECTIVE_START_DATE"], rd["EFFECTIVE_END_DATE"], rd["STATUS"], rd["VERSION"],
-                rd["CREATED_BY"], rd.get("DESCRIPTION"), rd.get("OPERATION_TYPE"), rd.get("BUSINESS_JUSTification", ""),
+                rd["CREATED_BY"], rd.get("DESCRIPTION"), rd.get("OPERATION_TYPE"), rd.get("BUSINESS_Justification", ""),
                 rd["CREATED_TIMESTAMP"], rd.get("UPDATED_BY"), rd["OWNER_GROUP"], rd.get("CLUSTER_NAME", ""),
                 rd.get("GROUP_ID", None), rd.get("APPROVAL_STATUS", "DRAFT"),
                 rd.get("IS_GLOBAL", 0), rd.get("CRITICAL_RULE", 0), rd.get("CRITICAL_SCOPE", "NONE"),
@@ -2765,8 +2796,6 @@ class CtrlTablesTab(QWidget):
         if not tbl:
             return
         c = self.connection.cursor()
-        # Use INFORMATION_SCHEMA for SQL Server (ODBC)
-        col_names = []
         try:
             if USE_ODBC:
                 c.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME=?", (tbl,))
@@ -2782,9 +2811,9 @@ class CtrlTablesTab(QWidget):
         try:
             if USE_ODBC:
                 query = f"SELECT * FROM {tbl} OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY"
-                c.execute(query)
             else:
-                c.execute(f"SELECT * FROM {tbl} LIMIT 500")
+                query = f"SELECT * FROM {tbl} LIMIT 500"
+            c.execute(query)
             rows = get_cursor_rows(c)
         except Exception as ex:
             QMessageBox.critical(self, "Error", "Failed to retrieve data: " + str(ex))
@@ -2796,7 +2825,7 @@ class CtrlTablesTab(QWidget):
             r = self.table_view.rowCount()
             self.table_view.insertRow(r)
             for j, cn in enumerate(col_names):
-                val = rd[cn] if cn in rd else ""
+                val = rd.get(cn, "")
                 self.table_view.setItem(r, j, QTableWidgetItem(str(val)))
 
 ###############################################################################
@@ -3224,7 +3253,7 @@ class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
         WHERE LOWER(RULE_NAME) LIKE ?
            OR LOWER(RULE_SQL) LIKE ?
            OR LOWER(DESCRIPTION) LIKE ?
-           OR LOWER(BUSINESS_JUSTIFICATION) LIKE ?
+           OR LOWER(BUSINESS_JUSTification) LIKE ?
            OR CAST(RULE_ID AS VARCHAR(50)) LIKE ?
         """, (f"%{ql}%", f"%{ql}%", f"%{ql}%", f"%{ql}%", f"%{ql}%"))
         for r in get_cursor_rows(c):
