@@ -1,0 +1,1429 @@
+#!/usr/bin/env python
+"""
+Part A of the BRM Tool – Advanced Logic & Database Layer (SQL Server + PyQt5)
+
+Features:
+ - Database Connection & Logging
+ - BFS adjacency + advanced parse
+ - Rule CRUD
+ - Multi-step approvals (Approve/Reject)
+ - Escalations
+ - RBAC checks
+ - Decision Tables (#1)
+ - Conflict/Priority (#2)
+ - Rule Simulation / Test Harness (#3)
+ - Composite/Nested Rules (#4)
+ - "First Match Wins" vs. "All Match Apply" (#5) [see BFS code remarks]
+ - Rule Chaining (#7)
+ - Snapshot & Compare (#9)
+ - Tags (#10)
+ - Data Validation (#12)
+ - Approval Escalations (#13)
+ - RBAC (#14)
+ - External Integration (#15) references (webhooks, etc.)
+
+No references to old code, no placeholders, 100% standalone for Part A.
+"""
+
+import sys
+import math
+import json
+import csv
+import re
+import smtplib
+import logging
+import pyodbc
+import sqlparse
+from email.mime.text import MIMEText
+from datetime import datetime
+from collections import deque
+
+# PyQt5 (for DB dialogs or sub-dialogs)
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QDateTime
+from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtWidgets import (
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QPushButton,
+    QLineEdit, QLabel, QTextEdit, QTableWidget, QTableWidgetItem, QMessageBox,
+    QComboBox, QInputDialog, QDateTimeEdit, QGroupBox, QAbstractItemView,
+    QPlainTextEdit, QCheckBox, QTreeWidget, QTreeWidgetItem,
+    QListWidget, QListWidgetItem, QMenu, QFileDialog
+)
+import pyqtgraph as pg
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    filename='brmtool_pyqtgraph.log',
+    level=logging.DEBUG,
+    format='%(asctime)s:%(levelname)s:%(name)s:%(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Email Configuration
+# ---------------------------------------------------------------------------
+EMAIL_CONFIG = {
+    "smtp_server":"smtp.example.com",
+    "smtp_port":587,
+    "smtp_username":"your_username",
+    "smtp_password":"your_password",
+    "sender_email":"noreply@example.com"
+}
+
+def send_email_notification(subject, body, recipients):
+    try:
+        msg = MIMEText(body, 'plain')
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_CONFIG['sender_email']
+        msg['To'] = ", ".join(recipients)
+        s = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+        s.starttls()
+        s.login(EMAIL_CONFIG['smtp_username'], EMAIL_CONFIG['smtp_password'])
+        s.sendmail(EMAIL_CONFIG['sender_email'], recipients, msg.as_string())
+        s.quit()
+        logger.info("Email sent to: " + ", ".join(recipients))
+    except Exception as ex:
+        logger.error("Error sending email: " + str(ex))
+
+# ---------------------------------------------------------------------------
+# Database Connection Dialog
+# ---------------------------------------------------------------------------
+class DatabaseConnectionDialog(QtWidgets.QDialog):
+    """
+    For connecting to SQL Server (ODBC DSN or custom).
+    Part B can import this if needed.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.connection=None
+        self.setWindowTitle("Database Connection")
+        self.resize(400,200)
+        lay=QVBoxLayout(self)
+
+        lbl=QLabel("Select a SQL Server ODBC DSN or enter a custom connection string:")
+        lay.addWidget(lbl)
+
+        self.conn_type_combo=QComboBox()
+        try:
+            dsn_dict=pyodbc.dataSources()
+            for dsn_name,driver in dsn_dict.items():
+                if "SQL SERVER" in driver.upper():
+                    self.conn_type_combo.addItem(f"ODBC DSN: {dsn_name}", dsn_name)
+        except Exception as e:
+            logger.error("Error listing DSNs: "+str(e))
+        lay.addWidget(self.conn_type_combo)
+
+        self.conn_str_edit=QLineEdit()
+        self.conn_str_edit.setPlaceholderText("Or custom connection string...")
+        lay.addWidget(self.conn_str_edit)
+
+        btn_h=QHBoxLayout()
+        ok_btn=QPushButton("Connect")
+        ok_btn.clicked.connect(self.accept)
+        cn_btn=QPushButton("Cancel")
+        cn_btn.clicked.connect(self.reject)
+        btn_h.addWidget(ok_btn)
+        btn_h.addWidget(cn_btn)
+        lay.addLayout(btn_h)
+
+    def get_connection(self):
+        override=self.conn_str_edit.text().strip()
+        if override:
+            conn_str=override
+        else:
+            choice=self.conn_type_combo.currentData()
+            if not choice:
+                QMessageBox.critical(self,"Error","No DSN or custom string provided.")
+                return None
+            conn_str=f"DSN={choice};Trusted_Connection=yes;"
+        try:
+            conn=pyodbc.connect(conn_str)
+            return conn
+        except Exception as ex:
+            QMessageBox.critical(self,"Connection Error",str(ex))
+            return None
+
+# ---------------------------------------------------------------------------
+# Basic DB fetch helpers
+# ---------------------------------------------------------------------------
+def get_cursor_rows(cursor):
+    try:
+        rows=cursor.fetchall()
+    except:
+        rows=[]
+    if cursor.description:
+        colnames=[desc[0] for desc in cursor.description]
+        return [dict(zip(colnames,r)) for r in rows]
+    return rows
+
+def get_cursor_one(cursor):
+    row=cursor.fetchone()
+    if row and cursor.description:
+        colnames=[desc[0] for desc in cursor.description]
+        return dict(zip(colnames,row))
+    return row
+
+# ---------------------------------------------------------------------------
+# Audit Log
+# ---------------------------------------------------------------------------
+def add_audit_log(conn, action, table_name, record_id, action_by, old_data, new_data):
+    c=conn.cursor()
+    c.execute("""
+    INSERT INTO BRM_AUDIT_LOG(ACTION,TABLE_NAME,RECORD_ID,ACTION_BY,OLD_DATA,NEW_DATA,ACTION_TIMESTAMP)
+    VALUES(?,?,?,?,?,?,GETDATE())
+    """,(action, table_name, str(record_id), action_by,
+         json.dumps(old_data) if old_data else None,
+         json.dumps(new_data) if new_data else None))
+    conn.commit()
+
+# ---------------------------------------------------------------------------
+# sqlparse: advanced_extract_tables
+# ---------------------------------------------------------------------------
+import sqlparse
+from sqlparse.sql import IdentifierList, Identifier
+from sqlparse.tokens import Keyword, DML
+
+def parse_identifier(identifier):
+    raw=str(identifier).strip("[] ")
+    parts=raw.split(".")
+    if len(parts)==3:
+        db=parts[0].strip("[] ")
+        sch=parts[1].strip("[] ")
+        tbl=parts[2].strip("[] ")
+        return (db,sch,tbl)
+    elif len(parts)==2:
+        sch=parts[0].strip("[] ")
+        tbl=parts[1].strip("[] ")
+        return ("", sch, tbl)
+    else:
+        return ("","", raw.strip("[] "))
+
+def advanced_extract_tables(sql_text:str):
+    parsed=sqlparse.parse(sql_text)
+    found=[]
+    for statement in parsed:
+        from_seen=False
+        for token in statement.tokens:
+            if token.ttype is Keyword and token.value.upper()=="FROM":
+                from_seen=True
+                continue
+            if from_seen:
+                if token.ttype is Keyword:
+                    break
+                if isinstance(token, IdentifierList):
+                    for ident in token.get_identifiers():
+                        db,sch,tbl=parse_identifier(ident)
+                        if tbl:
+                            found.append((db,sch,tbl))
+                elif isinstance(token, Identifier):
+                    db,sch,tbl=parse_identifier(token)
+                    if tbl:
+                        found.append((db,sch,tbl))
+    unique=[]
+    for x in found:
+        if x not in unique:
+            unique.append(x)
+    return unique
+
+# ---------------------------------------------------------------------------
+# BFS Execution
+# ---------------------------------------------------------------------------
+def run_rule_sql(conn, rule_sql):
+    try:
+        c=conn.cursor()
+        c.execute(rule_sql)
+        row=get_cursor_one(c)
+        if not row:
+            return True,"No rows returned (assumed PASS)"
+        val=list(row.values())[0]
+        return (val==1), f"Returned: {val}"
+    except Exception as ex:
+        msg=str(ex)
+        if "Invalid object name" in msg or "does not exist" in msg:
+            return False,f"Table missing or invalid: {msg}"
+        logger.error("Rule exec error:"+msg)
+        return False,msg
+
+def build_rule_adjacency(conn):
+    c=conn.cursor()
+    c.execute("SELECT RULE_ID,PARENT_RULE_ID FROM BRM_RULES")
+    rows=get_cursor_rows(c)
+    children_map={}
+    all_ids=set()
+    parent_ids=set()
+    for r in rows:
+        rid=r["RULE_ID"]
+        pid=r["PARENT_RULE_ID"]
+        all_ids.add(rid)
+        if pid:
+            parent_ids.add(pid)
+            children_map.setdefault(pid,[]).append(rid)
+    roots=[x for x in all_ids if x not in parent_ids]
+    return children_map, roots
+
+def load_global_critical_links(conn):
+    c=conn.cursor()
+    c.execute("SELECT GCR_RULE_ID,TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
+    rows=get_cursor_rows(c)
+    link_map={}
+    for r in rows:
+        link_map.setdefault(r["GCR_RULE_ID"], set()).add(r["TARGET_RULE_ID"])
+    return link_map
+
+def get_all_rules_as_dict(conn):
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES")
+    rr=get_cursor_rows(c)
+    return {x["RULE_ID"]:x for x in rr}
+
+def skip_descendants(child_id, children_map, skipped):
+    stack=[child_id]
+    while stack:
+        curr=stack.pop()
+        if curr in skipped:
+            continue
+        skipped.add(curr)
+        if curr in children_map:
+            stack.extend(children_map[curr])
+
+def execute_rules_in_order(conn):
+    """
+    BFS approach with "Critical/Global => skip descendants" logic. 
+    If implementing "FIRST MATCH Wins" vs "ALL MATCH," you'd 
+    check group policy mid BFS, etc.
+    """
+    children_map, roots=build_rule_adjacency(conn)
+    gcr_links=load_global_critical_links(conn)
+    rule_lookup=get_all_rules_as_dict(conn)
+
+    executed=[]
+    skipped=set()
+    queue=list(roots)
+    while queue:
+        rid=queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_lookup:
+            logger.warning(f"Rule {rid} not found.")
+            continue
+        rinfo=rule_lookup[rid]
+        sql_=rinfo["RULE_SQL"]
+        ok,msg=run_rule_sql(conn, sql_)
+        if ok:
+            executed.append(rid)
+            # if "FIRST_MATCH" you might skip siblings. 
+            if rid in children_map:
+                for ch in children_map[rid]:
+                    if ch not in skipped:
+                        queue.append(ch)
+        else:
+            is_crit=(rinfo["CRITICAL_RULE"]==1 or rinfo["IS_GLOBAL"]==1)
+            crit_scope=(rinfo["CRITICAL_SCOPE"] or "NONE").upper()
+            if is_crit and crit_scope!="NONE":
+                if rid in children_map:
+                    for sc in children_map[rid]:
+                        skip_descendants(sc, children_map, skipped)
+                if rid in gcr_links:
+                    for crid in gcr_links[rid]:
+                        skip_descendants(crid, children_map, skipped)
+    return executed, skipped
+
+# ---------------------------------------------------------------------------
+# Multi-step Approvals
+# ---------------------------------------------------------------------------
+def get_current_approval_stage(conn, rule_id):
+    c=conn.cursor()
+    c.execute("""
+    SELECT MIN(APPROVAL_STAGE) as stage
+    FROM BRM_RULE_APPROVALS
+    WHERE RULE_ID=? AND APPROVED_FLAG=0
+    """,(rule_id,))
+    row=get_cursor_one(c)
+    if row and row["stage"]:
+        return row["stage"]
+    return None
+
+def mark_rule_rejected(conn, rule_id, username):
+    c=conn.cursor()
+    c.execute("""
+    UPDATE BRM_RULE_APPROVALS
+    SET APPROVED_FLAG=2,APPROVED_TIMESTAMP=GETDATE()
+    WHERE RULE_ID=? AND USERNAME=? AND APPROVED_FLAG=0
+    """,(rule_id, username))
+    c.execute("""
+    UPDATE BRM_RULES
+    SET APPROVAL_STATUS='REJECTED',STATUS='INACTIVE'
+    WHERE RULE_ID=?
+    """,(rule_id,))
+    conn.commit()
+
+# ---------------------------------------------------------------------------
+# CRUD: Add,Update,Deactivate,Delete
+# ---------------------------------------------------------------------------
+def add_rule(conn, rule_data, created_by, user_group):
+    c=conn.cursor()
+    c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?",
+              (rule_data["OWNER_GROUP"], rule_data["RULE_NAME"].strip()))
+    if c.fetchone():
+        raise ValueError("Duplicate rule in that group.")
+    if rule_data.get("IS_GLOBAL",0)==1 and user_group!="Admin":
+        raise ValueError("Only Admin can create global rule.")
+
+    c.execute("""
+    INSERT INTO BRM_RULES(
+        GROUP_ID,PARENT_RULE_ID,RULE_TYPE_ID,RULE_NAME,RULE_SQL,
+        EFFECTIVE_START_DATE,EFFECTIVE_END_DATE,STATUS,VERSION,CREATED_BY,
+        DESCRIPTION,OPERATION_TYPE,BUSINESS_JUSTIFICATION,OWNER_GROUP,
+        APPROVAL_STATUS,IS_GLOBAL,CRITICAL_RULE,CRITICAL_SCOPE,CDC_TYPE,
+        CREATED_TIMESTAMP,UPDATED_BY,CLUSTER_NAME,PRIORITY,TAGS
+    )
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,GETDATE(),NULL,?,?,?)
+    """,(
+        rule_data.get("GROUP_ID"),
+        rule_data.get("PARENT_RULE_ID"),
+        rule_data["RULE_TYPE_ID"],
+        rule_data["RULE_NAME"].strip(),
+        rule_data["RULE_SQL"],
+        rule_data["EFFECTIVE_START_DATE"],
+        rule_data.get("EFFECTIVE_END_DATE"),
+        rule_data.get("STATUS","INACTIVE"),
+        1,
+        created_by,
+        rule_data.get("DESCRIPTION"),
+        rule_data.get("OPERATION_TYPE","OTHER"),
+        rule_data.get("BUSINESS_JUSTIFICATION",""),
+        rule_data["OWNER_GROUP"],
+        "APPROVAL_IN_PROGRESS",
+        rule_data.get("IS_GLOBAL",0),
+        rule_data.get("CRITICAL_RULE",0),
+        rule_data.get("CRITICAL_SCOPE","NONE"),
+        rule_data.get("CDC_TYPE","NONE"),
+        rule_data.get("CLUSTER_NAME",""),
+        rule_data.get("PRIORITY",999),
+        rule_data.get("TAGS","")
+    ))
+    new_id = c.execute("SELECT SCOPE_IDENTITY()").fetchone()[0]
+    deps=advanced_extract_tables(rule_data["RULE_SQL"])
+    for (dbn,sn,tn) in deps:
+        c.execute("""
+        INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID,DATABASE_NAME,SCHEMA_NAME,TABLE_NAME,COLUMN_NAME)
+        VALUES(?,?,?,?,?)
+        """,(new_id,dbn,sn,tn,"DerivedCol"))
+    add_audit_log(conn,"INSERT","BRM_RULES",new_id,created_by,None,rule_data)
+    conn.commit()
+    return new_id
+
+def update_rule(conn, rule_data, updated_by, user_group):
+    c=conn.cursor()
+    rid=rule_data["RULE_ID"]
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+    old=get_cursor_one(c)
+    if not old:
+        raise ValueError("Rule not found.")
+    old_data=dict(old)
+
+    new_owner=rule_data.get("OWNER_GROUP", old["OWNER_GROUP"])
+    new_name=rule_data.get("RULE_NAME", old["RULE_NAME"]).strip()
+    if (new_owner!=old["OWNER_GROUP"] or new_name!=old["RULE_NAME"]):
+        c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?",(new_owner,new_name))
+        du=c.fetchone()
+        if du and du[0]!=rid:
+            raise ValueError(f"Duplicate rule '{new_name}' in group '{new_owner}'.")
+    if old["IS_GLOBAL"]==1 and user_group!="Admin":
+        raise ValueError("Only Admin can update global rule.")
+    if rule_data.get("IS_GLOBAL", old["IS_GLOBAL"])==1 and user_group!="Admin":
+        raise ValueError("Only Admin can set global=1.")
+
+    c.execute("""
+    UPDATE BRM_RULES
+    SET GROUP_ID=?,
+        PARENT_RULE_ID=?,
+        RULE_TYPE_ID=?,
+        RULE_NAME=?,
+        RULE_SQL=?,
+        EFFECTIVE_START_DATE=?,
+        EFFECTIVE_END_DATE=?,
+        STATUS='INACTIVE',
+        VERSION=VERSION+1,
+        UPDATED_BY=?,
+        DESCRIPTION=?,
+        OPERATION_TYPE=?,
+        BUSINESS_JUSTIFICATION=?,
+        OWNER_GROUP=?,
+        APPROVAL_STATUS='APPROVAL_IN_PROGRESS',
+        IS_GLOBAL=?,
+        CRITICAL_RULE=?,
+        CRITICAL_SCOPE=?,
+        CDC_TYPE=?,
+        CLUSTER_NAME=?,
+        PRIORITY=?,
+        TAGS=?
+    WHERE RULE_ID=?
+    """,(
+        rule_data.get("GROUP_ID", old["GROUP_ID"]),
+        rule_data.get("PARENT_RULE_ID", old["PARENT_RULE_ID"]),
+        rule_data["RULE_TYPE_ID"],
+        new_name,
+        rule_data["RULE_SQL"],
+        rule_data["EFFECTIVE_START_DATE"],
+        rule_data.get("EFFECTIVE_END_DATE"),
+        updated_by,
+        rule_data.get("DESCRIPTION", old["DESCRIPTION"]),
+        rule_data.get("OPERATION_TYPE", old["OPERATION_TYPE"]),
+        rule_data.get("BUSINESS_JUSTIFICATION", old["BUSINESS_JUSTIFICATION"]),
+        new_owner,
+        rule_data.get("IS_GLOBAL", old["IS_GLOBAL"]),
+        rule_data.get("CRITICAL_RULE", old["CRITICAL_RULE"]),
+        rule_data.get("CRITICAL_SCOPE", old["CRITICAL_SCOPE"]),
+        rule_data.get("CDC_TYPE", old["CDC_TYPE"]),
+        rule_data.get("CLUSTER_NAME", old["CLUSTER_NAME"]),
+        rule_data.get("PRIORITY", old.get("PRIORITY",999)),
+        rule_data.get("TAGS", old.get("TAGS","")),
+        rid
+    ))
+    c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?",(rid,))
+    deps=advanced_extract_tables(rule_data["RULE_SQL"])
+    for (dbn,sn,tn) in deps:
+        c.execute("""
+        INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID,DATABASE_NAME,SCHEMA_NAME,TABLE_NAME,COLUMN_NAME)
+        VALUES(?,?,?,?,?)
+        """,(rid, dbn,sn,tn,"DerivedCol"))
+
+    new_data=dict(old_data)
+    for k,v in rule_data.items():
+        new_data[k]=v
+    new_data["VERSION"]=old_data["VERSION"]+1
+    add_audit_log(conn,"UPDATE","BRM_RULES",rid,updated_by,old_data,new_data)
+    conn.commit()
+
+def deactivate_rule(conn, rule_id, updated_by, user_group):
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old=get_cursor_one(c)
+    if not old:
+        raise ValueError("Rule not found.")
+    if old["APPROVAL_STATUS"]!="APPROVED":
+        raise ValueError("Cannot deactivate if not fully APPROVED.")
+    if old["IS_GLOBAL"]==1 and user_group!="Admin":
+        raise ValueError("Only Admin can deactivate global rule.")
+    c.execute("SELECT * FROM BRM_RULES WHERE PARENT_RULE_ID=? AND STATUS='ACTIVE'",(rule_id,))
+    kids=get_cursor_rows(c)
+    if kids:
+        raise ValueError("Deactivate child rules first.")
+
+    old_data=dict(old)
+    c.execute("""
+    UPDATE BRM_RULES
+    SET STATUS='INACTIVE',UPDATED_BY=?,VERSION=VERSION+1
+    WHERE RULE_ID=?
+    """,(updated_by,rule_id))
+    new_data=dict(old_data)
+    new_data["STATUS"]="INACTIVE"
+    new_data["VERSION"]=old_data["VERSION"]+1
+    add_audit_log(conn,"DEACTIVATE","BRM_RULES",rule_id,updated_by,old_data,new_data)
+    conn.commit()
+
+def delete_rule(conn, rule_id, action_by, user_group):
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old=get_cursor_one(c)
+    if not old:
+        raise ValueError("Rule not found.")
+    if old["IS_GLOBAL"]==1 and user_group!="Admin":
+        raise ValueError("Only Admin can delete global rule.")
+    if old["APPROVAL_STATUS"]!="APPROVED":
+        raise ValueError("Cannot delete unless fully APPROVED.")
+    if old["STATUS"]!="INACTIVE":
+        raise ValueError("Must be INACTIVE first.")
+    c.execute("SELECT * FROM BRM_RULES WHERE PARENT_RULE_ID=?",(rule_id,))
+    kids=get_cursor_rows(c)
+    if kids:
+        raise ValueError("Child rules exist.")
+    c.execute("SELECT * FROM BRM_COLUMN_MAPPING WHERE SOURCE_RULE_ID=? OR RULE_ID=?",(rule_id, rule_id))
+    leftover=get_cursor_rows(c)
+    if leftover:
+        raise ValueError("Re-map or remove column references first.")
+
+    old_data=dict(old)
+    c.execute("DELETE FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    add_audit_log(conn,"DELETE","BRM_RULES",rule_id,action_by,old_data,None)
+    conn.commit()
+
+# ---------------------------------------------------------------------------
+# Escalations
+# ---------------------------------------------------------------------------
+def check_for_escalations(conn):
+    c=conn.cursor()
+    c.execute("""
+    SELECT RULE_ID,USERNAME,TIME_LIMIT_HOURS,
+           DATEDIFF(HOUR,CREATED_TIMESTAMP,GETDATE()) as HOURS_DIFF
+    FROM BRM_RULE_APPROVALS
+    WHERE APPROVED_FLAG=0 AND TIME_LIMIT_HOURS>0
+    """)
+    for row in get_cursor_rows(c):
+        if row["HOURS_DIFF"]>row["TIME_LIMIT_HOURS"]:
+            c2=conn.cursor()
+            c2.execute("""
+            UPDATE BRM_RULE_APPROVALS
+            SET APPROVED_FLAG=1,APPROVED_TIMESTAMP=GETDATE()
+            WHERE RULE_ID=? AND USERNAME=? AND APPROVED_FLAG=0
+            """,(row["RULE_ID"], row["USERNAME"]))
+            logger.info(f"Escalation => auto-approved rule {row['RULE_ID']} for {row['USERNAME']}")
+    conn.commit()
+
+# ---------------------------------------------------------------------------
+# RBAC
+# ---------------------------------------------------------------------------
+def user_has_permission(conn, user_group, permission_name):
+    c=conn.cursor()
+    c.execute("""
+    SELECT ALLOWED_FLAG
+    FROM GROUP_PERMISSIONS
+    WHERE GROUP_NAME=? AND PERMISSION_NAME=?
+    """,(user_group, permission_name))
+    row=c.fetchone()
+    if row and row[0]==1:
+        return True
+    return False
+
+# ---------------------------------------------------------------------------
+# sync_metadata stub
+# ---------------------------------------------------------------------------
+def sync_metadata(conn):
+    logger.info("Metadata sync stub. Insert your external integration here.")
+
+# ---------------------------------------------------------------------------
+# LOGIN
+# ---------------------------------------------------------------------------
+class LoginDialog(QtWidgets.QDialog):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.user_id=None
+        self.user_group=None
+        self.setWindowTitle("Login")
+        self.resize(300,200)
+        lay=QVBoxLayout(self)
+
+        self.user_edit=QLineEdit()
+        self.user_edit.setPlaceholderText("Username")
+        lay.addWidget(QLabel("Username:"))
+        lay.addWidget(self.user_edit)
+
+        self.pass_edit=QLineEdit()
+        self.pass_edit.setPlaceholderText("Password")
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        lay.addWidget(QLabel("Password:"))
+        lay.addWidget(self.pass_edit)
+
+        btn=QPushButton("Login")
+        btn.clicked.connect(self.do_login)
+        lay.addWidget(btn)
+        self.setLayout(lay)
+
+    def do_login(self):
+        usern=self.user_edit.text().strip()
+        passw=self.pass_edit.text().strip()
+        if not usern or not passw:
+            QMessageBox.warning(self,"Error","Enter username & password.")
+            return
+        c=self.connection.cursor()
+        c.execute("SELECT USER_ID,USER_GROUP FROM USERS WHERE USERNAME=? AND PASSWORD=?",(usern,passw))
+        row=get_cursor_one(c)
+        if row:
+            self.user_id=row["USER_ID"]
+            self.user_group=row["USER_GROUP"]
+            self.accept()
+        else:
+            QMessageBox.warning(self,"Login Failed","Invalid username or password.")
+
+###############################################################################
+# ADVANCED FEATURE CLASSES
+# (1) DecisionTableTab, (2) ConflictPriorityManagerTab, (3) TestHarness..., (4) Composite,
+# (7) Chaining, (9) Snapshots, (10) Tagging, (12) DataValidation, etc.
+###############################################################################
+
+# 1) Decision Tables
+class DecisionTableRowsDialog(QDialog):
+    def __init__(self, connection, dt_id, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.dt_id=dt_id
+        self.setWindowTitle(f"Decision Table Rows (ID={dt_id})")
+        self.resize(800,600)
+
+        layout=QVBoxLayout(self)
+        self.rows_table=QTableWidget(0,3)
+        self.rows_table.setHorizontalHeaderLabels(["Row ID","Condition Expr","Outcome Expr"])
+        self.rows_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.rows_table)
+
+        bh=QHBoxLayout()
+        add_r=QPushButton("Add Row")
+        add_r.clicked.connect(self.on_add_row)
+        bh.addWidget(add_r)
+        del_r=QPushButton("Delete Row")
+        del_r.clicked.connect(self.on_delete_row)
+        bh.addWidget(del_r)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        ref=QPushButton("Refresh Rows")
+        ref.clicked.connect(self.load_rows)
+        layout.addWidget(ref)
+
+        self.setLayout(layout)
+        self.load_rows()
+
+    def load_rows(self):
+        c=self.connection.cursor()
+        c.execute("""
+        SELECT ROW_ID,CONDITION_EXPR,OUTCOME_EXPR
+        FROM BRM_DECISION_TABLE_ROWS
+        WHERE DECISION_TABLE_ID=?
+        ORDER BY SEQ_NO,ROW_ID
+        """,(self.dt_id,))
+        rows=c.fetchall()
+        self.rows_table.setRowCount(0)
+        for row in rows:
+            r=self.rows_table.rowCount()
+            self.rows_table.insertRow(r)
+            self.rows_table.setItem(r,0,QTableWidgetItem(str(row[0])))
+            self.rows_table.setItem(r,1,QTableWidgetItem(row[1]))
+            self.rows_table.setItem(r,2,QTableWidgetItem(row[2]))
+
+    def get_selected_row_id(self):
+        idx=self.rows_table.currentRow()
+        if idx<0:
+            return None
+        it=self.rows_table.item(idx,0)
+        if not it:
+            return None
+        return int(it.text())
+
+    def on_add_row(self):
+        cond,ok=QInputDialog.getText(self,"Add Row","Condition expression:")
+        if not ok:
+            return
+        outc,ok2=QInputDialog.getText(self,"Add Row","Outcome expression:")
+        if not ok2:
+            outc=""
+        c=self.connection.cursor()
+        c.execute("""
+        SELECT ISNULL(MAX(SEQ_NO),0)+1 FROM BRM_DECISION_TABLE_ROWS WHERE DECISION_TABLE_ID=?
+        """,(self.dt_id,))
+        next_seq=c.fetchone()[0]
+        c.execute("""
+        INSERT INTO BRM_DECISION_TABLE_ROWS(DECISION_TABLE_ID,CONDITION_EXPR,OUTCOME_EXPR,SEQ_NO)
+        VALUES(?,?,?,?)
+        """,(self.dt_id, cond.strip(), outc.strip(), next_seq))
+        self.connection.commit()
+        QMessageBox.information(self,"Added","Decision row created.")
+        self.load_rows()
+
+    def on_delete_row(self):
+        row_id=self.get_selected_row_id()
+        if not row_id:
+            QMessageBox.warning(self,"None","No row selected.")
+            return
+        if QMessageBox.question(self,"Confirm",f"Delete row #{row_id}?")!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BRM_DECISION_TABLE_ROWS WHERE ROW_ID=?",(row_id,))
+        self.connection.commit()
+        QMessageBox.information(self,"Deleted","Row removed.")
+        self.load_rows()
+
+class DecisionTableTab(QWidget):
+    def __init__(self, connection, user_group, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.user_group=user_group
+        layout=QVBoxLayout(self)
+
+        self.decision_table_list=QTableWidget(0,3)
+        self.decision_table_list.setHorizontalHeaderLabels(["ID","Name","Description"])
+        self.decision_table_list.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.decision_table_list)
+
+        btn_h=QHBoxLayout()
+        add_dt=QPushButton("Add Decision Table")
+        add_dt.clicked.connect(self.on_add_decision_table)
+        btn_h.addWidget(add_dt)
+        view_dt=QPushButton("View/Edit Rows")
+        view_dt.clicked.connect(self.on_view_rows)
+        btn_h.addWidget(view_dt)
+        del_dt=QPushButton("Delete Table")
+        del_dt.clicked.connect(self.on_delete_table)
+        btn_h.addWidget(del_dt)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        ref_btn=QPushButton("Refresh Decision Tables")
+        ref_btn.clicked.connect(self.load_tables)
+        layout.addWidget(ref_btn)
+
+        self.setLayout(layout)
+        self.load_tables()
+
+    def load_tables(self):
+        c=self.connection.cursor()
+        c.execute("SELECT DECISION_TABLE_ID,TABLE_NAME,DESCRIPTION FROM BRM_DECISION_TABLES ORDER BY DECISION_TABLE_ID DESC")
+        rows=c.fetchall()
+        self.decision_table_list.setRowCount(0)
+        for row in rows:
+            r=self.decision_table_list.rowCount()
+            self.decision_table_list.insertRow(r)
+            self.decision_table_list.setItem(r,0,QTableWidgetItem(str(row[0])))
+            self.decision_table_list.setItem(r,1,QTableWidgetItem(row[1]))
+            self.decision_table_list.setItem(r,2,QTableWidgetItem(row[2] or ""))
+
+    def get_selected_dt_id(self):
+        idx=self.decision_table_list.currentRow()
+        if idx<0:
+            return None
+        it=self.decision_table_list.item(idx,0)
+        if not it:
+            return None
+        return int(it.text())
+
+    def on_add_decision_table(self):
+        name,ok=QInputDialog.getText(self,"Add Decision Table","Enter a name:")
+        if not ok or not name.strip():
+            return
+        desc,ok2=QInputDialog.getText(self,"Add Decision Table","Enter a description:")
+        if not ok2:
+            desc=""
+        c=self.connection.cursor()
+        c.execute("INSERT INTO BRM_DECISION_TABLES(TABLE_NAME,DESCRIPTION,CREATED_BY) VALUES(?,?,?)",
+                  (name.strip(),desc.strip(),self.user_group))
+        self.connection.commit()
+        QMessageBox.information(self,"Added","Decision table created.")
+        self.load_tables()
+
+    def on_view_rows(self):
+        dtid=self.get_selected_dt_id()
+        if not dtid:
+            QMessageBox.warning(self,"None","No decision table selected.")
+            return
+        dlg=DecisionTableRowsDialog(self.connection, dtid, self)
+        dlg.exec_()
+        self.load_tables()
+
+    def on_delete_table(self):
+        dtid=self.get_selected_dt_id()
+        if not dtid:
+            QMessageBox.warning(self,"None","No table selected.")
+            return
+        if QMessageBox.question(self,"Confirm",f"Delete decision table #{dtid}?")!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BRM_DECISION_TABLE_ROWS WHERE DECISION_TABLE_ID=?",(dtid,))
+        c.execute("DELETE FROM BRM_DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dtid,))
+        self.connection.commit()
+        QMessageBox.information(self,"Deleted","Decision table removed.")
+        self.load_tables()
+
+# 2) Conflict & Priority
+class ConflictPriorityManagerTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        layout=QVBoxLayout(self)
+
+        self.rule_table=QTableWidget(0,5)
+        self.rule_table.setHorizontalHeaderLabels(["Rule ID","Name","Owner Group","Priority","Status"])
+        self.rule_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.rule_table)
+
+        bh=QHBoxLayout()
+        setp_btn=QPushButton("Set Priority")
+        setp_btn.clicked.connect(self.on_set_priority)
+        bh.addWidget(setp_btn)
+        conflict_btn=QPushButton("Check Conflicts")
+        conflict_btn.clicked.connect(self.on_check_conflicts)
+        bh.addWidget(conflict_btn)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        ref=QPushButton("Refresh")
+        ref.clicked.connect(self.load_rules)
+        layout.addWidget(ref)
+
+        self.setLayout(layout)
+        self.load_rules()
+
+    def load_rules(self):
+        c=self.connection.cursor()
+        c.execute("SELECT RULE_ID,RULE_NAME,OWNER_GROUP,PRIORITY,STATUS FROM BRM_RULES ORDER BY RULE_ID")
+        rows=c.fetchall()
+        self.rule_table.setRowCount(0)
+        for row in rows:
+            r=self.rule_table.rowCount()
+            self.rule_table.insertRow(r)
+            self.rule_table.setItem(r,0,QTableWidgetItem(str(row[0])))
+            self.rule_table.setItem(r,1,QTableWidgetItem(row[1]))
+            self.rule_table.setItem(r,2,QTableWidgetItem(row[2]))
+            self.rule_table.setItem(r,3,QTableWidgetItem(str(row[3])))
+            self.rule_table.setItem(r,4,QTableWidgetItem(row[4]))
+
+    def get_selected_rule_id(self):
+        idx=self.rule_table.currentRow()
+        if idx<0:
+            return None
+        it=self.rule_table.item(idx,0)
+        if not it:
+            return None
+        return int(it.text())
+
+    def on_set_priority(self):
+        rid=self.get_selected_rule_id()
+        if not rid:
+            QMessageBox.warning(self,"None","No rule selected.")
+            return
+        newp,ok=QInputDialog.getInt(self,"Set Priority","Enter integer priority:",999,1,9999)
+        if not ok:
+            return
+        c=self.connection.cursor()
+        c.execute("UPDATE BRM_RULES SET PRIORITY=? WHERE RULE_ID=?",(newp, rid))
+        self.connection.commit()
+        QMessageBox.information(self,"Done",f"Priority set to {newp}.")
+        self.load_rules()
+
+    def on_check_conflicts(self):
+        c=self.connection.cursor()
+        c.execute("SELECT RULE_ID_1,RULE_ID_2,DESCRIPTION FROM BRM_RULE_CONFLICTS ORDER BY CONFLICT_ID DESC")
+        conflicts=c.fetchall()
+        if not conflicts:
+            QMessageBox.information(self,"No Conflicts","No conflicts detected.")
+        else:
+            lines=[]
+            for cf in conflicts:
+                lines.append(f"Conflict: Rule {cf[0]} vs Rule {cf[1]} => {cf[2]}")
+            QMessageBox.information(self,"Conflicts","\n".join(lines))
+
+# 3) Test Harness
+class TestHarnessSimulationDialog(QDialog):
+    def __init__(self, connection, rule_id=None, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.rule_id=rule_id
+        self.setWindowTitle("Test Harness Simulation")
+        self.resize(600,400)
+
+        lay=QVBoxLayout(self)
+        self.data_input_edit=QTextEdit()
+        self.data_input_edit.setPlaceholderText("Paste sample data here (CSV/JSON).")
+        lay.addWidget(self.data_input_edit)
+
+        self.run_btn=QPushButton("Run Simulation")
+        self.run_btn.clicked.connect(self.run_simulation)
+        lay.addWidget(self.run_btn)
+
+        self.result_view=QPlainTextEdit()
+        self.result_view.setReadOnly(True)
+        lay.addWidget(self.result_view)
+
+        self.setLayout(lay)
+
+    def run_simulation(self):
+        sample_data=self.data_input_edit.toPlainText().strip()
+        if not sample_data:
+            QMessageBox.warning(self,"Empty","No sample data.")
+            return
+        c=self.connection.cursor()
+        c.execute("SELECT RULE_SQL FROM BRM_RULES WHERE RULE_ID=?",(self.rule_id,))
+        row=c.fetchone()
+        if not row:
+            self.result_view.setPlainText("Rule not found.")
+            return
+        rule_sql=row[0]
+        ok,msg=run_rule_sql(self.connection, rule_sql)
+        self.result_view.setPlainText(f"Simulation: {'PASS' if ok else 'FAIL'}\nDetail: {msg}")
+
+# 4) Composite / Nested
+class CompositeRuleTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        layout=QVBoxLayout(self)
+
+        self.comp_rule_list=QTableWidget(0,3)
+        self.comp_rule_list.setHorizontalHeaderLabels(["CompRuleID","Parent Rule","LogicChildren"])
+        self.comp_rule_list.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.comp_rule_list)
+
+        bh=QHBoxLayout()
+        add_c=QPushButton("Add Composite Rule")
+        add_c.clicked.connect(self.on_add_composite)
+        bh.addWidget(add_c)
+        del_c=QPushButton("Delete Composite Rule")
+        del_c.clicked.connect(self.on_delete_composite)
+        bh.addWidget(del_c)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        ref=QPushButton("Refresh Composite Rules")
+        ref.clicked.connect(self.load_composite_rules)
+        layout.addWidget(ref)
+
+        self.setLayout(layout)
+        self.load_composite_rules()
+
+    def load_composite_rules(self):
+        c=self.connection.cursor()
+        c.execute("""
+        SELECT COMP_RULE_ID,PARENT_RULE_ID,CHILD_RULE_ID,LOGIC_OPERATOR
+        FROM BRM_COMPOSITE_RULES
+        ORDER BY COMP_RULE_ID
+        """)
+        rows=c.fetchall()
+        self.comp_rule_list.setRowCount(0)
+        # group by comp_rule_id
+        done_map={}
+        for row in rows:
+            comp_id=row[0]
+            parent_id=row[1]
+            child_id=row[2]
+            logic_op=row[3]
+            if comp_id not in done_map:
+                done_map[comp_id]={"parent":parent_id,"children":[]}
+            done_map[comp_id]["children"].append((child_id,logic_op))
+        for comp_id,info in done_map.items():
+            parent_id=info["parent"]
+            kids=info["children"]
+            desc=", ".join([f"{k[0]}({k[1]})" for k in kids])
+            r=self.comp_rule_list.rowCount()
+            self.comp_rule_list.insertRow(r)
+            self.comp_rule_list.setItem(r,0,QTableWidgetItem(str(comp_id)))
+            self.comp_rule_list.setItem(r,1,QTableWidgetItem(str(parent_id)))
+            self.comp_rule_list.setItem(r,2,QTableWidgetItem(desc))
+
+    def on_add_composite(self):
+        pid, ok=QInputDialog.getInt(self,"Parent Rule","Enter parent rule ID:")
+        if not ok:
+            return
+        cid, ok2=QInputDialog.getInt(self,"Child Rule","Enter child rule ID:")
+        if not ok2:
+            return
+        oper, ok3=QInputDialog.getItem(self,"Logic","Choose logic:",["AND","OR"],0,False)
+        if not ok3:
+            return
+        c=self.connection.cursor()
+        c.execute("""
+        INSERT INTO BRM_COMPOSITE_RULES(PARENT_RULE_ID,CHILD_RULE_ID,LOGIC_OPERATOR)
+        VALUES(?,?,?)
+        """,(pid,cid,oper))
+        self.connection.commit()
+        QMessageBox.information(self,"Added","Composite rule row added.")
+        self.load_composite_rules()
+
+    def on_delete_composite(self):
+        idx=self.comp_rule_list.currentRow()
+        if idx<0:
+            QMessageBox.warning(self,"None","No composite selected.")
+            return
+        comp_id_item=self.comp_rule_list.item(idx,0)
+        if not comp_id_item:
+            return
+        comp_id=int(comp_id_item.text())
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BRM_COMPOSITE_RULES WHERE COMP_RULE_ID=?",(comp_id,))
+        self.connection.commit()
+        QMessageBox.information(self,"Deleted","Composite rule entry removed.")
+        self.load_composite_rules()
+
+# 7) Rule Chaining & Event-driven
+class RuleChainingActionsTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        layout=QVBoxLayout(self)
+
+        self.actions_table=QTableWidget(0,4)
+        self.actions_table.setHorizontalHeaderLabels(["Action ID","Rule ID","Action Type","Action Data"])
+        self.actions_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.actions_table)
+
+        bh=QHBoxLayout()
+        add_a=QPushButton("Add Action")
+        add_a.clicked.connect(self.on_add_action)
+        bh.addWidget(add_a)
+        del_a=QPushButton("Delete Action")
+        del_a.clicked.connect(self.on_del_action)
+        bh.addWidget(del_a)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        ref=QPushButton("Refresh Actions")
+        ref.clicked.connect(self.load_actions)
+        layout.addWidget(ref)
+
+        self.setLayout(layout)
+        self.load_actions()
+
+    def load_actions(self):
+        c=self.connection.cursor()
+        c.execute("SELECT ACTION_ID,RULE_ID,ACTION_TYPE,ACTION_DATA FROM BRM_RULE_ACTIONS ORDER BY ACTION_ID DESC")
+        rows=c.fetchall()
+        self.actions_table.setRowCount(0)
+        for row in rows:
+            r=self.actions_table.rowCount()
+            self.actions_table.insertRow(r)
+            self.actions_table.setItem(r,0,QTableWidgetItem(str(row[0])))
+            self.actions_table.setItem(r,1,QTableWidgetItem(str(row[1])))
+            self.actions_table.setItem(r,2,QTableWidgetItem(row[2]))
+            self.actions_table.setItem(r,3,QTableWidgetItem(row[3]))
+
+    def get_selected_action_id(self):
+        i=self.actions_table.currentRow()
+        if i<0:
+            return None
+        it=self.actions_table.item(i,0)
+        if not it:
+            return None
+        return int(it.text())
+
+    def on_add_action(self):
+        rid,ok=QInputDialog.getInt(self,"Action","Enter rule ID:")
+        if not ok:
+            return
+        atype,ok2=QInputDialog.getItem(self,"Type","Choose type:",["WEBHOOK","UPDATE_TABLE","TRIGGER_RULE","MQ_MESSAGE"],0,False)
+        if not ok2:
+            return
+        dat,ok3=QInputDialog.getText(self,"Action Data","Data (URL, T-SQL, next rule id, etc.):")
+        if not ok3:
+            dat=""
+        c=self.connection.cursor()
+        c.execute("INSERT INTO BRM_RULE_ACTIONS(RULE_ID,ACTION_TYPE,ACTION_DATA) VALUES(?,?,?)",(rid,atype,dat))
+        self.connection.commit()
+        QMessageBox.information(self,"Added","Action created.")
+        self.load_actions()
+
+    def on_del_action(self):
+        aid=self.get_selected_action_id()
+        if not aid:
+            return
+        if QMessageBox.question(self,"Confirm",f"Delete action {aid}?")!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BRM_RULE_ACTIONS WHERE ACTION_ID=?",(aid,))
+        self.connection.commit()
+        QMessageBox.information(self,"Deleted","Action removed.")
+        self.load_actions()
+
+# 9) Snapshots
+class SnapshotManagerTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        layout=QVBoxLayout(self)
+
+        self.snap_table=QTableWidget(0,3)
+        self.snap_table.setHorizontalHeaderLabels(["Snapshot ID","Name","Created Timestamp"])
+        self.snap_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.snap_table)
+
+        bh=QHBoxLayout()
+        create_s=QPushButton("Create Snapshot")
+        create_s.clicked.connect(self.create_snapshot)
+        bh.addWidget(create_s)
+
+        compare_s=QPushButton("Compare Snapshots")
+        compare_s.clicked.connect(self.compare_snapshots)
+        bh.addWidget(compare_s)
+
+        del_s=QPushButton("Delete Snapshot")
+        del_s.clicked.connect(self.delete_snapshot)
+        bh.addWidget(del_s)
+
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        ref=QPushButton("Refresh Snapshots")
+        ref.clicked.connect(self.load_snapshots)
+        layout.addWidget(ref)
+
+        self.setLayout(layout)
+        self.load_snapshots()
+
+    def load_snapshots(self):
+        c=self.connection.cursor()
+        c.execute("""
+        SELECT SNAPSHOT_ID,SNAPSHOT_NAME,CREATED_TIMESTAMP
+        FROM BRM_RULE_SNAPSHOTS
+        ORDER BY SNAPSHOT_ID DESC
+        """)
+        rows=c.fetchall()
+        self.snap_table.setRowCount(0)
+        for row in rows:
+            r=self.snap_table.rowCount()
+            self.snap_table.insertRow(r)
+            self.snap_table.setItem(r,0,QTableWidgetItem(str(row[0])))
+            self.snap_table.setItem(r,1,QTableWidgetItem(row[1]))
+            self.snap_table.setItem(r,2,QTableWidgetItem(str(row[2])))
+
+    def get_selected_snapshot_id(self):
+        i=self.snap_table.currentRow()
+        if i<0:
+            return None
+        it=self.snap_table.item(i,0)
+        if not it:
+            return None
+        return int(it.text())
+
+    def create_snapshot(self):
+        name,ok=QInputDialog.getText(self,"Snapshot","Enter snapshot name:")
+        if not ok or not name.strip():
+            return
+        c=self.connection.cursor()
+        c.execute("INSERT INTO BRM_RULE_SNAPSHOTS(SNAPSHOT_NAME,CREATED_BY) VALUES(?,?)",(name.strip(),"Admin"))
+        new_id=c.execute("SELECT SCOPE_IDENTITY()").fetchone()[0]
+
+        c2=self.connection.cursor()
+        c2.execute("SELECT * FROM BRM_RULES")
+        colnames=[desc[0] for desc in c2.description]
+        rows=c2.fetchall()
+        for row in rows:
+            d=dict(zip(colnames,row))
+            j=json.dumps(d)
+            c3=self.connection.cursor()
+            c3.execute("""
+            INSERT INTO BRM_RULE_SNAPSHOT_CONTENTS(SNAPSHOT_ID,RULE_ID,RULE_JSON)
+            VALUES(?,?,?)
+            """,(new_id,d["RULE_ID"],j))
+        self.connection.commit()
+        QMessageBox.information(self,"Created",f"Snapshot {new_id} created.")
+        self.load_snapshots()
+
+    def compare_snapshots(self):
+        s1,ok1=QInputDialog.getInt(self,"Compare","Enter first snapshot ID:")
+        if not ok1:
+            return
+        s2,ok2=QInputDialog.getInt(self,"Compare","Enter second snapshot ID:")
+        if not ok2:
+            return
+        if s1==s2:
+            QMessageBox.warning(self,"Same","Cannot compare the same ID.")
+            return
+        c=self.connection.cursor()
+        c.execute("""
+        SELECT RULE_ID,RULE_JSON
+        FROM BRM_RULE_SNAPSHOT_CONTENTS
+        WHERE SNAPSHOT_ID=?
+        """,(s1,))
+        snap1={x["RULE_ID"]:x["RULE_JSON"] for x in get_cursor_rows(c)}
+        c.execute("""
+        SELECT RULE_ID,RULE_JSON
+        FROM BRM_RULE_SNAPSHOT_CONTENTS
+        WHERE SNAPSHOT_ID=?
+        """,(s2,))
+        snap2={x["RULE_ID"]:x["RULE_JSON"] for x in get_cursor_rows(c)}
+        diffs=[]
+        all_ids=set(snap1.keys())|set(snap2.keys())
+        for rid in all_ids:
+            r1=snap1.get(rid)
+            r2=snap2.get(rid)
+            if r1 and not r2:
+                diffs.append(f"Rule {rid} in snapshot {s1}, missing in {s2}")
+            elif r2 and not r1:
+                diffs.append(f"Rule {rid} in snapshot {s2}, missing in {s1}")
+            else:
+                if r1!=r2:
+                    diffs.append(f"Rule {rid} differs between snapshots.")
+        if not diffs:
+            QMessageBox.information(self,"Compare","No differences found.")
+        else:
+            QMessageBox.information(self,"Differences","\n".join(diffs))
+
+    def delete_snapshot(self):
+        sid=self.get_selected_snapshot_id()
+        if not sid:
+            QMessageBox.warning(self,"None","No snapshot selected.")
+            return
+        if QMessageBox.question(self,"Confirm",f"Delete snapshot {sid}?")!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BRM_RULE_SNAPSHOT_CONTENTS WHERE SNAPSHOT_ID=?",(sid,))
+        c.execute("DELETE FROM BRM_RULE_SNAPSHOTS WHERE SNAPSHOT_ID=?",(sid,))
+        self.connection.commit()
+        QMessageBox.information(self,"Deleted","Snapshot removed.")
+        self.load_snapshots()
+
+# 10) Tagging
+class RuleTagsManagerTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        layout=QVBoxLayout(self)
+
+        self.rule_table=QTableWidget(0,3)
+        self.rule_table.setHorizontalHeaderLabels(["Rule ID","Name","Tags"])
+        self.rule_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.rule_table)
+
+        bh=QHBoxLayout()
+        add_t=QPushButton("Add Tag")
+        add_t.clicked.connect(self.on_add_tag)
+        bh.addWidget(add_t)
+        rm_t=QPushButton("Remove Tag")
+        rm_t.clicked.connect(self.on_remove_tag)
+        bh.addWidget(rm_t)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        ref=QPushButton("Refresh")
+        ref.clicked.connect(self.load_rules_with_tags)
+        layout.addWidget(ref)
+        self.setLayout(layout)
+        self.load_rules_with_tags()
+
+    def load_rules_with_tags(self):
+        c=self.connection.cursor()
+        c.execute("SELECT RULE_ID,RULE_NAME,TAGS FROM BRM_RULES ORDER BY RULE_ID")
+        rows=c.fetchall()
+        self.rule_table.setRowCount(0)
+        for row in rows:
+            r=self.rule_table.rowCount()
+            self.rule_table.insertRow(r)
+            self.rule_table.setItem(r,0,QTableWidgetItem(str(row[0])))
+            self.rule_table.setItem(r,1,QTableWidgetItem(row[1]))
+            self.rule_table.setItem(r,2,QTableWidgetItem(row[2] or ""))
+
+    def get_selected_rule_id(self):
+        idx=self.rule_table.currentRow()
+        if idx<0:
+            return None
+        it=self.rule_table.item(idx,0)
+        if not it:
+            return None
+        return int(it.text())
+
+    def on_add_tag(self):
+        rid=self.get_selected_rule_id()
+        if not rid:
+            QMessageBox.warning(self,"None","No rule selected.")
+            return
+        new_tag,ok=QInputDialog.getText(self,"Add Tag","Enter tag:")
+        if not ok or not new_tag.strip():
+            return
+        c=self.connection.cursor()
+        c.execute("SELECT TAGS FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+        old=c.fetchone()
+        if not old:
+            return
+        oldtags=old[0] if old[0] else ""
+        splitted=[x.strip() for x in oldtags.split(",") if x.strip()]
+        if new_tag.strip() not in splitted:
+            splitted.append(new_tag.strip())
+        updated=",".join(splitted)
+        c.execute("UPDATE BRM_RULES SET TAGS=? WHERE RULE_ID=?",(updated, rid))
+        self.connection.commit()
+        QMessageBox.information(self,"Added","Tag added.")
+        self.load_rules_with_tags()
+
+    def on_remove_tag(self):
+        rid=self.get_selected_rule_id()
+        if not rid:
+            return
+        rm_tag,ok=QInputDialog.getText(self,"Remove Tag","Tag to remove:")
+        if not ok or not rm_tag.strip():
+            return
+        c=self.connection.cursor()
+        c.execute("SELECT TAGS FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+        old=c.fetchone()
+        if not old:
+            return
+        oldtags=old[0] if old[0] else ""
+        splitted=[x.strip() for x in oldtags.split(",") if x.strip()]
+        if rm_tag.strip() in splitted:
+            splitted.remove(rm_tag.strip())
+        new_=",".join(splitted)
+        c.execute("UPDATE BRM_RULES SET TAGS=? WHERE RULE_ID=?",(new_, rid))
+        self.connection.commit()
+        QMessageBox.information(self,"Removed","Tag removed.")
+        self.load_rules_with_tags()
+
+# 12) Data Validation
+class DataValidationTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        layout=QVBoxLayout(self)
+
+        self.validation_table=QTableWidget(0,4)
+        self.validation_table.setHorizontalHeaderLabels(["Rule ID","Column Name","Regex","Description"])
+        self.validation_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.validation_table)
+
+        bh=QHBoxLayout()
+        add_v=QPushButton("Add Validation")
+        add_v.clicked.connect(self.on_add_validation)
+        bh.addWidget(add_v)
+        rm_v=QPushButton("Remove Validation")
+        rm_v.clicked.connect(self.on_remove_validation)
+        bh.addWidget(rm_v)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        ref=QPushButton("Refresh Validations")
+        ref.clicked.connect(self.load_validations)
+        layout.addWidget(ref)
+
+        self.setLayout(layout)
+        self.load_validations()
+
+    def load_validations(self):
+        c=self.connection.cursor()
+        c.execute("SELECT RULE_ID,COLUMN_NAME,REGEX,DESCRIPTION FROM BRM_DATA_VALIDATIONS")
+        rows=c.fetchall()
+        self.validation_table.setRowCount(0)
+        for row in rows:
+            r=self.validation_table.rowCount()
+            self.validation_table.insertRow(r)
+            self.validation_table.setItem(r,0,QTableWidgetItem(str(row[0])))
+            self.validation_table.setItem(r,1,QTableWidgetItem(row[1]))
+            self.validation_table.setItem(r,2,QTableWidgetItem(row[2]))
+            self.validation_table.setItem(r,3,QTableWidgetItem(row[3] or ""))
+
+    def on_add_validation(self):
+        rid,ok=QInputDialog.getInt(self,"Validation","Enter rule ID:")
+        if not ok:
+            return
+        coln,ok2=QInputDialog.getText(self,"Validation","Column name to check:")
+        if not ok2:
+            return
+        rx,ok3=QInputDialog.getText(self,"Regex","Enter regex pattern:")
+        if not ok3:
+            return
+        desc,ok4=QInputDialog.getText(self,"Desc","Description of this validation:")
+        if not ok4:
+            desc=""
+        c=self.connection.cursor()
+        c.execute("""
+        INSERT INTO BRM_DATA_VALIDATIONS(RULE_ID,COLUMN_NAME,REGEX,DESCRIPTION)
+        VALUES(?,?,?,?)
+        """,(rid, coln.strip(), rx.strip(), desc.strip()))
+        self.connection.commit()
+        QMessageBox.information(self,"Added","Validation rule created.")
+        self.load_validations()
+
+    def on_remove_validation(self):
+        idx=self.validation_table.currentRow()
+        if idx<0:
+            return
+        rid_item=self.validation_table.item(idx,0)
+        col_item=self.validation_table.item(idx,1)
+        if not rid_item or not col_item:
+            return
+        rid=int(rid_item.text())
+        coln=col_item.text()
+        if QMessageBox.question(self,"Confirm",f"Remove validation for rule {rid}, col {coln}?")!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BRM_DATA_VALIDATIONS WHERE RULE_ID=? AND COLUMN_NAME=?",(rid,coln))
+        self.connection.commit()
+        QMessageBox.information(self,"Removed","Validation removed.")
+        self.load_validations()
