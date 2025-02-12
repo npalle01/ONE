@@ -1,22 +1,15 @@
 #!/usr/bin/env python
 """
-BRM TOOL – SINGLE FILE, FULLY INTEGRATED, NO OMITTED CODE
-========================================================
-Key Features:
-  • Database connection & login
-  • BFS-based rule execution (with per-rule transaction for DML)
-  • Multi-step approvals (Approve/Reject) with pipeline
-  • Full "Add/Update Rule" dialog (RuleEditorDialog) with combos:
-    - Rule Group, Parent Rule, Rule Type, CDC Type
-  • Insert/Update statement matches 22 columns in BRM_RULES
-  • Dry-run simulation for single rule or chain
-  • Enhanced lineage with read vs. write columns
-  • Scheduling, control tables viewer, advanced tabs for:
-    - Decision tables, conflict priority, composite rules, snapshot manager,
-      tags, data validation
-  • Group management, user management (admin only)
-  • Global/critical admin tab
-No references to "omitted" or "same as prior" remain. This is the complete code.
+BRM TOOL – SINGLE FILE, FULLY INCORPORATED
+
+Includes:
+  • BFS-based rule exec (INSERT/UPDATE/DELETE w/ per-rule transaction)
+  • Multi-step approvals (approve/reject)
+  • Add/Update Rule (w/ combos for group, parent, type, CDC)
+  • 'OUTPUT inserted.RULE_ID' => no null in RULE_ID
+  • Control tables, lineage, scheduling, custom groups, advanced features
+  • Group mgmt, user mgmt, conflict priority, decision tables, snapshots, tags, data validation
+  • No references to "prior code" or "..." placeholders
 """
 
 import sys
@@ -30,6 +23,7 @@ from datetime import datetime
 from collections import deque
 from email.mime.text import MIMEText
 
+# PyQt5 / PyQtGraph
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QDateTime, QTimer, QDate
 from PyQt5.QtGui import QColor
@@ -39,7 +33,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTextEdit, QPlainTextEdit, QFormLayout,
     QGroupBox, QDateTimeEdit, QCheckBox, QTreeWidget, QTreeWidgetItem,
     QListWidget, QListWidgetItem, QMenu, QFileDialog, QInputDialog,
-    QCalendarWidget
+    QCalendarWidget, QAbstractItemView
 )
 import pyqtgraph as pg
 from sqlparse.sql import IdentifierList, Identifier
@@ -401,22 +395,23 @@ def execute_rules_in_order(conn):
     return executed, skipped
 
 ###############################################################################
-# RULE CRUD
+# RULE CRUD (with OUTPUT inserted.RULE_ID)
 ###############################################################################
 def add_rule(conn, rule_data, created_by, user_group):
     c=conn.cursor()
+    # Check duplicates
     c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?",
               (rule_data["OWNER_GROUP"], rule_data["RULE_NAME"].strip()))
     if c.fetchone():
         raise ValueError("Duplicate rule name in that group.")
+
     if rule_data.get("IS_GLOBAL", 0)==1 and user_group!="Admin":
         raise ValueError("Only Admin can create global rule.")
 
     op_type=detect_operation_type(rule_data["RULE_SQL"])
     rule_data["OPERATION_TYPE"]=op_type
 
-    # 22 columns
-    c.execute("""
+    row = c.execute("""
     INSERT INTO BRM_RULES(
         GROUP_ID,
         PARENT_RULE_ID,
@@ -441,6 +436,7 @@ def add_rule(conn, rule_data, created_by, user_group):
         CRITICAL_SCOPE,
         CDC_TYPE
     )
+    OUTPUT inserted.RULE_ID
     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """,(
         rule_data.get("GROUP_ID"),
@@ -451,7 +447,7 @@ def add_rule(conn, rule_data, created_by, user_group):
         rule_data["EFFECTIVE_START_DATE"],
         rule_data.get("EFFECTIVE_END_DATE"),
         rule_data.get("STATUS","INACTIVE"),
-        1,
+        1,  
         created_by,
         rule_data.get("DESCRIPTION",""),
         op_type,
@@ -465,8 +461,11 @@ def add_rule(conn, rule_data, created_by, user_group):
         rule_data.get("CRITICAL_RULE",0),
         rule_data.get("CRITICAL_SCOPE","NONE"),
         rule_data.get("CDC_TYPE","NONE")
-    ))
-    new_id = c.execute("SELECT SCOPE_IDENTITY()").fetchone()[0]
+    )).fetchone()
+
+    if not row:
+        raise ValueError("Insert failed, no RULE_ID returned.")
+    new_id = row[0]
 
     if op_type in ["INSERT","UPDATE","DELETE"]:
         target_table="N/A"
@@ -765,11 +764,11 @@ def run_rule_sql_dry_run(conn, rule_sql):
     return success,msg
 
 ###############################################################################
-# RULE EDITOR DIALOG (SHOWS GROUP, PARENT, RULE TYPE, CDC, ETC.)
+# RULE EDITOR DIALOG
 ###############################################################################
 class RuleEditorDialog(QDialog):
     """
-    A dialog to create or update a rule, with combos for group, parent, type, cdc.
+    A dialog to create or update a rule, with combos for group, parent, type, cdc, etc.
     """
     def __init__(self, connection, user_group, rule_data=None, parent=None):
         super().__init__(parent)
@@ -803,6 +802,7 @@ class RuleEditorDialog(QDialog):
         self.name_edit=QLineEdit()
         form_layout.addRow("Rule Name:", self.name_edit)
 
+        self.rule_type_combo.setEditable(False)
         form_layout.addRow("Rule Type:", self.rule_type_combo)
 
         self.status_combo=QComboBox()
@@ -989,8 +989,9 @@ class RuleEditorDialog(QDialog):
         just_=self.just_edit.toPlainText().strip()
 
         isg=0
-        if self.user_group=="Admin" and self.global_cb and self.global_cb.isChecked():
-            isg=1
+        if self.user_group=="Admin":
+            if self.global_cb and self.global_cb.isChecked():
+                isg=1
         isc=1 if self.critical_cb.isChecked() else 0
         scp_=self.scope_combo.currentText().upper()
 
@@ -1011,36 +1012,34 @@ class RuleEditorDialog(QDialog):
             "CDC_TYPE": cdcval
         }
 
-        from __main__ import add_rule, update_rule
-
-        if self.is_update:
-            rule_dict["RULE_ID"]=self.rule_data["RULE_ID"]
-            old_owner=self.rule_data.get("OWNER_GROUP","BG1")
-            try:
+        # We'll call add_rule or update_rule:
+        try:
+            if self.is_update:
+                rule_dict["RULE_ID"]=self.rule_data["RULE_ID"]
+                from __main__ import update_rule
                 update_rule(self.connection, rule_dict, "CurrentUser", self.user_group)
                 QMessageBox.information(self,"Success",f"Rule '{nm}' updated.")
                 self.accept()
-            except Exception as ex:
-                QMessageBox.critical(self,"Update Error",str(ex))
-        else:
-            # new
-            c=self.connection.cursor()
-            c.execute("SELECT GROUP_NAME FROM BRM_RULE_GROUPS WHERE GROUP_ID=?",(group_id,))
-            rowg=c.fetchone()
-            if rowg:
-                gname=rowg[0]
-                rule_dict["OWNER_GROUP"]=gname
             else:
-                rule_dict["OWNER_GROUP"]="BG1"
-            try:
+                from __main__ import add_rule
+                # If we store group_id in the DB, we might need to convert to group_name:
+                c=self.connection.cursor()
+                c.execute("SELECT GROUP_NAME FROM BRM_RULE_GROUPS WHERE GROUP_ID=?",(group_id,))
+                rw=c.fetchone()
+                if rw:
+                    gname=rw[0]
+                    rule_dict["OWNER_GROUP"]=gname
+                else:
+                    rule_dict["OWNER_GROUP"]="BG1"
+
                 new_id=add_rule(self.connection, rule_dict, "CurrentUser", self.user_group)
-                QMessageBox.information(self,"Success",f"Rule '{nm}' created ID={new_id}.")
+                QMessageBox.information(self,"Success",f"Rule '{nm}' created with ID={new_id}.")
                 self.accept()
-            except Exception as ex:
-                QMessageBox.critical(self,"Add Error",str(ex))
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
 ###############################################################################
-# SINGLE RULE SIM
+# SINGLE RULE SIM DIALOG
 ###############################################################################
 class SingleRuleSimulationDialog(QDialog):
     def __init__(self, connection, rule_id, sql_text, parent=None):
@@ -1050,8 +1049,8 @@ class SingleRuleSimulationDialog(QDialog):
         self.sql_text=sql_text
         self.setWindowTitle(f"Simulate Rule {rule_id}")
         self.resize(500,300)
-
         layout=QVBoxLayout(self)
+
         self.result_text=QPlainTextEdit()
         self.result_text.setReadOnly(True)
         layout.addWidget(self.result_text)
@@ -1065,7 +1064,6 @@ class SingleRuleSimulationDialog(QDialog):
         cls_btn.clicked.connect(self.close)
         bh.addWidget(cls_btn)
         layout.addLayout(bh)
-
         self.setLayout(layout)
 
     def do_sim(self):
@@ -1117,7 +1115,6 @@ class ChainSimulationDialog(QDialog):
         self.result_text.setPlainText(txt)
 
     def do_chain_sim(self, start_rule):
-        # BFS but each step is a dry-run
         c=self.connection.cursor()
         c.execute("SELECT RULE_ID,PARENT_RULE_ID,RULE_SQL FROM BRM_RULES")
         rows=get_cursor_rows(c)
@@ -1129,6 +1126,7 @@ class ChainSimulationDialog(QDialog):
             rule_dict[rid]=r_
             if pid:
                 children_map.setdefault(pid,[]).append(rid)
+
         executed=[]
         skipped=set()
         queue=[start_rule]
@@ -1220,7 +1218,7 @@ class GroupSimulationDialog(QDialog):
         return executed,fails
 
 ###############################################################################
-# COMMENTS DIALOG (OPTIONAL)
+# COMMENTS DIALOG
 ###############################################################################
 class CommentsDialog(QDialog):
     def __init__(self, connection, rule_id, parent=None):
@@ -1315,7 +1313,9 @@ class AlertsAndDashboardsTab(QWidget):
         FROM BRM_RULE_APPROVALS A
         JOIN BRM_RULES R ON A.RULE_ID=R.RULE_ID
         WHERE A.APPROVED_FLAG=0
-          AND A.APPROVAL_STAGE=(SELECT MIN(APPROVAL_STAGE) FROM BRM_RULE_APPROVALS WHERE RULE_ID=A.RULE_ID AND APPROVED_FLAG=0)
+          AND A.APPROVAL_STAGE=(SELECT MIN(APPROVAL_STAGE)
+                                FROM BRM_RULE_APPROVALS
+                                WHERE RULE_ID=A.RULE_ID AND APPROVED_FLAG=0)
           AND DATEDIFF(DAY,ISNULL(A.APPROVED_TIMESTAMP,R.CREATED_TIMESTAMP),GETDATE())>3
         """)
         old_ap=get_cursor_rows(c)
@@ -1484,8 +1484,8 @@ class VersionHistoryDialog(QDialog):
         row=get_cursor_one(c)
         if not row:
             raise ValueError("Rule not found for rollback.")
-        # Example minimal
         c.execute("BEGIN TRANSACTION")
+        # Minimal rollback example
         c.execute("""
         UPDATE BRM_RULES
         SET RULE_NAME=?,
@@ -1496,7 +1496,7 @@ class VersionHistoryDialog(QDialog):
             UPDATED_BY='Rollback',
             APPROVAL_STATUS='APPROVAL_IN_PROGRESS'
         WHERE RULE_ID=?
-        """,(old_data["RULE_NAME"],old_data["RULE_SQL"],old_data["OWNER_GROUP"],rid))
+        """,(old_data["RULE_NAME"], old_data["RULE_SQL"], old_data["OWNER_GROUP"], rid))
         c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?",(rid,))
         c.execute("""
         INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME,COLUMN_OP)
@@ -1780,7 +1780,8 @@ class MultiStepApprovalTab(QWidget):
         else:
             c.execute("UPDATE BRM_RULES SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS',STATUS='INACTIVE' WHERE RULE_ID=?",(rid,))
 
-        add_audit_log(self.connection,"UPDATE","BRM_RULE_APPROVALS",rid,self.logged_in_username,{"APPROVED_FLAG":0},{"APPROVED_FLAG":1})
+        add_audit_log(self.connection,"UPDATE","BRM_RULE_APPROVALS",rid,self.logged_in_username,
+                      {"APPROVED_FLAG":0},{"APPROVED_FLAG":1})
         self.connection.commit()
         QMessageBox.information(self,"Approved",f"Rule {rid} approved.")
         self.load_approvals()
@@ -1796,13 +1797,11 @@ class MultiStepApprovalTab(QWidget):
         if confirm!=QMessageBox.Yes:
             return
         c=self.connection.cursor()
-        # Mark this row as rejected
         c.execute("""
         UPDATE BRM_RULE_APPROVALS
         SET APPROVED_FLAG=2,APPROVED_TIMESTAMP=GETDATE()
         WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=? AND APPROVED_FLAG=0
         """,(rid,grp,self.logged_in_username))
-        # Mark the rule as REJECTED
         c.execute("""
         UPDATE BRM_RULES
         SET APPROVAL_STATUS='REJECTED', STATUS='INACTIVE'
@@ -1973,7 +1972,8 @@ class GlobalCriticalAdminTab(QWidget):
         is_global=1 if self.global_cb.isChecked() else 0
         is_crit=1 if self.critical_cb.isChecked() else 0
         scope_val=self.scope_combo.currentText().upper()
-        confirm=QMessageBox.question(self,"Confirm",f"Set IS_GLOBAL={is_global}, CRITICAL_RULE={is_crit}, scope={scope_val} for {len(rids)} rule(s)?")
+        confirm=QMessageBox.question(self,"Confirm",
+            f"Set IS_GLOBAL={is_global}, CRITICAL_RULE={is_crit}, scope={scope_val} for {len(rids)} rule(s)?")
         if confirm!=QMessageBox.Yes:
             return
         c=self.connection.cursor()
@@ -2019,7 +2019,7 @@ class GlobalCriticalAdminTab(QWidget):
         self.load_link_view()
 
 ###############################################################################
-# HIERARCHY VIEW
+# HIERARCHY VIEW TAB
 ###############################################################################
 class HierarchyViewTab(QWidget):
     def __init__(self, connection, parent=None):
@@ -2346,7 +2346,6 @@ class CtrlTablesTab(QWidget):
         self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.data_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         layout.addWidget(self.data_table)
-
         self.setLayout(layout)
 
     def on_load_data(self):
@@ -2446,7 +2445,7 @@ class GroupManagementTab(QWidget):
         gm_tab.setLayout(gm_layout)
         self.tabs.addTab(gm_tab,"Groups & Membership")
 
-        # Permissions
+        # Permissions Tab
         perm_tab=QWidget()
         perm_layout=QVBoxLayout(perm_tab)
         perm_box=QGroupBox("Group Permissions")
@@ -2474,11 +2473,11 @@ class GroupManagementTab(QWidget):
         ph.addWidget(remp_btn)
         ph.addStretch()
         perm_box_layout.addLayout(ph)
-        perm_tab.setLayout(perm_layout)
         perm_layout.addWidget(perm_box)
+        perm_tab.setLayout(perm_layout)
         self.tabs.addTab(perm_tab,"Permissions")
 
-        # Approvers
+        # Approvers Tab
         appr_tab=QWidget()
         appr_layout=QVBoxLayout(appr_tab)
 
@@ -2848,7 +2847,8 @@ class UserManagementTab(QWidget):
         if c.fetchone():
             QMessageBox.warning(self,"Error","Username already in use.")
             return
-        c.execute("INSERT INTO USERS(USERNAME,PASSWORD,USER_GROUP) VALUES(?,?,?)",(name.strip(),pwd.strip(),grp.strip()))
+        c.execute("INSERT INTO USERS(USERNAME,PASSWORD,USER_GROUP) VALUES(?,?,?)",
+                  (name.strip(),pwd.strip(),grp.strip()))
         self.connection.commit()
         QMessageBox.information(self,"Created","User added.")
         self.load_users()
@@ -2936,7 +2936,7 @@ class CustomRuleGroupEnhancedTab(QWidget):
         rw_layout.addWidget(self.rule_search)
 
         self.rule_list=QListWidget()
-        self.rule_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.rule_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         rw_layout.addWidget(self.rule_list)
 
         assign_btn=QPushButton("Assign Selected Rule(s)")
@@ -3007,7 +3007,6 @@ class CustomRuleGroupEnhancedTab(QWidget):
             ORDER BY RULE_ID DESC
             OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY
             """)
-
         rows=get_cursor_rows(c)
         c2=self.connection.cursor()
         c2.execute("SELECT DISTINCT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS")
@@ -3950,7 +3949,7 @@ class SearchRuleDialog(QDialog):
 class BRMTool(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BRM Tool – Fully Integrated")
+        self.setWindowTitle("BRM Tool – Fully Integrated, OUTPUT-based ID")
         self.resize(1300,850)
         self.connection=None
 
@@ -4010,6 +4009,7 @@ class BRMTool(QMainWindow):
         cw=QWidget()
         layout=QVBoxLayout(cw)
 
+        # If admin, provide user switch
         if self.user_group=="Admin":
             top_h=QHBoxLayout()
             self.switch_combo=QComboBox()
@@ -4203,11 +4203,9 @@ class BRMTool(QMainWindow):
 
     def show_help(self):
         msg=(
-            "BRM Tool – Full Code.\n"
-            "Features: BFS-based DML, multi-step approvals, advanced lineage, scheduling, etc.\n"
-            "Use Add/Update Rule for the RuleEditorDialog with group, parent, type combos.\n"
-            "Approvals: Approve or Reject in 'Approvals' tab.\n"
-            "Global/Critical admin, custom groups, advanced features, no placeholders.\n"
+            "BRM Tool – Full Code with 'OUTPUT inserted.RULE_ID' fix.\n"
+            "Ensures no NULL in RULE_ID for dependencies.\n"
+            "Everything BFS, multi-step approvals, advanced UI.\n"
         )
         QMessageBox.information(self,"Help/Tips",msg)
 
