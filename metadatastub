@@ -1,0 +1,85 @@
+def sync_metadata_stub(self):
+    """
+    Example of a real metadata sync that:
+      1) Gets all real [schema].[table] from sys.tables + sys.schemas
+      2) Compares with BRM_RULE_TABLE_DEPENDENCIES
+      3) Flags missing/mismatched references
+      4) Optionally auto-fixes them or logs them
+    """
+    c = self.connection.cursor()
+
+    # 1) Gather actual tables from sys.schemas + sys.tables
+    #    We'll build a set like {"dbo.MyTable", "risk.Customers", ...}
+    c.execute("""
+    SELECT s.name as schema_name, t.name as table_name
+    FROM sys.tables t
+    JOIN sys.schemas s ON t.schema_id = s.schema_id
+    ORDER BY s.name, t.name
+    """)
+    actual_tables = set()
+    for row in c.fetchall():
+        schema_name = row[0]
+        tbl_name = row[1]
+        full_name = f"{schema_name}.{tbl_name}"
+        actual_tables.add(full_name.lower())
+
+    # 2) Gather references from BRM_RULE_TABLE_DEPENDENCIES
+    #    Typically we store (RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP)
+    #    This example assumes "DATABASE_NAME" is "N/A" or real db name, and
+    #    "TABLE_NAME" might contain "schema.table" or just "table".
+    c.execute("""
+    SELECT DEPENDENCY_ID, RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+    FROM BRM_RULE_TABLE_DEPENDENCIES
+    """)
+    rows = c.fetchall()
+
+    # We’ll track any mismatches or missing references
+    missing = []
+    updated = 0
+
+    for r in rows:
+        dep_id = r[0]
+        rule_id = r[1]
+        db_name = (r[2] or "").strip()
+        tbl_name = (r[3] or "").strip()
+
+        # If your code does not store schema, we guess "dbo" or something.
+        # If you do store something like "dbo.Customers" in TABLE_NAME, then parse it:
+        # e.g. if tbl_name = "dbo.Customers", we can compare "dbo.Customers" to actual_tables
+        # We'll do a naive approach below:
+        if "." not in tbl_name:
+            # If there's no dot, we assume "dbo.tbl_name" for comparison
+            candidate = f"dbo.{tbl_name}"
+        else:
+            candidate = tbl_name
+
+        candidate_lower = candidate.lower()
+
+        if candidate_lower not in actual_tables:
+            # Mark as missing
+            missing.append((dep_id, rule_id, db_name, tbl_name))
+        else:
+            # It's found => do nothing, or you might update 'DATABASE_NAME' to actual DB if needed
+            pass
+
+    # 3) Optionally auto-fix or remove missing references
+    # For example, we can mark them with a suffix:
+    # Just an example to show we can do something:
+    for (dep_id, rule_id, db_name, tbl_name) in missing:
+        # E.g. update the table name to "MISSING_<oldName>"
+        c.execute("""
+        UPDATE BRM_RULE_TABLE_DEPENDENCIES
+        SET TABLE_NAME='MISSING_' + TABLE_NAME
+        WHERE DEPENDENCY_ID=?
+        """, (dep_id,))
+        updated += 1
+
+    # commit changes
+    self.connection.commit()
+
+    # 4) Show summary
+    msg = (f"Metadata Sync Completed.\n"
+           f"Found {len(actual_tables)} actual table(s) in sys.tables.\n"
+           f"Scanned {len(rows)} dependency records.\n"
+           f"Marked {updated} references as MISSING_xxx.\n")
+    QMessageBox.information(self, "Sync Metadata", msg)
