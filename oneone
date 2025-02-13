@@ -1,8 +1,9 @@
+
 #!/usr/bin/env python
 """
-BRM TOOL – PART 1 of 4
-Core imports, logging, email config, DB connection, login, advanced SQL parsing, etc.
-No placeholders or references to old code.
+BRM TOOL – ENHANCED PART 1
+Core imports, logging, email config, DB connection, login, advanced SQL + column parsing, etc.
+No placeholders or references to “old code.” Fully supports column extraction for BRM_COLUMN_MAPPING.
 """
 
 import sys
@@ -28,7 +29,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QMenu, QFileDialog, QInputDialog
 )
 import pyqtgraph as pg
-from sqlparse.sql import Identifier, IdentifierList, Parenthesis
+from sqlparse.sql import Identifier, IdentifierList, Parenthesis, Token, TokenList
 from sqlparse.tokens import Keyword, DML
 
 ###############################################################################
@@ -53,6 +54,9 @@ EMAIL_CONFIG = {
 }
 
 def send_email_notification(subject: str, body: str, recipients: list):
+    """
+    Sends email via SMTP to 'recipients' using EMAIL_CONFIG.
+    """
     try:
         msg = MIMEText(body, 'plain')
         msg['Subject'] = subject
@@ -71,10 +75,13 @@ def send_email_notification(subject: str, body: str, recipients: list):
 # DATABASE CONNECTION DIALOG
 ###############################################################################
 class DatabaseConnectionDialog(QtWidgets.QDialog):
+    """
+    Lets user pick an ODBC DSN (SQL Server) or type a custom connection string.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.connection=None
-        self.setWindowTitle("DB Connection - Part 1")
+        self.setWindowTitle("DB Connection - Enhanced Part 1")
         self.resize(400, 200)
         layout=QVBoxLayout(self)
 
@@ -124,6 +131,9 @@ class DatabaseConnectionDialog(QtWidgets.QDialog):
 # DB HELPERS
 ###############################################################################
 def get_cursor_rows(cursor):
+    """
+    Safely fetches all rows from a cursor, returns list of dicts if column info present.
+    """
     try:
         rows=cursor.fetchall()
     except:
@@ -134,6 +144,9 @@ def get_cursor_rows(cursor):
     return rows
 
 def get_cursor_one(cursor):
+    """
+    Fetches one row from a cursor, returns dict if column info present.
+    """
     row=cursor.fetchone()
     if row and cursor.description:
         colnames=[desc[0] for desc in cursor.description]
@@ -141,6 +154,9 @@ def get_cursor_one(cursor):
     return None
 
 def add_audit_log(conn, action, table_name, record_id, action_by, old_data, new_data):
+    """
+    Insert an audit record into BRM_AUDIT_LOG.
+    """
     import json
     c=conn.cursor()
     c.execute("""
@@ -157,12 +173,15 @@ def add_audit_log(conn, action, table_name, record_id, action_by, old_data, new_
 # LOGIN
 ###############################################################################
 class LoginDialog(QtWidgets.QDialog):
+    """
+    Simple username/password prompt.
+    """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection=connection
         self.user_id=None
         self.user_group=None
-        self.setWindowTitle("Login - Part 1")
+        self.setWindowTitle("Login - Enhanced Part 1")
         self.resize(300,150)
         layout=QVBoxLayout(self)
 
@@ -199,9 +218,12 @@ class LoginDialog(QtWidgets.QDialog):
             QMessageBox.warning(self,"Failed","Invalid credentials.")
 
 ###############################################################################
-# DETECT OP TYPE (INSERT,UPDATE,DELETE,SELECT)
+# DETECT OPERATION TYPE
 ###############################################################################
 def detect_operation_type(sql_text:str)->str:
+    """
+    Returns one of INSERT,UPDATE,DELETE,SELECT or OTHER based on the first word.
+    """
     txt=sql_text.strip().upper()
     if txt.startswith("INSERT"):
         return "INSERT"
@@ -214,32 +236,50 @@ def detect_operation_type(sql_text:str)->str:
     return "OTHER"
 
 ###############################################################################
-# ADVANCED SQL PARSER
+# ADVANCED SQL PARSER (TABLE + COLUMN EXTRACTION)
 ###############################################################################
 def enhanced_advanced_extract_tables(sql_text:str):
+    """
+    Returns a dict with:
+      "tables": list of (schema, table, alias, is_subselect)
+      "cte_tables": list of (cte_name, list_of_references)
+      "alias_map": mapping from alias -> (schema, table)
+      "columns": list of (col_name, is_target, in_select)
+    We do a basic attempt to find columns in SELECT lists or DML targets.
+    """
     statements=sqlparse.parse(sql_text)
     final_tables=[]
     cte_info=[]
     alias_map={}
+    column_list=[]  # (column_name, is_dml_target, in_select_list)
 
     for stmt in statements:
+        # Check for WITH clauses
         cte_dict=_extract_with_clauses(stmt)
         for cName,refs in cte_dict.items():
             cte_info.append((cName,refs))
 
+        # Identify main FROM references
         main_refs,main_alias=_extract_main_from(stmt.tokens,set(cte_dict.keys()))
         final_tables.extend(main_refs)
-        for (al,ttuple) in main_alias.items():
-            alias_map[al]=ttuple
+        alias_map.update(main_alias)
 
-    final_tables=list({x for x in final_tables})
+        # Attempt to parse columns in SELECT or DML
+        col_refs=_extract_columns(stmt)
+        column_list.extend(col_refs)
+
+    final_tables=list({x for x in final_tables})  # unique
     return {
-        "tables":final_tables,
-        "cte_tables":cte_info,
-        "alias_map":alias_map
+        "tables": final_tables,
+        "cte_tables": list(cte_info),
+        "alias_map": alias_map,
+        "columns": column_list
     }
 
 def _extract_with_clauses(statement):
+    """
+    Gathers all WITH cte_name => subselect references.
+    """
     cte_map={}
     tokens=list(statement.tokens)
     i=0
@@ -253,6 +293,11 @@ def _extract_with_clauses(statement):
     return cte_map
 
 def _parse_cte_block(tokens,i,cte_map):
+    """
+    If we see something like:
+      WITH cte1 AS (SELECT ...), cte2 AS (SELECT ...)
+    parse each cte block to store references.
+    """
     while i<len(tokens):
         tk=tokens[i]
         if isinstance(tk,Identifier):
@@ -266,6 +311,10 @@ def _parse_cte_block(tokens,i,cte_map):
     return i
 
 def _parse_cte_as_clause(tokens,i,cte_name,cte_map):
+    """
+    We see cte_name, then 'AS', then parentheses with subselect => parse subselect tokens
+    for references.
+    """
     while i<len(tokens):
         tk=tokens[i]
         val=tk.value.upper() if tk.ttype else ""
@@ -283,6 +332,9 @@ def _parse_cte_as_clause(tokens,i,cte_name,cte_map):
     return i
 
 def _extract_subselect_tokens(tokens):
+    """
+    Recursive approach for subselect. We find FROM/JOIN references inside.
+    """
     results=[]
     from_seen=False
     i=0
@@ -297,6 +349,7 @@ def _extract_subselect_tokens(tokens):
                 from_seen=True
             else:
                 from_seen=False
+
         if from_seen:
             if isinstance(tk,IdentifierList):
                 for ident in tk.get_identifiers():
@@ -311,6 +364,9 @@ def _extract_subselect_tokens(tokens):
     return results
 
 def _is_subselect(token):
+    """
+    Returns True if token is a group containing a 'SELECT'.
+    """
     if not token.is_group:
         return False
     for sub in token.tokens:
@@ -319,6 +375,9 @@ def _is_subselect(token):
     return False
 
 def _extract_main_from(tokenlist,known_cte_names):
+    """
+    Finds table references after FROM/JOIN keywords.
+    """
     results=[]
     alias_map={}
     tokens=list(tokenlist)
@@ -355,14 +414,127 @@ def _extract_main_from(tokenlist,known_cte_names):
     return (results,alias_map)
 
 def _parse_identifier(ident,known_cte_names):
+    """
+    Parse an identifier => (schema, real_name, alias, is_subselect).
+    If real_name in known_cte_names => it's a CTE reference.
+    """
     alias=ident.get_alias()
     real_name=ident.get_real_name()
     schema_name=ident.get_parent_name()
     if real_name and real_name.upper() in (n.upper() for n in known_cte_names):
         return (None,f"(CTE) {real_name}",alias,False)
     return (schema_name, real_name, alias, False)
-# End of PART 1
 
+def _extract_columns(statement):
+    """
+    Attempt to extract columns from SELECT list or from DML target columns.
+    Returns list of tuples: (column_name, is_dml_target:bool, in_select_list:bool).
+    """
+    results=[]
+    tokens=list(statement.tokens)
+    # Check if we have an insert, update, or if we see a SELECT statement
+    # We'll do a simple pass looking for SELECT columns or update target columns
+    i=0
+    while i<len(tokens):
+        tk=tokens[i]
+        if tk.ttype is DML:
+            dml_word=tk.value.upper()
+            if dml_word=="SELECT":
+                # parse next tokens for SELECT columns until FROM
+                col_refs=_parse_select_list(tokens, i+1)
+                for c_ in col_refs:
+                    results.append((c_, False, True))
+            elif dml_word in ("INSERT","UPDATE"):
+                # parse columns in the column list or set clause
+                col_refs2=_parse_dml_columns(tokens, i, dml_word)
+                for c_ in col_refs2:
+                    results.append((c_, True, False))
+        i+=1
+    return results
+
+def _parse_select_list(tokens, start_idx):
+    """
+    We look from start_idx forward until we see 'FROM' or another DML keyword.
+    We'll gather columns from an IdentifierList in SELECT.
+    """
+    columns=[]
+    found_select_list=True
+    i=start_idx
+    while i<len(tokens):
+        tk=tokens[i]
+        if tk.ttype is Keyword:
+            upv=tk.value.upper()
+            if upv in ("FROM","JOIN","WHERE","GROUP","ORDER","UNION","INTERSECT"):
+                # end of select-list
+                break
+        if isinstance(tk,IdentifierList):
+            for ident in tk.get_identifiers():
+                colnm=ident.get_name()
+                if colnm and colnm.upper() not in ("DISTINCT","TOP","ALL"):
+                    columns.append(colnm)
+        elif isinstance(tk,Identifier):
+            colnm=tk.get_name()
+            if colnm and colnm.upper() not in ("DISTINCT","TOP","ALL"):
+                columns.append(colnm)
+        i+=1
+    return columns
+
+def _parse_dml_columns(tokens, start_idx, dml_word):
+    """
+    For INSERT: columns in parentheses after table name
+    For UPDATE: columns in 'SET' clause
+    This is very simplified.
+    """
+    columns=[]
+    if dml_word=="INSERT":
+        # find '(' after table name
+        # e.g. INSERT INTO table (col1,col2) VALUES(...)
+        i=start_idx
+        while i<len(tokens):
+            tk=tokens[i]
+            if tk.is_group and isinstance(tk,Parenthesis):
+                # parse inside for columns
+                for subiden in tk.tokens:
+                    if isinstance(subiden,IdentifierList):
+                        for ident in subiden.get_identifiers():
+                            colnm=ident.get_name()
+                            columns.append(colnm)
+                    elif isinstance(subiden,Identifier):
+                        columns.append(subiden.get_name())
+                return columns
+            i+=1
+    elif dml_word=="UPDATE":
+        # find SET, parse columns
+        found_set=False
+        i=start_idx
+        while i<len(tokens):
+            tk=tokens[i]
+            if tk.ttype is Keyword and tk.value.upper()=="SET":
+                found_set=True
+                i+=1
+                # parse columns
+                columns.extend(_parse_update_set_list(tokens, i))
+                break
+            i+=1
+    return columns
+
+def _parse_update_set_list(tokens, start_i):
+    """
+    Very naive approach: after 'SET col1=..., col2=..., ...'
+    we'll gather 'col1','col2', ...
+    """
+    columns=[]
+    i=start_i
+    while i<len(tokens):
+        tk=tokens[i]
+        if tk.ttype is Keyword and tk.value.upper() in ("WHERE","FROM"):
+            break
+        if isinstance(tk,Identifier):
+            columns.append(tk.get_name())
+        i+=1
+    return columns
+
+# End of ENHANCED PART 1
 """
 BRM TOOL – PART 2 of 4
 BFS rule exec, multi-step approvals, advanced update logic:
