@@ -4,6 +4,7 @@ import re
 ###############################################################################
 # 1) DOMAIN MAP
 ###############################################################################
+# Customize these mappings for your environment:
 DOMAIN_MAP = {
     "tables": {
         "financial_risk_table": "the Financial Risk data store",
@@ -20,25 +21,42 @@ DOMAIN_MAP = {
 }
 
 def get_domain_table_name(raw: str) -> str:
+    """
+    Map a raw table name to a domain-friendly name if found in DOMAIN_MAP.
+    Otherwise, return the raw name.
+    """
     return DOMAIN_MAP["tables"].get(raw.lower().strip(), raw)
 
 def get_domain_column_name(raw: str) -> str:
+    """
+    Map a raw column name to a domain-friendly name if found in DOMAIN_MAP.
+    Otherwise, return the raw name.
+    """
     return DOMAIN_MAP["columns"].get(raw.lower().strip(), raw)
 
 ###############################################################################
-# 2) TOP-LEVEL PARSE LOGIC
+# 2) PARSING LOGIC
 ###############################################################################
 def parse_sql_to_dict(sql_query: str) -> dict:
     """
-    Use sqlparse to identify SELECT, FROM, JOIN, WHERE, GROUP BY, ORDER BY, LIMIT.
-    Recursively detect subqueries in parentheses (SELECT...).
-    Returns a dictionary describing the query structure.
+    Use sqlparse to extract:
+      - SELECT columns
+      - FROM (table or subquery)
+      - JOIN(s)
+      - WHERE
+      - GROUP BY
+      - ORDER BY
+      - LIMIT
+    Recursively handle subqueries.
+    Returns a dict describing the query.
     """
     parsed = sqlparse.parse(sql_query)
     if not parsed:
         return {}
 
-    stmt = parsed[0]
+    # We'll parse only the first statement
+    statement = parsed[0]
+
     result = {
         "columns": [],
         "from": None,
@@ -49,24 +67,19 @@ def parse_sql_to_dict(sql_query: str) -> dict:
         "limit": None
     }
 
-    tokens = [t for t in stmt.tokens if not t.is_whitespace]
+    tokens = [t for t in statement.tokens if not t.is_whitespace]
     current_clause = None
     buffer = []
 
     def flush_clause(clause_name, buf):
-        from parser_utils import (
-            parse_select_list, parse_from_clause,
-            parse_join_clause, parse_condition_clause,
-            parse_comma_list, parse_limit_clause
-        )
         if clause_name == "SELECT":
             result["columns"] = parse_select_list(buf)
         elif clause_name == "FROM":
             result["from"] = parse_from_clause(buf)
         elif clause_name == "JOIN":
-            j = parse_join_clause(buf)
-            if j:
-                result["joins"].append(j)
+            jinfo = parse_join_clause(buf)
+            if jinfo:
+                result["joins"].append(jinfo)
         elif clause_name == "WHERE":
             result["where"] = parse_condition_clause(buf)
         elif clause_name == "GROUP BY":
@@ -77,47 +90,57 @@ def parse_sql_to_dict(sql_query: str) -> dict:
             result["limit"] = parse_limit_clause(buf)
         buf.clear()
 
-    # Inline or external parser_utils. We'll inline for brevity below.
-
     i = 0
     while i < len(tokens):
         t = tokens[i]
-        v_up = t.value.upper()
-        if t.ttype == sqlparse.tokens.DML and v_up == "SELECT":
+        val_up = t.value.upper()
+
+        # Detect start of SELECT clause
+        if t.ttype == sqlparse.tokens.DML and val_up == "SELECT":
             if current_clause and buffer:
                 flush_clause(current_clause, buffer)
             current_clause = "SELECT"
             buffer.clear()
+
         elif t.is_keyword:
-            if v_up == "FROM":
+            # Check for major clauses
+            if val_up == "FROM":
                 if current_clause and buffer:
                     flush_clause(current_clause, buffer)
                 current_clause = "FROM"
                 buffer.clear()
-            elif v_up in ("LEFT", "RIGHT", "FULL", "CROSS", "INNER"):
+
+            elif val_up in ("LEFT", "RIGHT", "FULL", "CROSS", "INNER"):
+                # join type prefix
                 buffer.append(t)
-            elif v_up == "JOIN":
+
+            elif val_up == "JOIN":
+                # finalize previous
                 if current_clause and buffer:
                     flush_clause(current_clause, buffer)
                 current_clause = "JOIN"
                 buffer.clear()
                 buffer.append(t)
-            elif v_up == "WHERE":
+
+            elif val_up == "WHERE":
                 if current_clause and buffer:
                     flush_clause(current_clause, buffer)
                 current_clause = "WHERE"
                 buffer.clear()
-            elif v_up == "GROUP":
-                # next might be BY
+
+            elif val_up == "GROUP":
+                # possibly GROUP BY
                 if i+1 < len(tokens) and tokens[i+1].value.upper() == "BY":
                     if current_clause and buffer:
                         flush_clause(current_clause, buffer)
                     current_clause = "GROUP BY"
-                    i += 1
+                    i += 1  # skip the "BY"
                     buffer.clear()
                 else:
                     buffer.append(t)
-            elif v_up == "ORDER":
+
+            elif val_up == "ORDER":
+                # possibly ORDER BY
                 if i+1 < len(tokens) and tokens[i+1].value.upper() == "BY":
                     if current_clause and buffer:
                         flush_clause(current_clause, buffer)
@@ -126,7 +149,8 @@ def parse_sql_to_dict(sql_query: str) -> dict:
                     buffer.clear()
                 else:
                     buffer.append(t)
-            elif v_up == "LIMIT":
+
+            elif val_up == "LIMIT":
                 if current_clause and buffer:
                     flush_clause(current_clause, buffer)
                 current_clause = "LIMIT"
@@ -135,18 +159,20 @@ def parse_sql_to_dict(sql_query: str) -> dict:
                 buffer.append(t)
         else:
             buffer.append(t)
+
         i += 1
 
+    # flush leftover tokens
     if current_clause and buffer:
         flush_clause(current_clause, buffer)
 
     return result
 
 ###############################################################################
-# 2B) HELPER PARSERS (Inline 'parser_utils')
+# 2B) HELPER PARSERS FOR CLAUSES
 ###############################################################################
 def tokens_to_str(token_list) -> str:
-    return "".join(t.value for t in token_list)
+    return "".join(t.value for t in token_list).strip()
 
 def parse_select_list(token_list) -> list:
     raw = tokens_to_str(token_list)
@@ -159,7 +185,7 @@ def parse_from_clause(token_list) -> str:
 def parse_join_clause(token_list) -> dict:
     raw = tokens_to_str(token_list)
     info = {"type": "JOIN", "table": "", "on": ""}
-    # separate "ON"
+    # split on "ON"
     parts = re.split(r"\bON\b", raw, flags=re.IGNORECASE)
     left_side = parts[0].strip()
     on_side = parts[1].strip() if len(parts) > 1 else ""
@@ -167,7 +193,7 @@ def parse_join_clause(token_list) -> dict:
     # find join type
     m = re.match(r"^\s*((LEFT|RIGHT|FULL|CROSS|INNER)\s*(OUTER)?\s+JOIN)(.*)$", left_side, re.IGNORECASE)
     if m:
-        info["type"] = m.group(1).upper()
+        info["type"] = m.group(1).upper()  # e.g. "LEFT JOIN"
         remainder = m.group(4).strip()
         info["table"] = detect_subquery(remainder)
     else:
@@ -185,9 +211,12 @@ def parse_comma_list(token_list) -> list:
     return split_top_level_csv(raw)
 
 def parse_limit_clause(token_list) -> str:
-    return tokens_to_str(token_list).strip()
+    return tokens_to_str(token_list)
 
 def split_top_level_csv(text: str) -> list:
+    """
+    Split by commas not within parentheses
+    """
     items = []
     buf = []
     level = 0
@@ -208,16 +237,18 @@ def split_top_level_csv(text: str) -> list:
     return items
 
 ###############################################################################
-# 3) Subquery Detection & Recursion
+# 3) SUBQUERY DETECTION & RECURSION
 ###############################################################################
 SUBQ_REGEX = re.compile(r"\(\s*SELECT\s+([\s\S]*?)\)", re.IGNORECASE)
 
 def detect_subquery(raw: str) -> str:
     match = re.search(SUBQ_REGEX, raw)
     if match:
+        # parse subquery
         sub_sql = match.group(1).strip()
         sub_dict = parse_sql_to_dict(sub_sql)
         sub_expl = build_business_explanation(sub_dict)
+        # replace the entire (SELECT...) block with SUBQUERY{explanation}
         replaced = re.sub(SUBQ_REGEX, f"SUBQUERY{{{sub_expl}}}", raw, 1, flags=re.IGNORECASE)
         return replaced
     return raw
@@ -235,43 +266,42 @@ def detect_subqueries_in_condition(cond: str) -> str:
     return new_text
 
 ###############################################################################
-# 4) BUILD BUSINESS-ORIENTED EXPLANATION
+# 4) BUILD A BUSINESS-ORIENTED EXPLANATION
 ###############################################################################
 def build_business_explanation(qdict: dict) -> str:
     """
-    Returns a short paragraph describing the query from a business/analyst perspective.
-    Subqueries appear as SUBQUERY{...} placeholders, which are themselves explained recursively.
+    Construct a short business-friendly explanation in paragraph style.
+    Subqueries are replaced with SUBQUERY{...} which also uses this function recursively.
     """
     segments = []
 
-    # FROM:
-    from_val = qdict.get("from")
-    if from_val:
-        from_str = describe_table_or_subquery(from_val)
-        segments.append(f"This analysis starts with data from {from_str}.")
+    # FROM
+    frm = qdict.get("from")
+    if frm:
+        from_desc = describe_table_or_subquery(frm)
+        segments.append(f"This analysis originates from {from_desc}.")
 
-    # JOINS:
-    joins = qdict.get("joins", [])
-    for j in joins:
+    # JOINS
+    for j in qdict.get("joins", []):
         jtype = j["type"].title()  # e.g. "Left Join"
-        tbl = describe_table_or_subquery(j["table"])
-        on_cond = domain_replace(j["on"])
-        if on_cond:
+        jtable = describe_table_or_subquery(j["table"])
+        jcond = domain_replace(j["on"])
+        if jcond:
             segments.append(
-                f"It then merges with {tbl} using a {jtype}, focusing on records where ({on_cond})."
+                f"It then merges with {jtable} via a {jtype}, focusing on ({jcond})."
             )
         else:
             segments.append(
-                f"It then merges with {tbl} using a {jtype}."
+                f"It then merges with {jtable} via a {jtype}."
             )
 
     # SELECT columns
-    cols = qdict.get("columns", [])
-    if cols:
-        replaced_cols = [domain_replace(c) for c in cols]
-        col_str = ", ".join(replaced_cols)
+    columns = qdict.get("columns", [])
+    if columns:
+        col_texts = [domain_replace(c) for c in columns]
+        joined_cols = ", ".join(col_texts)
         segments.append(
-            f"Key fields or metrics gathered include: {col_str}."
+            f"The analysis captures these key measures or fields: {joined_cols}."
         )
 
     # WHERE
@@ -279,67 +309,66 @@ def build_business_explanation(qdict: dict) -> str:
     if wh:
         wh_str = domain_replace(wh)
         segments.append(
-            f"We only consider rows meeting the business condition: ({wh_str})."
+            f"Only records meeting ({wh_str}) are considered."
         )
 
     # GROUP BY
     gb = qdict.get("group_by", [])
     if gb:
-        gb_mapped = [domain_replace(g) for g in gb]
+        mapped_gb = [domain_replace(g) for g in gb]
         segments.append(
-            f"To consolidate results, the data is grouped by: {', '.join(gb_mapped)}."
+            f"For aggregation, data is grouped by {', '.join(mapped_gb)}."
         )
 
     # ORDER BY
     ob = qdict.get("order_by", [])
     if ob:
-        ob_mapped = [domain_replace(o) for o in ob]
+        mapped_ob = [domain_replace(o) for o in ob]
         segments.append(
-            f"For prioritization, the output is sorted by: {', '.join(ob_mapped)}."
+            f"The output is prioritized by sorting on {', '.join(mapped_ob)}."
         )
 
     # LIMIT
     lim = qdict.get("limit")
     if lim:
         segments.append(
-            f"Finally, we limit the result set to the top {lim} records."
+            f"Finally, results are capped at the top {lim} entries."
         )
 
     if not any(qdict.values()):
-        return "an empty or minimal query"
+        return "a minimal or empty query"
 
     paragraph = " ".join(segments)
     return paragraph
 
 def describe_table_or_subquery(txt: str) -> str:
     """
-    If it's SUBQUERY{...}, return that explanation as 'a sub-analysis' or similar phrase.
-    Otherwise, map the table name via domain map.
+    If txt is a SUBQUERY, embed that explanation.
+    Otherwise map the table name from domain map.
     """
     if txt.startswith("SUBQUERY{") and txt.endswith("}"):
         inside = txt[len("SUBQUERY{"):-1].strip()
-        return f"an internal sub-analysis: ({inside})"
+        return f"a sub-analysis: ({inside})"
     else:
         splitted = txt.split(None, 1)
         tbl = splitted[0]
         remainder = ""
         if len(splitted) > 1:
             remainder = " " + splitted[1]
-        domain_table = get_domain_table_name(tbl)
-        return f"{domain_table}{remainder}"
+        mapped_tbl = get_domain_table_name(tbl)
+        return f"{mapped_tbl}{remainder}"
 
-def domain_replace(raw: str) -> str:
+def domain_replace(raw_text: str) -> str:
     """
-    Naive token-based domain mapping for columns/tables in a string,
-    skipping SUBQUERY placeholders.
+    Naive approach: replace recognized table/column names in raw_text,
+    skipping SUBQUERY{...} placeholders.
     """
-    tokens = re.split(r'(\W+)', raw)
+    tokens = re.split(r'(\W+)', raw_text)
     out = []
     for t in tokens:
         if t.startswith("SUBQUERY{"):
             out.append(t)
             continue
-
         if "." in t:
             parts = t.split(".")
             if len(parts) == 2:
@@ -348,26 +377,25 @@ def domain_replace(raw: str) -> str:
             else:
                 out.append(t)
         else:
-            # single token => check table/column
-            replaced = get_domain_column_name(get_domain_table_name(t))
-            out.append(replaced)
+            # single token => maybe table or column
+            out.append(get_domain_column_name(get_domain_table_name(t)))
     return "".join(out)
 
 ###############################################################################
-# 5) MAIN: Standalone Console
+# 5) STANDALONE MAIN
 ###############################################################################
 def main():
-    print("SQL-to-English (Business-Oriented) with sqlparse + subqueries\n")
+    print("Business-Oriented SQL-to-English (sqlparse-based). Enter 'exit' to quit.\n")
     while True:
-        user_sql = input("Enter SQL (or 'exit'): ").strip()
-        if user_sql.lower() in ("exit", "quit"):
-            print("Goodbye.")
+        user_input = input("Enter a SELECT query:\n> ").strip()
+        if user_input.lower() in ("exit", "quit"):
+            print("Goodbye!")
             break
-        if not user_sql:
+        if not user_input:
             continue
 
-        query_dict = parse_sql_to_dict(user_sql)
-        explanation = build_business_explanation(query_dict)
+        qdict = parse_sql_to_dict(user_input)
+        explanation = build_business_explanation(qdict)
         print("\n--- Explanation ---")
         print(explanation)
         print("-------------------\n")
@@ -375,16 +403,11 @@ def main():
 if __name__ == "__main__":
     main()
 
+
 SELECT
     frt.customer_id,
-    SUM(frt.exposure_amount) AS total_exposure,
-    (SELECT MAX(ci.rating)
-     FROM customer_info ci
-     WHERE ci.customer_id = frt.customer_id
-    ) AS max_rat
+    SUM(frt.exposure_amount) AS total_exposure
 FROM financial_risk_table frt
-LEFT JOIN customer_info c2
-    ON frt.customer_id = c2.customer_id
 WHERE frt.rating < 'BBB'
 GROUP BY frt.customer_id
 ORDER BY total_exposure DESC
