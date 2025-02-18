@@ -1,0 +1,599 @@
+"""
+ENHANCED PART 2: BFS rule exec, multi-step approvals,
+and now requiring new approvals for DEACTIVATION or DELETION.
+
+Requires:
+ - Part 1 for detect_operation_type, enhanced_advanced_extract_tables, add_audit_log, etc.
+ - A new column in BRM_RULE_APPROVALS named ACTION_TYPE (VARCHAR).
+"""
+
+import json
+from datetime import datetime
+from collections import deque
+
+###############################################################################
+# BFS RULE EXEC + STATS
+###############################################################################
+def build_rule_adjacency(conn):
+    c=conn.cursor()
+    c.execute("SELECT RULE_ID,PARENT_RULE_ID FROM BRM_RULES")
+    rows=c.fetchall()
+    children_map={}
+    all_ids=set()
+    parent_ids=set()
+    for r_ in rows:
+        rid=r_[0]
+        pid=r_[1]
+        all_ids.add(rid)
+        if pid:
+            parent_ids.add(pid)
+            children_map.setdefault(pid,[]).append(rid)
+    roots=[x for x in all_ids if x not in parent_ids]
+    return children_map, roots
+
+def load_global_critical_links(conn):
+    c=conn.cursor()
+    c.execute("SELECT GCR_RULE_ID,TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
+    rows=c.fetchall()
+    link_map={}
+    for r_ in rows:
+        gcr=r_[0]
+        tgt=r_[1]
+        link_map.setdefault(gcr,set()).add(tgt)
+    return link_map
+
+def get_all_rules_as_dict(conn):
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES")
+    rr=c.fetchall()
+    cols=[desc[0] for desc in c.description]
+    res={}
+    for row in rr:
+        d=dict(zip(cols,row))
+        res[d["RULE_ID"]]=d
+    return res
+
+def skip_descendants(child_id, children_map, skipped):
+    stack=[child_id]
+    while stack:
+        curr=stack.pop()
+        if curr in skipped:
+            continue
+        skipped.add(curr)
+        if curr in children_map:
+            stack.extend(children_map[curr])
+
+def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count):
+    c=conn.cursor()
+    c.execute("""
+    INSERT INTO RULE_EXECUTION_LOGS(
+      RULE_ID,EXECUTION_TIMESTAMP,PASS_FLAG,MESSAGE,RECORD_COUNT
+    )
+    VALUES(?,GETDATE(),?,?,?)
+    """,(rule_id,1 if pass_flag else 0,message,record_count))
+    conn.commit()
+
+def execute_rules_in_order(conn):
+    """
+    BFS-based rule exec. If a critical/global rule fails => skip children.
+    Logs outcomes in RULE_EXECUTION_LOGS.
+    """
+    children_map, roots = build_rule_adjacency(conn)
+    gcr_links = load_global_critical_links(conn)
+    rule_lookup = get_all_rules_as_dict(conn)
+    executed=[]
+    skipped=set()
+    c=conn.cursor()
+    queue=list(roots)
+
+    while queue:
+        rid=queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_lookup:
+            continue
+        rinfo=rule_lookup[rid]
+        sql_=rinfo["RULE_SQL"]
+        is_crit=(rinfo["CRITICAL_RULE"]==1 or rinfo["IS_GLOBAL"]==1)
+        crit_scope=(rinfo["CRITICAL_SCOPE"] or "NONE").upper()
+
+        c.execute("BEGIN TRANSACTION")
+        success=False
+        msg=""
+        record_count=0
+        try:
+            c.execute(sql_)
+            rows=c.fetchall()
+            if rows:
+                record_count=len(rows)
+                val=rows[0][0]
+                success=(val==1)
+                msg=f"Returned: {val}"
+            else:
+                success=True
+                msg="No rows => PASS"
+            if success:
+                c.execute("COMMIT")
+            else:
+                c.execute("ROLLBACK")
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            success=False
+            msg=str(ex)
+
+        insert_rule_execution_log(conn, rid, success, msg, record_count)
+
+        if success:
+            executed.append(rid)
+            if rid in children_map:
+                for ch_ in children_map[rid]:
+                    if ch_ not in skipped:
+                        queue.append(ch_)
+        else:
+            # skip BFS descendants if rule is critical
+            if is_crit and crit_scope!="NONE":
+                if rid in children_map:
+                    for subc in children_map[rid]:
+                        skip_descendants(subc,children_map,skipped)
+                if rid in gcr_links:
+                    for child_rid in gcr_links[rid]:
+                        skip_descendants(child_rid,children_map,skipped)
+
+    return executed, skipped
+
+###############################################################################
+# BFS FOR CHILD RULES
+###############################################################################
+def get_child_rules_bfs(conn, start_rule_id):
+    c=conn.cursor()
+    c.execute("SELECT RULE_ID,PARENT_RULE_ID FROM BRM_RULES")
+    allrows=c.fetchall()
+    children_map={}
+    for row in allrows:
+        rid=row[0]
+        pid=row[1]
+        if pid:
+            children_map.setdefault(pid,[]).append(rid)
+
+    c.execute("SELECT GCR_RULE_ID,TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
+    glinks=c.fetchall()
+    gl_map={}
+    for row in glinks:
+        g_parent=row[0]
+        g_child=row[1]
+        gl_map.setdefault(g_parent,[]).append(g_child)
+
+    visited=set()
+    queue=[start_rule_id]
+    results=set()
+    while queue:
+        cur=queue.pop(0)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if cur in children_map:
+            for ch_ in children_map[cur]:
+                results.add(ch_)
+                queue.append(ch_)
+        if cur in gl_map:
+            for ch_ in gl_map[cur]:
+                results.add(ch_)
+                queue.append(ch_)
+    return results
+
+###############################################################################
+# MULTI-STEP APPROVAL CREATION
+###############################################################################
+def find_impacted_business_groups(conn, rule_id):
+    impacted=set()
+    c=conn.cursor()
+    c.execute("SELECT OWNER_GROUP FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    row=c.fetchone()
+    if row:
+        impacted.add(row[0])
+
+    child_ids=get_child_rules_bfs(conn, rule_id)
+    for cid in child_ids:
+        c2=conn.cursor()
+        c2.execute("SELECT OWNER_GROUP FROM BRM_RULES WHERE RULE_ID=?",(cid,))
+        r2=c2.fetchone()
+        if r2:
+            impacted.add(r2[0])
+    return impacted
+
+def create_multistep_approvals(conn, rule_id, action_type="CREATE_OR_UPDATE"):
+    """
+    Creates an approval pipeline for a given rule_id with an ACTION_TYPE:
+      - e.g. "CREATE_OR_UPDATE", "DEACTIVATE", "DELETE"
+    We do a simple approach: BG1, BG2, BG3 (if impacted), then FINAL.
+
+    NOTE: we store 'action_type' in a new column in BRM_RULE_APPROVALS => 'ACTION_TYPE'.
+    Make sure to do: ALTER TABLE BRM_RULE_APPROVALS ADD ACTION_TYPE VARCHAR(50) NULL;
+    """
+    impacted=find_impacted_business_groups(conn, rule_id)
+    base_order=["BG1","BG2","BG3","FINAL"]
+    c=conn.cursor()
+
+    # remove old lines for this rule and this action_type—just to be safe
+    c.execute("DELETE FROM BRM_RULE_APPROVALS WHERE RULE_ID=? AND ACTION_TYPE=?", (rule_id, action_type))
+
+    stage_ctr=1
+    pipeline=[]
+    for stg in base_order:
+        if stg=="FINAL":
+            pipeline.append(stg)
+        else:
+            if stg in impacted:
+                pipeline.append(stg)
+
+    for st_ in pipeline:
+        if st_=="FINAL":
+            c.execute("""
+            INSERT INTO BRM_RULE_APPROVALS(
+              RULE_ID,GROUP_NAME,USERNAME,APPROVED_FLAG,APPROVED_TIMESTAMP,APPROVAL_STAGE,ACTION_TYPE
+            )
+            VALUES(?,?,?,?,NULL,?,?)
+            """,(rule_id,"FINAL","final_approver",0,stage_ctr,action_type))
+            stage_ctr+=1
+        else:
+            c2=conn.cursor()
+            c2.execute("SELECT USERNAME FROM BUSINESS_GROUP_APPROVERS WHERE GROUP_NAME=?",(st_,))
+            ap_rows=c2.fetchall()
+            for apx in ap_rows:
+                c.execute("""
+                INSERT INTO BRM_RULE_APPROVALS(
+                  RULE_ID,GROUP_NAME,USERNAME,APPROVED_FLAG,APPROVED_TIMESTAMP,APPROVAL_STAGE,ACTION_TYPE
+                )
+                VALUES(?,?,?,?,NULL,?,?)
+                """,(rule_id, st_, apx[0], 0, stage_ctr, action_type))
+            stage_ctr+=1
+
+    conn.commit()
+
+###############################################################################
+# RULE CRUD with BFS checks + Column mapping + ENHANCED for Deactivate/Delete Approvals
+###############################################################################
+def add_rule(conn, rule_data, created_by, user_group):
+    from __main__ import detect_operation_type, enhanced_advanced_extract_tables, add_audit_log
+    c=conn.cursor()
+
+    # Check duplicates by name
+    c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?",
+              (rule_data["OWNER_GROUP"], rule_data["RULE_NAME"].strip()))
+    if c.fetchone():
+        raise ValueError("Duplicate rule name in that group.")
+
+    new_sql=rule_data["RULE_SQL"].strip()
+    c.execute("SELECT RULE_ID FROM BRM_RULES WHERE RULE_SQL=?",(new_sql,))
+    if c.fetchone():
+        raise ValueError("Another rule with the same SQL exists. Not allowed.")
+
+    if rule_data.get("IS_GLOBAL",0)==1 and user_group!="Admin":
+        raise ValueError("Only Admin can create global rule.")
+
+    op_type=detect_operation_type(new_sql)
+    rule_data["OPERATION_TYPE"]=op_type
+
+    # Group perms
+    owner_grp=rule_data["OWNER_GROUP"]
+    c.execute("SELECT TARGET_TABLE FROM GROUP_PERMISSIONS WHERE GROUP_NAME=?",(owner_grp,))
+    perm_rows=c.fetchall()
+    allowed_tables=set(x[0].lower() for x in perm_rows)
+
+    parse_info=enhanced_advanced_extract_tables(new_sql)
+    for (schema,tbl,alias,_) in parse_info["tables"]:
+        if tbl:
+            schema_part=schema if schema else "dbo"
+            full_name=(f"{schema_part}.{tbl}").lower()
+            if not full_name.startswith("(cte)") and full_name not in allowed_tables:
+                raise ValueError(f"Group '{owner_grp}' does not have permission for '{full_name}'")
+
+    row=c.execute("""
+    INSERT INTO BRM_RULES(
+      GROUP_ID,PARENT_RULE_ID,RULE_TYPE_ID,RULE_NAME,RULE_SQL,
+      EFFECTIVE_START_DATE,EFFECTIVE_END_DATE,STATUS,VERSION,
+      CREATED_BY,DESCRIPTION,OPERATION_TYPE,BUSINESS_JUSTIFICATION,
+      CREATED_TIMESTAMP,UPDATED_BY,OWNER_GROUP,CLUSTER_NAME,
+      APPROVAL_STATUS,IS_GLOBAL,CRITICAL_RULE,CRITICAL_SCOPE,CDC_TYPE
+    )
+    OUTPUT inserted.RULE_ID
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """,(
+        rule_data.get("GROUP_ID"),
+        rule_data.get("PARENT_RULE_ID"),
+        rule_data["RULE_TYPE_ID"],
+        rule_data["RULE_NAME"].strip(),
+        new_sql,
+        rule_data["EFFECTIVE_START_DATE"],
+        rule_data.get("EFFECTIVE_END_DATE"),
+        rule_data.get("STATUS","INACTIVE"),
+        1,
+        created_by,
+        rule_data.get("DESCRIPTION",""),
+        rule_data["OPERATION_TYPE"],
+        rule_data.get("BUSINESS_JUSTIFICATION",""),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        None,
+        rule_data["OWNER_GROUP"],
+        rule_data.get("CLUSTER_NAME",""),
+        "APPROVAL_IN_PROGRESS",
+        rule_data.get("IS_GLOBAL",0),
+        rule_data.get("CRITICAL_RULE",0),
+        rule_data.get("CRITICAL_SCOPE","NONE"),
+        rule_data.get("CDC_TYPE","NONE")
+    )).fetchone()
+
+    if not row:
+        raise ValueError("Insert failed, no RULE_ID returned.")
+    new_id=row[0]
+
+    # Dependencies
+    if op_type in ("INSERT","UPDATE","DELETE"):
+        col_op="WRITE"
+    else:
+        col_op="READ"
+
+    for (sch,tb,alias,_) in parse_info["tables"]:
+        if tb and not tb.startswith("(CTE)"):
+            c.execute("""
+            INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+              RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME,COLUMN_OP
+            )
+            VALUES(?,?,?,?,?)
+            """,(new_id, sch if sch else "N/A", tb, "DerivedCol", col_op))
+
+    # Column mapping
+    columns_info=parse_info["columns"]
+    for (col_name, is_target, in_select) in columns_info:
+        map_type="WRITE" if is_target else "READ"
+        c.execute("""
+            INSERT INTO BRM_COLUMN_MAPPING(SOURCE_RULE_ID,RULE_ID,COLUMN_NAME,MAP_TYPE)
+            VALUES(?,?,?,?)
+        """,(new_id,new_id,col_name,map_type))
+
+    add_audit_log(conn,"INSERT","BRM_RULES",new_id,created_by,None,rule_data)
+    conn.commit()
+
+    if rule_data.get("IS_GLOBAL",0)==0:
+        # Normal pipeline => CREATE_OR_UPDATE
+        create_multistep_approvals(conn,new_id,"CREATE_OR_UPDATE")
+
+    return new_id
+
+def update_rule(conn, rule_data, updated_by, user_group):
+    from __main__ import detect_operation_type, enhanced_advanced_extract_tables, add_audit_log
+    c=conn.cursor()
+    rid=rule_data["RULE_ID"]
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+    old=get_cursor_one(c)
+    if not old:
+        raise ValueError("Rule not found.")
+    old_data=dict(old)
+
+    new_owner=rule_data.get("OWNER_GROUP", old["OWNER_GROUP"])
+    new_name=rule_data.get("RULE_NAME", old["RULE_NAME"]).strip()
+
+    # Check duplicates
+    if (new_owner!=old["OWNER_GROUP"] or new_name!=old["RULE_NAME"]):
+        c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?",(new_owner,new_name))
+        du=c.fetchone()
+        if du and du[0]!=rid:
+            raise ValueError(f"Duplicate rule '{new_name}' in group '{new_owner}'")
+
+    new_sql=rule_data["RULE_SQL"].strip()
+    if new_sql!=old["RULE_SQL"].strip():
+        c.execute("SELECT RULE_ID FROM BRM_RULES WHERE RULE_SQL=?",(new_sql,))
+        rowx=c.fetchone()
+        if rowx and rowx[0]!=rid:
+            raise ValueError("Another rule with that SQL exists. Not allowed.")
+
+    if old["IS_GLOBAL"]==1 and user_group!="Admin":
+        raise ValueError("Only Admin can update global rule.")
+    if rule_data.get("IS_GLOBAL", old["IS_GLOBAL"])==1 and user_group!="Admin":
+        raise ValueError("Only Admin can set is_global=1.")
+
+    op_type=detect_operation_type(new_sql)
+    rule_data["OPERATION_TYPE"]=op_type
+
+    # group perms
+    c.execute("SELECT TARGET_TABLE FROM GROUP_PERMISSIONS WHERE GROUP_NAME=?",(new_owner,))
+    perm_rows=c.fetchall()
+    allowed_tables=set(x[0].lower() for x in perm_rows)
+
+    parse_info=enhanced_advanced_extract_tables(new_sql)
+    for (schema,tbl,alias,_) in parse_info["tables"]:
+        if tbl:
+            schema_part=schema if schema else "dbo"
+            full_name=(f"{schema_part}.{tbl}").lower()
+            if not full_name.startswith("(cte)") and full_name not in allowed_tables:
+                raise ValueError(f"Group '{new_owner}' not permitted for '{full_name}'")
+
+    c.execute("""
+    UPDATE BRM_RULES
+    SET
+      GROUP_ID=?,
+      PARENT_RULE_ID=?,
+      RULE_TYPE_ID=?,
+      RULE_NAME=?,
+      RULE_SQL=?,
+      EFFECTIVE_START_DATE=?,
+      EFFECTIVE_END_DATE=?,
+      STATUS='INACTIVE',
+      VERSION=VERSION+1,
+      UPDATED_BY=?,
+      DESCRIPTION=?,
+      OPERATION_TYPE=?,
+      BUSINESS_JUSTIFICATION=?,
+      OWNER_GROUP=?,
+      CLUSTER_NAME=?,
+      APPROVAL_STATUS='APPROVAL_IN_PROGRESS',
+      IS_GLOBAL=?,
+      CRITICAL_RULE=?,
+      CRITICAL_SCOPE=?,
+      CDC_TYPE=?
+    WHERE RULE_ID=?
+    """,(
+        rule_data.get("GROUP_ID", old["GROUP_ID"]),
+        rule_data.get("PARENT_RULE_ID", old["PARENT_RULE_ID"]),
+        rule_data["RULE_TYPE_ID"],
+        new_name,
+        new_sql,
+        rule_data["EFFECTIVE_START_DATE"],
+        rule_data.get("EFFECTIVE_END_DATE"),
+        updated_by,
+        rule_data.get("DESCRIPTION", old["DESCRIPTION"]),
+        rule_data["OPERATION_TYPE"],
+        rule_data.get("BUSINESS_JUSTIFICATION", old["BUSINESS_JUSTIFICATION"]),
+        new_owner,
+        rule_data.get("CLUSTER_NAME", old.get("CLUSTER_NAME","")),
+        rule_data.get("IS_GLOBAL", old["IS_GLOBAL"]),
+        rule_data.get("CRITICAL_RULE", old["CRITICAL_RULE"]),
+        rule_data.get("CRITICAL_SCOPE", old["CRITICAL_SCOPE"]),
+        rule_data.get("CDC_TYPE", old["CDC_TYPE"]),
+        rid
+    ))
+
+    c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?",(rid,))
+    if op_type in ("INSERT","UPDATE","DELETE"):
+        col_op="WRITE"
+    else:
+        col_op="READ"
+
+    for (sch,tb,alias,_) in parse_info["tables"]:
+        if tb and not tb.startswith("(CTE)"):
+            c.execute("""
+            INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+              RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME,COLUMN_OP
+            )VALUES(?,?,?,?,?)
+            """,(rid,sch if sch else "N/A",tb,"DerivedCol",col_op))
+
+    # re-pop column mapping
+    c.execute("DELETE FROM BRM_COLUMN_MAPPING WHERE SOURCE_RULE_ID=? OR RULE_ID=?",(rid,rid))
+    columns_info=parse_info["columns"]
+    for (col_name, is_target, in_select) in columns_info:
+        map_type="WRITE" if is_target else "READ"
+        c.execute("""
+            INSERT INTO BRM_COLUMN_MAPPING(SOURCE_RULE_ID,RULE_ID,COLUMN_NAME,MAP_TYPE)
+            VALUES(?,?,?,?)
+        """,(rid,rid,col_name,map_type))
+
+    new_data=dict(old_data)
+    for k,v in rule_data.items():
+        new_data[k]=v
+    new_data["VERSION"]=old_data["VERSION"]+1
+
+    add_audit_log(conn,"UPDATE","BRM_RULES",rid,updated_by,old_data,new_data)
+    conn.commit()
+
+    # re-init approvals if not global
+    if rule_data.get("IS_GLOBAL", old["IS_GLOBAL"])==0:
+        create_multistep_approvals(conn, rid, "CREATE_OR_UPDATE")
+
+def deactivate_rule(conn, rule_id, updated_by, user_group):
+    """
+    Enhanced: Instead of immediately setting rule to INACTIVE, we:
+      1) Check BFS + approvals
+      2) Switch rule to 'DEACTIVATE_IN_PROGRESS'
+      3) Create a new multi-step approval pipeline with ACTION_TYPE='DEACTIVATE'
+         Only after final approval do we truly set it INACTIVE.
+    """
+    from __main__ import add_audit_log
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old=get_cursor_one(c)
+    if not old:
+        raise ValueError("Rule not found.")
+    if old["IS_GLOBAL"]==1 and user_group!="Admin":
+        raise ValueError("Only Admin can deactivate global rule.")
+
+    # BFS check: no active children
+    child_ids=get_child_rules_bfs(conn, rule_id)
+    if child_ids:
+        placeholders=",".join(str(x) for x in child_ids)
+        c2=conn.cursor()
+        c2.execute(f"SELECT RULE_ID,STATUS FROM BRM_RULES WHERE RULE_ID IN ({placeholders})")
+        kids=c2.fetchall()
+        active_kids=[kid[0] for kid in kids if kid[1]=="ACTIVE"]
+        if active_kids:
+            raise ValueError(f"Deactivate child rule(s) first: {active_kids}")
+
+    # So we do not forcibly require the rule to be "APPROVED" in this new design
+    # but if you want to require it, uncomment next line:
+    # if old["APPROVAL_STATUS"]!="APPROVED":
+    #     raise ValueError("Cannot deactivate if not fully APPROVED.")
+
+    old_data=dict(old)
+    # Instead of setting 'INACTIVE', we do:
+    c.execute("""
+    UPDATE BRM_RULES
+    SET STATUS='DEACTIVATE_IN_PROGRESS',
+        APPROVAL_STATUS='DEACTIVATE_IN_PROGRESS',
+        UPDATED_BY=?,
+        VERSION=VERSION+1
+    WHERE RULE_ID=?
+    """,(updated_by, rule_id))
+    new_data=dict(old_data)
+    new_data["STATUS"]="DEACTIVATE_IN_PROGRESS"
+    new_data["APPROVAL_STATUS"]="DEACTIVATE_IN_PROGRESS"
+    new_data["VERSION"]=old_data["VERSION"]+1
+
+    add_audit_log(conn,"REQUEST_DEACTIVATE","BRM_RULES",rule_id,updated_by,old_data,new_data)
+    conn.commit()
+
+    # Now create separate approvals => 'DEACTIVATE'
+    create_multistep_approvals(conn, rule_id, action_type="DEACTIVATE")
+
+def delete_rule(conn, rule_id, action_by, user_group):
+    """
+    Enhanced: Instead of immediate deletion, we:
+      1) BFS checks
+      2) Mark 'DELETE_IN_PROGRESS'
+      3) Re-approval pipeline for 'DELETE'
+      4) Only after final approval do we truly remove from DB
+    """
+    from __main__ import add_audit_log
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old=get_cursor_one(c)
+    if not old:
+        raise ValueError("Rule not found.")
+    if old["IS_GLOBAL"]==1 and user_group!="Admin":
+        raise ValueError("Only Admin can delete global rule.")
+
+    # BFS check: no children
+    child_ids=get_child_rules_bfs(conn, rule_id)
+    if child_ids:
+        placeholders=",".join(str(x) for x in child_ids)
+        c2=conn.cursor()
+        c2.execute(f"SELECT RULE_ID FROM BRM_RULES WHERE RULE_ID IN ({placeholders})")
+        existing=c2.fetchall()
+        if existing:
+            raise ValueError("Child rules exist. Remove or deactivate them first.")
+
+    # Also check column references
+    c.execute("SELECT * FROM BRM_COLUMN_MAPPING WHERE SOURCE_RULE_ID=? OR RULE_ID=?",(rule_id,rule_id))
+    leftover=c.fetchall()
+    if leftover:
+        raise ValueError("Re-map or remove column references in BRM_COLUMN_MAPPING first.")
+
+    old_data=dict(old)
+
+    # Instead of physical deletion, mark 'DELETE_IN_PROGRESS'
+    c.execute("""
+    UPDATE BRM_RULES
+    SET STATUS='DELETE_IN_PROGRESS',
+        APPROVAL_STATUS='DELETE_IN_PROGRESS',
+        UPDATED_BY=?,
+        VERSION=VERSION+1
+    WHERE RULE_ID=?
+    """,(action_by, rule_id))
+    new_data=dict(old_data)
+    new_data["STATUS"]="DELETE_IN_PROGRESS"
+    new_data["APPROVAL_STATUS"]="DELETE_IN_PROGRESS"
+    new_data["VERSION"]=old_data["VERSION"]+1
+
+    add_audit_log(conn,"REQUEST_DELETE","BRM_RULES",rule_id,action_by,old_data,new_data)
+    conn.commit()
+
+    # Create new multi-step approvals => 'DELETE'
+    create_multistep_approvals(conn, rule_id, action_type="DELETE")
