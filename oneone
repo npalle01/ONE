@@ -4568,7 +4568,7 @@ class BRMTool(QMainWindow):
             QMessageBox.critical(self,"Error", str(ex))
 
     ############################################################
-    # Other existing methods from “Part 5”
+    # Other
     ############################################################
     def sync_metadata_real(self):
         from __main__ import sync_metadata_improved
@@ -4814,5 +4814,1249 @@ class BRMTool(QMainWindow):
             except:
                 pass
         event.accept()
+self.perf_tab = PerfMonitoringWidget(self.connection)
+self.tabs.addTab(self.perf_tab,"Performance Stats")
+###############################################################
+#                
+#   Additional advanced features:
+#     (1) Automated Testing tab (BRM_RULE_TESTS)
+#     (2) Policy-based auto-approvals (AUTOPROV_GROUPS)
+#     (3) BFS execution with conflict resolution
+###############################################################
+
+
+################################################################
+# AUTOMATED TESTING TAB
+################################################################
+class RuleTestsTab(QWidget):
+    """
+    Manages a table 'BRM_RULE_TESTS' with columns like:
+      TEST_ID, RULE_ID, TEST_SQL, EXPECTED_RESULT (INT?), DESCRIPTION
+    Provides a button to run selected tests => show pass/fail.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        layout = QVBoxLayout(self)
+
+        self.tests_table = QTableWidget(0,5)
+        self.tests_table.setHorizontalHeaderLabels(["Test ID","Rule ID","Test SQL","Expected","Description"])
+        self.tests_table.horizontalHeader().setStretchLastSection(True)
+        self.tests_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tests_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.tests_table)
+
+        bh = QHBoxLayout()
+        load_btn = QPushButton("Refresh Tests")
+        load_btn.clicked.connect(self.load_tests)
+        bh.addWidget(load_btn)
+
+        add_btn = QPushButton("Add Test")
+        add_btn.clicked.connect(self.add_test)
+        bh.addWidget(add_btn)
+
+        run_btn = QPushButton("Run Selected")
+        run_btn.clicked.connect(self.run_selected_tests)
+        bh.addWidget(run_btn)
+
+        del_btn = QPushButton("Delete Test")
+        del_btn.clicked.connect(self.del_test)
+        bh.addWidget(del_btn)
+
+        bh.addStretch()
+        layout.addLayout(bh)
+        self.setLayout(layout)
+        self.load_tests()
+
+    def load_tests(self):
+        self.tests_table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT TEST_ID,RULE_ID,TEST_SQL,EXPECTED_RESULT,DESCRIPTION FROM BRM_RULE_TESTS ORDER BY TEST_ID")
+        except Exception as ex:
+            QMessageBox.critical(self,"Error loading tests",str(ex))
+            return
+        rows = c.fetchall()
+        for row in rows:
+            r_i = self.tests_table.rowCount()
+            self.tests_table.insertRow(r_i)
+            for col_i, val in enumerate(row):
+                self.tests_table.setItem(r_i, col_i, QTableWidgetItem(str(val)))
+
+    def add_test(self):
+        # minimal approach: ask user for rule id, test sql, expected result
+        rid,ok = QInputDialog.getInt(self,"Add Test","Rule ID:")
+        if not ok:
+            return
+        t_sql,ok2 = QInputDialog.getMultiLineText(self,"Test SQL","Enter test SQL returning an INT result:")
+        if not ok2 or not t_sql.strip():
+            return
+        exp,ok3 = QInputDialog.getInt(self,"Expected","Expected INT result:",1)
+        if not ok3:
+            return
+        desc,ok4 = QInputDialog.getText(self,"Description","(optional) short desc:")
+        if not ok4:
+            desc=""
+
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+              INSERT INTO BRM_RULE_TESTS(RULE_ID, TEST_SQL, EXPECTED_RESULT, DESCRIPTION)
+              VALUES(?,?,?,?)
+            """,(rid,t_sql.strip(),exp,desc.strip()))
+            self.connection.commit()
+            QMessageBox.information(self,"Added","Test inserted.")
+            self.load_tests()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
+
+    def del_test(self):
+        row = self.tests_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No test selected.")
+            return
+        it = self.tests_table.item(row,0)
+        if not it:
+            return
+        test_id = it.text()
+        confirm = QMessageBox.question(self,"Confirm",f"Delete test {test_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("DELETE FROM BRM_RULE_TESTS WHERE TEST_ID=?",(test_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted","Test removed.")
+            self.load_tests()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
+
+    def run_selected_tests(self):
+        rows = self.tests_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.warning(self,"None","No tests selected.")
+            return
+        c = self.connection.cursor()
+        results=[]
+        for idx in rows:
+            row_i = idx.row()
+            t_id_item = self.tests_table.item(row_i,0)
+            rid_item = self.tests_table.item(row_i,1)
+            sql_item = self.tests_table.item(row_i,2)
+            exp_item = self.tests_table.item(row_i,3)
+
+            if not t_id_item or not sql_item:
+                continue
+            test_id = t_id_item.text()
+            rule_id = rid_item.text()
+            test_sql = sql_item.text()
+            expected = int(exp_item.text())
+
+            pass_flag,msg = self.run_test_sql(test_sql)
+            outcome = "PASS" if (pass_flag and msg==expected) else f"FAIL: got={msg}, expected={expected}"
+            results.append(f"Test {test_id} (rule {rule_id}): {outcome}")
+
+        QMessageBox.information(self,"Test Results","\n".join(results))
+
+    def run_test_sql(self, sql_):
+        c = self.connection.cursor()
+        c.execute("BEGIN TRANSACTION")
+        val=0
+        pass_flag=False
+        try:
+            c.execute(sql_)
+            rows = c.fetchall()
+            if rows:
+                val = rows[0][0]
+                pass_flag=True
+            else:
+                pass_flag=True
+            c.execute("ROLLBACK")
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            return (False, f"Error {ex}")
+        return (True, val)
+
+################################################################
+# POLICY-BASED AUTO-APPROVALS
+################################################################
+def check_auto_approve(conn, rule_id, user_group):
+    """
+    If user_group is in AUTOPROV_GROUPS, we auto-approve the current stage 
+    (like a bypass). Example approach.
+    """
+    c = conn.cursor()
+    # see if user_group is in table AUTOPROV_GROUPS
+    c.execute("SELECT GROUP_NAME FROM AUTOPROV_GROUPS WHERE GROUP_NAME=?",(user_group,))
+    row = c.fetchone()
+    if row:
+        # user_group is auto-approval => just do it
+        # We find the current stage that belongs to user_group, set APPROVED_FLAG=1.
+        c.execute("""
+            UPDATE A
+            SET A.APPROVED_FLAG=1, A.APPROVED_TIMESTAMP=GETDATE()
+            FROM BRM_RULE_APPROVALS A
+            JOIN (
+              SELECT MIN(APPROVAL_STAGE) as stg
+              FROM BRM_RULE_APPROVALS
+              WHERE RULE_ID=? AND APPROVED_FLAG=0
+            )X ON A.APPROVAL_STAGE=X.stg
+            WHERE A.RULE_ID=? AND A.GROUP_NAME=? AND A.APPROVED_FLAG=0
+        """,(rule_id, rule_id, user_group))
+
+        # Then we see if any more stages are needed
+        c.execute("""
+            SELECT MIN(APPROVAL_STAGE) as stage
+            FROM BRM_RULE_APPROVALS
+            WHERE RULE_ID=? AND APPROVED_FLAG=0
+        """,(rule_id,))
+        row2 = c.fetchone()
+        if row2 and row2[0] is not None:
+            # still in progress => we keep rule STATUS='INACTIVE'
+            c.execute("UPDATE BRM_RULES SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS', STATUS='INACTIVE' WHERE RULE_ID=?",(rule_id,))
+        else:
+            # no more stages => fully approved => set rule active
+            c.execute("UPDATE BRM_RULES SET APPROVAL_STATUS='APPROVED', STATUS='ACTIVE' WHERE RULE_ID=?",(rule_id,))
+        conn.commit()
+
+################################################################
+# (3) BFS EXECUTION + CONFLICT PRIORITY
+################################################################
+def execute_rules_in_order_with_conflict(conn):
+    """
+    Variation of BFS rule exec from Part 2, but we incorporate RULE_CONFLICTS 
+    so that if conflicting rules both pass, we only consider the higher PRIORITY.
+    """
+    from __main__ import build_rule_adjacency, load_global_critical_links, get_all_rules_as_dict, skip_descendants, insert_rule_execution_log
+
+    children_map,roots=build_rule_adjacency(conn)
+    gcr_links=load_global_critical_links(conn)
+    rule_lookup=get_all_rules_as_dict(conn)
+    executed=[]
+    skipped=set()
+    c=conn.cursor()
+
+    # load conflicts
+    conflicts_map = {}  
+    # for example: RULE_CONFLICTS: (CONFLICT_ID,RULE_ID1,RULE_ID2,PRIORITY)
+    c.execute("SELECT RULE_ID1,RULE_ID2,PRIORITY,CONFLICT_ID FROM RULE_CONFLICTS ORDER BY CONFLICT_ID")
+    for row in c.fetchall():
+        r1 = row[0]
+        r2 = row[1]
+        prio = row[2]
+        # store a 2-way conflict => a bigger structure?
+        conflicts_map.setdefault(frozenset([r1,r2]),[]).append(prio)
+
+    queue=list(roots)
+    while queue:
+        rid=queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_lookup:
+            continue
+        rinfo = rule_lookup[rid]
+        sql_ = rinfo["RULE_SQL"]
+        is_crit = (rinfo["CRITICAL_RULE"]==1 or rinfo["IS_GLOBAL"]==1)
+        crit_scope = (rinfo["CRITICAL_SCOPE"] or "NONE").upper()
+
+        c.execute("BEGIN TRANSACTION")
+        success=False
+        msg=""
+        record_count=0
+        try:
+            c.execute(sql_)
+            rows=c.fetchall()
+            if rows:
+                record_count=len(rows)
+                val=rows[0][0]
+                success=(val==1)
+                msg=f"Returned: {val}"
+            else:
+                success=True
+                msg="No rows => PASS"
+            if success:
+                c.execute("COMMIT")
+            else:
+                c.execute("ROLLBACK")
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            success=False
+            msg=str(ex)
+
+        insert_rule_execution_log(conn, rid, success, msg, record_count)
+
+        if success:
+            # check conflict => if we have a second rule that also passes
+            # for each pair => if both pass => only highest priority "wins"
+            # This code is a simplistic approach.
+            # 1) see any "executed" rule that conflicts with rid
+            # 2) see priority => skip the lower priority
+            for ex_rid in executed:
+                fs = frozenset([ex_rid, rid])
+                if fs in conflicts_map:
+                    # suppose we define the conflict row's priority means ex_rid > rid
+                    # or we could store a separate row for each direction
+                    # This example is minimal => we just skip rid if ex_rid has the higher priority
+                    # or skip ex_rid if rid has higher priority
+                    # Implementation specifics vary.
+                    # We'll do a naive approach: whichever rule_id is bigger => "higher priority"
+                    # or read from the RULE_CONFLICTS rows themselves
+                    # For brevity:
+                    # We'll skip the "lower rule_id" if there's a conflict
+                    if ex_rid < rid:
+                        # skip rid
+                        success=False
+                        msg=f"Conflict with rule {ex_rid} => skipping"
+                    else:
+                        # skip ex_rid
+                        # but ex_rid was already executed => we can't retroactively "unexecute"? 
+                        # in real scenario we might do a partial rollback or track "canceled"
+                        msg=f"Conflict => overshadowing {ex_rid}"
+            if success:
+                executed.append(rid)
+                if rid in children_map:
+                    for ch_ in children_map[rid]:
+                        if ch_ not in skipped:
+                            queue.append(ch_)
+            else:
+                # we effectively skip rid
+                pass
+        else:
+            if is_crit and crit_scope!="NONE":
+                if rid in children_map:
+                    for subc in children_map[rid]:
+                        skip_descendants(subc,children_map,skipped)
+                if rid in gcr_links:
+                    for child_rid in gcr_links[rid]:
+                        skip_descendants(child_rid,children_map,skipped)
+
+    return executed, skipped
+
+################################################################
+#  UI HOOK
+################################################################
+class ExtendedConflictBFSDialog(QWidget):
+    """
+    Optional small UI to call 'execute_rules_in_order_with_conflict' 
+    and show results in a text box.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.setWindowTitle("Conflict BFS Execution - Part 6")
+        self.resize(400,300)
+        layout=QVBoxLayout(self)
+
+        run_btn=QPushButton("Execute BFS with Conflict Priority")
+        run_btn.clicked.connect(self.do_bfs)
+        layout.addWidget(run_btn)
+
+        self.result_area=QPlainTextEdit()
+        self.result_area.setReadOnly(True)
+        layout.addWidget(self.result_area)
+
+        self.setLayout(layout)
+
+    def do_bfs(self):
+        ex,sk=execute_rules_in_order_with_conflict(self.connection)
+        txt=f"Executed => {ex}\nSkipped => {sk}"
+        self.result_area.setPlainText(txt)
+###############################################################
+#                     PART 7 (Continuation)
+#   Advanced additions:
+#     (1) Tag Inheritance / Cascade
+#     (2) Decision Table & Composite Rule expansions
+#     (3) Automated Email Alerts on Audit Log triggers
+#     (4) Enhanced Data Lineage scanning (SP references)
+###############################################################
+
+################################################################
+# TAG INHERITANCE / CASCADE
+################################################################
+def propagate_tags_to_children(conn, rule_id):
+    """
+    If a rule has certain tags, we can propagate (inherit) them to its children
+    via BFS logic (similar to Part 2 BFS).
+    For instance, if the parent rule has a "HighRisk" tag => children also get that tag.
+    This is optional and can be toggled in the UI.
+    """
+    # 1) get all tags for the parent
+    c = conn.cursor()
+    c.execute("SELECT TAG_NAME FROM RULE_TAGS WHERE RULE_ID=?", (rule_id,))
+    parent_tags = [row[0] for row in c.fetchall()]
+    if not parent_tags:
+        return  # no tags to propagate
+
+    # 2) BFS find children
+    from __main__ import get_child_rules_bfs  # remove if merging into a single file
+    children = get_child_rules_bfs(conn, rule_id)
+    if not children:
+        return
+
+    # 3) for each child => upsert the same tags
+    for ch_ in children:
+        for tag in parent_tags:
+            try:
+                c.execute("""
+                    INSERT INTO RULE_TAGS(RULE_ID, TAG_NAME)
+                    SELECT ?,?
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM RULE_TAGS WHERE RULE_ID=? AND TAG_NAME=?
+                    )
+                """, (ch_, tag, ch_, tag))
+            except:
+                pass
+    conn.commit()
+
+def remove_propagated_tags(conn, rule_id, tag_name):
+    """
+    Remove a specific tag from a parent & cascade remove from children if it was 
+    originally inherited. This logic can be more advanced if you track 
+    which tags were explicitly assigned vs. inherited.
+    """
+    # 1) remove from parent
+    c = conn.cursor()
+    c.execute("DELETE FROM RULE_TAGS WHERE RULE_ID=? AND TAG_NAME=?",(rule_id, tag_name))
+
+    # 2) BFS children => remove if inherited
+    # simplistic approach: just remove the same tag
+    from __main__ import get_child_rules_bfs
+    children = get_child_rules_bfs(conn, rule_id)
+    for ch_ in children:
+        # disclaim: if the child explicitly assigned the tag, we might not want to remove it
+        # You’d need an "inherited_flag" in RULE_TAGS or separate logic. 
+        c.execute("DELETE FROM RULE_TAGS WHERE RULE_ID=? AND TAG_NAME=?",(ch_, tag_name))
+    conn.commit()
+
+################################################################
+# (2) DECISION TABLE & COMPOSITE RULE expansions
+################################################################
+def add_decision_table_column(conn, dt_id, column_name, default_expr=None):
+    """
+    Example function: let's say each DECISION_TABLE can have multiple columns with expressions.
+    We store in a child table DECISION_TABLE_COLUMNS with references.
+    """
+    c = conn.cursor()
+    # naive example: DECISION_TABLE_COLUMNS(DT_COLUMN_ID,DECISION_TABLE_ID,COLUMN_NAME,DEFAULT_EXPR)
+    if not default_expr:
+        default_expr = "None"
+    c.execute("""
+        INSERT INTO DECISION_TABLE_COLUMNS(DECISION_TABLE_ID, COLUMN_NAME, DEFAULT_EXPR)
+        VALUES(?,?,?)
+    """,(dt_id, column_name, default_expr))
+    conn.commit()
+
+def expand_composite_rule(conn, composite_rule_id, sub_rule_ids):
+    """
+    Example: Let a COMPOSITE_RULES table also have a child table with the sub-rules. 
+    This method appends new sub-rules to an existing composite rule.
+    """
+    c = conn.cursor()
+    # naive approach: COMPOSITE_RULE_SUBS(CRULE_ID,RULE_ID)
+    for r_ in sub_rule_ids:
+        c.execute("""
+            INSERT INTO COMPOSITE_RULE_SUBS(CRULE_ID, RULE_ID)
+            VALUES(?,?)
+        """,(composite_rule_id, r_))
+    conn.commit()
+
+################################################################
+# (3) AUTOMATED EMAIL ALERTS ON AUDIT LOG TRIGGERS
+################################################################
+def setup_audit_alert_trigger(conn):
+    """
+    If you'd like to send an email each time a user DELETES a rule 
+    or does a CRITICAL update, you can define a DB Trigger or a Python approach.
+    Here we illustrate a Python approach to check recent audit logs and send emails.
+    A scheduled job or timer might call this function periodically.
+    """
+    c = conn.cursor()
+    # naive approach => check last 10 minutes for specific actions in BRM_AUDIT_LOG
+    c.execute("""
+        SELECT AUDIT_ID, ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, ACTION_TIMESTAMP
+        FROM BRM_AUDIT_LOG
+        WHERE ACTION_TIMESTAMP >= DATEADD(MINUTE,-10,GETDATE())
+          AND (ACTION='DELETE' OR ACTION='DEACTIVATE')
+        ORDER BY ACTION_TIMESTAMP DESC
+    """)
+    rows = c.fetchall()
+    if not rows:
+        return
+
+    # If we found some critical logs => send email
+    from __main__ import send_email_notification  # remove if merged
+    subject = "BRM Alert: Critical Deactivate/Delete Actions"
+    lines=[]
+    for row in rows:
+        lines.append(f"AUDIT_ID={row[0]}, ACTION={row[1]}, TABLE={row[2]}, RECORD_ID={row[3]}, BY={row[4]}, TS={row[5]}")
+    body = "\n".join(lines)
+    recipients = ["alerts@example.com"]
+    try:
+        send_email_notification(subject, body, recipients)
+    except Exception as ex:
+        logger.error("Error sending audit alert email: " + str(ex))
+
+################################################################
+# (4) ENHANCED DATA LINEAGE SCANNING (STORED PROCEDURES)
+################################################################
+def find_stored_proc_references(conn):
+    """
+    Additional scanning for references in stored procedures.
+    We read sys.sql_modules for procs => parse references to tables or columns.
+    Then integrate with BRM_RULE_TABLE_DEPENDENCIES if needed or 
+    store in a new table STORED_PROC_DEPENDENCIES.
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT p.object_id, SCHEMA_NAME(p.schema_id) AS schema_name,
+               p.name AS proc_name,
+               m.definition
+        FROM sys.procedures p
+        JOIN sys.sql_modules m ON p.object_id=m.object_id
+        ORDER BY schema_name, proc_name
+    """)
+    rows = c.fetchall()
+
+    for row in rows:
+        object_id = row[0]
+        schema_name = row[1]
+        proc_name = row[2]
+        definition = row[3]
+
+        # naive parse => find statements referencing "FROM x" or "JOIN x"
+        # better approach => use SQL parser or sys.sql_expression_dependencies
+        # For demonstration, let's do a simple regex:
+        regex = r"\b(FROM|JOIN)\s+(\[?\w+\]?\.)?(\[?\w+\]?)"
+        matches = re.findall(regex, definition, re.IGNORECASE)
+        # Then store in a new table:
+        # STORED_PROC_DEPENDENCIES(OBJECT_ID,PROC_NAME,TABLE_NAME,SCHEMA_NAME)
+        for m_ in matches:
+            # m_ might be like ('FROM','dbo.','Customers') => you’ll have to piece it together
+            # Or just store the raw match
+            table_part = m_[2]  # the third group => "Customers" for example
+            try:
+                c2 = conn.cursor()
+                c2.execute("""
+                    INSERT INTO STORED_PROC_DEPENDENCIES(
+                        OBJECT_ID, PROC_SCHEMA, PROC_NAME, TABLE_NAME
+                    )VALUES(?,?,?,?)
+                """,(object_id, schema_name, proc_name, table_part))
+            except:
+                pass
+    conn.commit()
+
+################################################################
+# OPTIONAL UI: Tag Inheritance & DB scanning
+################################################################
+class TagInheritanceWidget(QWidget):
+    """
+    Minimal widget letting user pick a rule ID => propagate or remove tags to children.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        layout = QVBoxLayout(self)
+
+        self.propagate_btn = QPushButton("Propagate Tags to Children (One Rule)")
+        self.propagate_btn.clicked.connect(self.do_propagate)
+        layout.addWidget(self.propagate_btn)
+
+        self.remove_btn = QPushButton("Remove Tag & Cascade")
+        self.remove_btn.clicked.connect(self.do_remove_cascade)
+        layout.addWidget(self.remove_btn)
+
+        self.setLayout(layout)
+
+    def do_propagate(self):
+        rid,ok = QInputDialog.getInt(self,"Propagate","Enter parent Rule ID:")
+        if not ok:
+            return
+        from __main__ import propagate_tags_to_children  # remove if single file
+        propagate_tags_to_children(self.connection, rid)
+        QMessageBox.information(self,"Done","Tags propagated if any.")
+
+    def do_remove_cascade(self):
+        rid,ok = QInputDialog.getInt(self,"Remove","Enter parent Rule ID:")
+        if not ok:
+            return
+        tag,ok2 = QInputDialog.getText(self,"Tag","Which tag to remove from parent & children:")
+        if not ok2 or not tag.strip():
+            return
+        from __main__ import remove_propagated_tags
+        remove_propagated_tags(self.connection, rid, tag.strip())
+        QMessageBox.information(self,"Done","Tag removed from that parent & BFS children.")
+###############################################################
+#                     PART 8 (Continuation)
+#   Advanced features:
+#     (1) Multi-environment promotion (e.g. DEV->QA->PROD)
+#     (2) Snapshot diff / comparison UI
+###############################################################
+
+import sys
+import json
+import logging
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
+    QTableWidgetItem, QMessageBox, QAbstractItemView, QInputDialog,
+    QFileDialog, QPlainTextEdit
+)
+from PyQt5.QtCore import Qt
+
+logger = logging.getLogger(__name__)
+
+################################################################
+# (1) MULTI-ENVIRONMENT PROMOTION
+################################################################
+class EnvironmentPromotionTab(QWidget):
+    """
+    Allows the user to select a set of rules from a "source environment" 
+    and promote them to "target environment" (like DEV->QA or QA->PROD).
+    We'll do a naive approach where we connect to two DBs or we just 
+    replicate the rules (SQL, etc.) from one schema to another in the same DB.
+    
+    For a real scenario, you might have separate DB connections for each environment.
+    """
+    def __init__(self, dev_connection, qa_connection, prod_connection, parent=None):
+        super().__init__(parent)
+        """
+        dev_connection, qa_connection, prod_connection are pyodbc (or similar) 
+        connections to each environment. 
+        If your environment is just one DB with different schemas, 
+        you'd pass in the same conn but with additional logic.
+        """
+        self.dev_conn = dev_connection
+        self.qa_conn = qa_connection
+        self.prod_conn = prod_connection
+
+        layout = QVBoxLayout(self)
+
+        # Simple UI: pick source env, target env, 
+        # show list of rules in source => user picks => promote
+        self.source_btn = QPushButton("Select Source Env (DEV/QA/PROD)")
+        self.source_btn.clicked.connect(self.select_source_env)
+        layout.addWidget(self.source_btn)
+
+        self.target_btn = QPushButton("Select Target Env (DEV/QA/PROD)")
+        self.target_btn.clicked.connect(self.select_target_env)
+        layout.addWidget(self.target_btn)
+
+        self.list_rules_btn = QPushButton("Load Rules from Source")
+        self.list_rules_btn.clicked.connect(self.load_source_rules)
+        layout.addWidget(self.list_rules_btn)
+
+        self.rules_table = QTableWidget(0,3)
+        self.rules_table.setHorizontalHeaderLabels(["Rule ID","Rule Name","Status"])
+        self.rules_table.horizontalHeader().setStretchLastSection(True)
+        self.rules_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.rules_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.rules_table)
+
+        self.promote_btn = QPushButton("Promote Selected to Target")
+        self.promote_btn.clicked.connect(self.promote_selected_rules)
+        layout.addWidget(self.promote_btn)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+        self.source_env = None
+        self.target_env = None
+
+    def select_source_env(self):
+        # For example, user picks from a small list: [DEV, QA, PROD]
+        envs = ["DEV","QA","PROD"]
+        env,ok = QInputDialog.getItem(self,"Pick Source","Which environment is source?",envs,0,False)
+        if ok:
+            self.source_env = env
+            self.source_btn.setText(f"Source Env: {env}")
+
+    def select_target_env(self):
+        envs = ["DEV","QA","PROD"]
+        env,ok = QInputDialog.getItem(self,"Pick Target","Which environment is target?",envs,0,False)
+        if ok:
+            self.target_env = env
+            self.target_btn.setText(f"Target Env: {env}")
+
+    def get_connection_for_env(self, env_name):
+        """
+        Return the pyodbc connection for the chosen environment.
+        """
+        if env_name=="DEV":
+            return self.dev_conn
+        elif env_name=="QA":
+            return self.qa_conn
+        elif env_name=="PROD":
+            return self.prod_conn
+        return None
+
+    def load_source_rules(self):
+        """
+        Show rules from the chosen source environment, e.g. BRM_RULES table there.
+        """
+        if not self.source_env:
+            QMessageBox.warning(self,"No Source","Pick a source environment first.")
+            return
+        conn = self.get_connection_for_env(self.source_env)
+        if not conn:
+            QMessageBox.critical(self,"Error",f"No connection for {self.source_env}.")
+            return
+        self.rules_table.setRowCount(0)
+        c = conn.cursor()
+        try:
+            c.execute("SELECT RULE_ID, RULE_NAME, STATUS FROM BRM_RULES ORDER BY RULE_ID")
+        except Exception as ex:
+            QMessageBox.critical(self,"Error loading rules",str(ex))
+            return
+        rows = c.fetchall()
+        for row in rows:
+            r_i = self.rules_table.rowCount()
+            self.rules_table.insertRow(r_i)
+            self.rules_table.setItem(r_i,0,QTableWidgetItem(str(row[0])))
+            self.rules_table.setItem(r_i,1,QTableWidgetItem(row[1]))
+            self.rules_table.setItem(r_i,2,QTableWidgetItem(row[2]))
+
+    def promote_selected_rules(self):
+        if not self.source_env or not self.target_env:
+            QMessageBox.warning(self,"No Env","Pick source and target env first.")
+            return
+        if self.source_env==self.target_env:
+            QMessageBox.warning(self,"Invalid","Source and target env cannot be the same.")
+            return
+        src_conn = self.get_connection_for_env(self.source_env)
+        tgt_conn = self.get_connection_for_env(self.target_env)
+        if not src_conn or not tgt_conn:
+            QMessageBox.critical(self,"Missing","Connection not available for one environment.")
+            return
+        rows = self.rules_table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.warning(self,"None","No rules selected.")
+            return
+
+        # naive approach => for each selected => read entire row from source => upsert into target
+        c_src = src_conn.cursor()
+        c_tgt = tgt_conn.cursor()
+
+        success_count=0
+        fail_msgs=[]
+        for idx in rows:
+            row_i=idx.row()
+            rid_item = self.rules_table.item(row_i,0)
+            if not rid_item:
+                continue
+            rid = int(rid_item.text())
+            # read from source
+            c_src.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+            row_src = c_src.fetchone()
+            if not row_src:
+                fail_msgs.append(f"Rule {rid} not found in source??")
+                continue
+
+            colnames = [desc[0] for desc in c_src.description]
+            row_dict = dict(zip(colnames, row_src))
+            # upsert into target => check if rule with same name or same ID already there
+            # a more advanced system might handle version conflicts, ID remap, etc.
+            rule_name = row_dict["RULE_NAME"]
+            c_tgt.execute("SELECT RULE_ID FROM BRM_RULES WHERE RULE_NAME=?",(rule_name,))
+            row_tgt = c_tgt.fetchone()
+            if row_tgt:
+                # update
+                existing_id = row_tgt[0]
+                try:
+                    c_tgt.execute("""
+                        UPDATE BRM_RULES
+                        SET RULE_SQL=?, STATUS=?, UPDATED_BY='EnvPromotion',VERSION=VERSION+1,
+                            APPROVAL_STATUS='APPROVED'
+                        WHERE RULE_ID=?
+                    """,(row_dict["RULE_SQL"],row_dict["STATUS"],existing_id))
+                    tgt_conn.commit()
+                    success_count+=1
+                except Exception as ex:
+                    fail_msgs.append(f"Update fail for {rule_name}: {ex}")
+            else:
+                # insert
+                try:
+                    # minimal columns
+                    c_tgt.execute("""
+                        INSERT INTO BRM_RULES(
+                            GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL, 
+                            EFFECTIVE_START_DATE, EFFECTIVE_END_DATE, STATUS, VERSION,
+                            CREATED_BY, DESCRIPTION, OPERATION_TYPE, BUSINESS_JUSTIFICATION,
+                            CREATED_TIMESTAMP, UPDATED_BY, OWNER_GROUP, CLUSTER_NAME,
+                            APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE, CDC_TYPE
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,(
+                        row_dict["GROUP_ID"],
+                        row_dict["PARENT_RULE_ID"],
+                        row_dict["RULE_TYPE_ID"],
+                        row_dict["RULE_NAME"],
+                        row_dict["RULE_SQL"],
+                        row_dict["EFFECTIVE_START_DATE"],
+                        row_dict["EFFECTIVE_END_DATE"],
+                        row_dict["STATUS"],
+                        row_dict["VERSION"],
+                        "EnvPromotion",  # or row_dict["CREATED_BY"]
+                        row_dict["DESCRIPTION"],
+                        row_dict["OPERATION_TYPE"],
+                        row_dict["BUSINESS_JUSTIFICATION"],
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        None,  # UPDATED_BY
+                        row_dict["OWNER_GROUP"],
+                        row_dict["CLUSTER_NAME"],
+                        "APPROVED",
+                        row_dict["IS_GLOBAL"],
+                        row_dict["CRITICAL_RULE"],
+                        row_dict["CRITICAL_SCOPE"],
+                        row_dict["CDC_TYPE"]
+                    ))
+                    tgt_conn.commit()
+                    success_count+=1
+                except Exception as ex:
+                    fail_msgs.append(f"Insert fail for {rule_name}: {ex}")
+
+        msg = f"Promote done: success={success_count}"
+        if fail_msgs:
+            msg += "\nFails:\n" + "\n".join(fail_msgs)
+        QMessageBox.information(self,"Promotion",msg)
+
+################################################################
+# (2) SNAPSHOT DIFF / COMPARISON
+################################################################
+class SnapshotDiffDialog(QWidget):
+    """
+    Compare two snapshots from RULE_SNAPSHOTS => show diffs in a text area.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Snapshot Comparison - Part 8")
+        self.resize(600,400)
+        layout = QVBoxLayout(self)
+
+        pick_h = QHBoxLayout()
+        self.ss1_btn = QPushButton("Pick Snapshot 1")
+        self.ss1_btn.clicked.connect(lambda: self.pick_snapshot(1))
+        pick_h.addWidget(self.ss1_btn)
+
+        self.ss2_btn = QPushButton("Pick Snapshot 2")
+        self.ss2_btn.clicked.connect(lambda: self.pick_snapshot(2))
+        pick_h.addWidget(self.ss2_btn)
+
+        comp_btn = QPushButton("Compare")
+        comp_btn.clicked.connect(self.compare_snapshots)
+        pick_h.addWidget(comp_btn)
+
+        pick_h.addStretch()
+        layout.addLayout(pick_h)
+
+        self.diff_area = QPlainTextEdit()
+        self.diff_area.setReadOnly(True)
+        layout.addWidget(self.diff_area)
+
+        self.ss_id1 = None
+        self.ss_id2 = None
+
+        self.setLayout(layout)
+
+    def pick_snapshot(self, which):
+        c = self.connection.cursor()
+        c.execute("""
+            SELECT SNAPSHOT_ID, SNAPSHOT_NAME, CREATED_TIMESTAMP 
+            FROM RULE_SNAPSHOTS
+            ORDER BY SNAPSHOT_ID DESC
+        """)
+        rows = c.fetchall()
+        if not rows:
+            QMessageBox.information(self,"No Snapshots","No snapshots found.")
+            return
+        items = [f"{r[0]} - {r[1]} (ts={r[2]})" for r in rows]
+        sel,ok = QInputDialog.getItem(self,"Select Snapshot",f"Pick snapshot for side {which}:",items,0,False)
+        if not ok or not sel:
+            return
+        # parse snapshot_id from start
+        sid = sel.split(" - ")[0]
+        if which==1:
+            self.ss_id1 = int(sid)
+            self.ss1_btn.setText(f"Snapshot1 = {sid}")
+        else:
+            self.ss_id2 = int(sid)
+            self.ss2_btn.setText(f"Snapshot2 = {sid}")
+
+    def compare_snapshots(self):
+        if not self.ss_id1 or not self.ss_id2:
+            QMessageBox.warning(self,"Missing","Pick both snapshots first.")
+            return
+        c = self.connection.cursor()
+
+        # load JSON for each
+        c.execute("SELECT SNAPSHOT_JSON FROM RULE_SNAPSHOTS WHERE SNAPSHOT_ID=?", (self.ss_id1,))
+        row1 = c.fetchone()
+        if not row1:
+            QMessageBox.warning(self,"Missing","Snapshot1 not found?")
+            return
+        snap_json1 = row1[0]
+
+        c.execute("SELECT SNAPSHOT_JSON FROM RULE_SNAPSHOTS WHERE SNAPSHOT_ID=?", (self.ss_id2,))
+        row2 = c.fetchone()
+        if not row2:
+            QMessageBox.warning(self,"Missing","Snapshot2 not found?")
+            return
+        snap_json2 = row2[0]
+
+        import json
+        try:
+            arr1 = json.loads(snap_json1)
+            arr2 = json.loads(snap_json2)
+            # each is a list of rule dicts => let's index by RULE_ID
+            map1 = {}
+            for d in arr1:
+                map1[d["RULE_ID"]] = d
+
+            map2 = {}
+            for d in arr2:
+                map2[d["RULE_ID"]] = d
+
+            # let's compare. We'll gather lines of diff
+            diffs=[]
+            all_ids = set(map1.keys()) | set(map2.keys())
+            for rid in sorted(all_ids):
+                r1 = map1.get(rid)
+                r2 = map2.get(rid)
+                if r1 and not r2:
+                    diffs.append(f"Rule {rid} present in snap1 but missing in snap2.")
+                elif r2 and not r1:
+                    diffs.append(f"Rule {rid} present in snap2 but missing in snap1.")
+                else:
+                    # both => compare fields
+                    # a minimal approach: check if RULE_SQL or STATUS differ
+                    if r1["RULE_SQL"]!=r2["RULE_SQL"]:
+                        diffs.append(f"Rule {rid} => SQL differs:\n   snap1: {r1['RULE_SQL']}\n   snap2: {r2['RULE_SQL']}")
+                    if r1["STATUS"]!=r2["STATUS"]:
+                        diffs.append(f"Rule {rid} => STATUS differs: {r1['STATUS']} vs {r2['STATUS']}")
+
+            if not diffs:
+                self.diff_area.setPlainText("No differences found.")
+            else:
+                self.diff_area.setPlainText("\n".join(diffs))
+
+        except Exception as ex:
+            QMessageBox.critical(self,"Error parsing JSON",str(ex))
+
+# If you have dev_conn, qa_conn, prod_conn available:
+self.env_promo_tab = EnvironmentPromotionTab(dev_conn, qa_conn, prod_conn)
+self.tabs.addTab(self.env_promo_tab, "Env Promotion")
+
+# For snapshot diff:
+self.ss_diff_dialog = SnapshotDiffDialog(self.connection)
+# maybe add a Tools-> action:
+actDiff = QtWidgets.QAction("Snapshot Compare", self)
+actDiff.triggered.connect(lambda: self.ss_diff_dialog.show())
+toolsMenu.addAction(actDiff)
+###############################################################
+#                     PART 9 (Continuation)
+#   More advanced expansions:
+#     (1) Single Sign-On (SSO) or external auth integration
+#     (2) Slack/Teams webhooks for critical notifications
+#     (3) Custom sub-stages in multi-step approvals
+#     (4) Extended performance/monitoring for large rule sets
+###############################################################
+
+import sys
+import json
+import logging
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox, 
+    QAbstractItemView, QInputDialog
+)
+from PyQt5.QtCore import Qt
+
+logger = logging.getLogger(__name__)
+
+################################################################
+# (1) SINGLE SIGN-ON (SSO) or External Auth Integration
+################################################################
+def sso_authenticate(username, sso_token):
+    """
+    Example function to authenticate a user via external identity provider.
+    In real usage, you'd call an SSO API or pass a JWT token for verification.
+    """
+    # Pseudocode only:
+    # you'd do something like:
+    #   valid = verify_jwt_token(sso_token, identity_provider_url)
+    #   if valid and token username matches 'username' => success
+    # This sample just returns True if sso_token == "SSO_OK"
+    if sso_token=="SSO_OK":
+        return True
+    return False
+
+class SSOLoginDialog(QWidget):
+    """
+    Minimal GUI example to let user type in SSO token => if valid => proceed.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = None
+        self.user_group = None
+        # You’d build a simple layout with QLineEdit for SSO token, 
+        # then call sso_authenticate, then fetch user from DB or some domain.
+        # For brevity, we skip the full UI code.
+        pass
+
+    def do_sso_login(self, input_username, input_sso_token):
+        ok = sso_authenticate(input_username, input_sso_token)
+        if not ok:
+            QMessageBox.warning(self,"Failed","SSO token invalid.")
+            return False
+        # if ok => look up user in USERS table
+        c = self.connection.cursor()
+        c.execute("SELECT USER_ID, USER_GROUP FROM USERS WHERE USERNAME=?",(input_username,))
+        row = c.fetchone()
+        if not row:
+            QMessageBox.warning(self,"Not found","Username not in local DB.")
+            return False
+        self.user_id = row[0]
+        self.user_group = row[1]
+        return True
+
+################################################################
+# (2) SLACK/TEAMS WEBHOOKS FOR CRITICAL NOTIFICATIONS
+################################################################
+def send_slack_message(webhook_url, text):
+    """
+    Simple example using requests to post to Slack Incoming Webhook.
+    """
+    import requests
+    payload = {"text": text}
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=5)
+        if resp.status_code != 200:
+            logger.error(f"Slack post failed: {resp.status_code} => {resp.text}")
+    except Exception as ex:
+        logger.error(f"Slack post exception: {ex}")
+
+def send_teams_message(webhook_url, text):
+    """
+    Similarly for MS Teams. 
+    They also accept a JSON payload. 
+    This is a minimal example.
+    """
+    import requests
+    payload = {
+      "@type": "MessageCard",
+      "@context": "http://schema.org/extensions",
+      "text": text
+    }
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=5)
+        if resp.status_code not in (200,201):
+            logger.error(f"Teams post failed: {resp.status_code} => {resp.text}")
+    except Exception as ex:
+        logger.error(f"Teams post exception: {ex}")
+
+def notify_critical_action_slack_teams(conn, rule_id, action):
+    """
+    If a rule is global or critical, we can post to Slack/Teams when certain actions occur 
+    (like update or delete).
+    Example usage: call this from your code that handles rule updates or deletes.
+    """
+    c = conn.cursor()
+    c.execute("SELECT RULE_NAME,IS_GLOBAL,CRITICAL_RULE FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    row = c.fetchone()
+    if not row:
+        return
+    rname = row[0]
+    isg = row[1]
+    iscrit = row[2]
+    if isg==1 or iscrit==1:
+        text = f"Critical action '{action}' occurred for rule {rule_id} - {rname}"
+        # get your webhooks from config or ENV
+        slack_url = "https://hooks.slack.com/services/XXXX"
+        teams_url = "https://outlook.office.com/webhook/XXXX"
+        send_slack_message(slack_url, text)
+        send_teams_message(teams_url, text)
+
+################################################################
+# (3) CUSTOM SUB-STAGES IN MULTI-STEP APPROVALS
+################################################################
+def create_approval_sub_stage(conn, rule_id, stage_name, assigned_to):
+    """
+    If your multi-step approval workflow needs sub-stages, 
+    we can store them in BRM_RULE_APPROVAL_SUBSTAGES, for example.
+    """
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO BRM_RULE_APPROVAL_SUBSTAGES(
+            RULE_ID, STAGE_NAME, ASSIGNED_TO, CREATED_TIMESTAMP, STATUS
+        ) VALUES(?,?,?,?,?)
+    """,(rule_id, stage_name, assigned_to, datetime.now(), 'Pending'))
+    conn.commit()
+
+def mark_sub_stage_approved(conn, sub_stage_id, approved_by):
+    """
+    Mark a sub-stage as approved => 
+    if all sub-stages in that main stage are approved => main stage is advanced.
+    """
+    c = conn.cursor()
+    c.execute("""
+        UPDATE BRM_RULE_APPROVAL_SUBSTAGES
+        SET STATUS='Approved', APPROVED_TIMESTAMP=GETDATE(), APPROVED_BY=?
+        WHERE SUB_STAGE_ID=?
+    """,(approved_by, sub_stage_id))
+    conn.commit()
+
+    # Then check if this sub-stage's parent stage is fully approved
+    c.execute("""
+        SELECT RULE_ID, STAGE_NAME
+        FROM BRM_RULE_APPROVAL_SUBSTAGES
+        WHERE SUB_STAGE_ID=?
+    """,(sub_stage_id,))
+    row = c.fetchone()
+    if row:
+        rid = row[0]
+        sname = row[1]
+        c.execute("""
+            SELECT COUNT(*) 
+            FROM BRM_RULE_APPROVAL_SUBSTAGES
+            WHERE RULE_ID=? AND STAGE_NAME=? AND STATUS<>'Approved'
+        """,(rid, sname))
+        leftover = c.fetchone()[0]
+        if leftover==0:
+            # all sub-stages in that stage => done => you might move the main stage forward
+            # e.g. update BRM_RULE_APPROVALS or next stage is open
+            pass
+
+################################################################
+# (4) EXTENDED PERFORMANCE/MONITORING FOR LARGE RULE SETS
+################################################################
+def gather_rule_performance_metrics(conn):
+    """
+    If we have thousands of rules, we might want to track average execution time or 
+    # times each rule is triggered. This function can store or fetch from RULE_PERF_STATS table.
+    """
+    c = conn.cursor()
+    # Suppose we read RULE_EXECUTION_LOGS => compute avg time
+    c.execute("""
+        SELECT RULE_ID, AVG(DATEDIFF(MILLISECOND, START_TIME, END_TIME)) as avg_ms
+        FROM RULE_EXECUTION_LOGS
+        WHERE START_TIME IS NOT NULL AND END_TIME IS NOT NULL
+        GROUP BY RULE_ID
+    """)
+    rows = c.fetchall()
+    # Then store in RULE_PERF_STATS(RULE_ID, AVG_EXEC_MS, UPDATED_TS)
+    for r_ in rows:
+        rid = r_[0]
+        avg_ms = r_[1] if r_[1] else 0
+        try:
+            c2 = conn.cursor()
+            c2.execute("""
+                MERGE RULE_PERF_STATS AS t
+                USING (SELECT ? as rid, ? as ams) as src(rid,ams)
+                ON t.RULE_ID=src.rid
+                WHEN MATCHED THEN 
+                  UPDATE SET t.AVG_EXEC_MS=src.ams, t.UPDATED_TS=GETDATE()
+                WHEN NOT MATCHED THEN
+                  INSERT(RULE_ID, AVG_EXEC_MS, UPDATED_TS)
+                  VALUES(src.rid, src.ams, GETDATE());
+            """,(rid, avg_ms))
+        except Exception as ex:
+            logger.error(f"Perf stat insert fail for {rid}: {ex}")
+    conn.commit()
+
+class PerfMonitoringWidget(QWidget):
+    """
+    Minimal UI to show RULE_PERF_STATS or gather it.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        layout = QVBoxLayout(self)
+
+        gather_btn = QPushButton("Gather Performance Stats")
+        gather_btn.clicked.connect(self.gather_stats)
+        layout.addWidget(gather_btn)
+
+        self.table = QTableWidget(0,3)
+        self.table.setHorizontalHeaderLabels(["Rule ID","Avg Exec ms","Updated"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        ref_btn = QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_perf)
+        layout.addWidget(ref_btn)
+
+        self.setLayout(layout)
+
+    def gather_stats(self):
+        gather_rule_performance_metrics(self.connection)
+        QMessageBox.information(self,"Done","Performance stats updated.")
+        self.load_perf()
+
+    def load_perf(self):
+        self.table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT RULE_ID, AVG_EXEC_MS, UPDATED_TS FROM RULE_PERF_STATS ORDER BY RULE_ID")
+            rows = c.fetchall()
+            for row in rows:
+                r_i = self.table.rowCount()
+                self.table.insertRow(r_i)
+                for col_i,val in enumerate(row):
+                    self.table.setItem(r_i,col_i,QTableWidgetItem(str(val)))
+        except Exception as ex:
+            QMessageBox.critical(self,"Error loading perf",str(ex))
+###############################################################
+#            MAIN LAUNCH CODE FOR PARTS 1–9
+###############################################################
+
+import sys
+from PyQt5.QtWidgets import QApplication
+
+def main():
+    # 1) Create the PyQt application
+    app = QApplication(sys.argv)
+
+    # 2) Database Connection prompt
+    dbdlg = DatabaseConnectionDialog()  # from Part 1
+    if dbdlg.exec_() == dbdlg.Accepted:
+        connection = dbdlg.get_connection()
+        if not connection:
+            sys.exit(1)
+    else:
+        # user canceled
+        sys.exit(0)
+
+    # 3) Login prompt (normal or SSO)
+    # If you do normal login:
+    logdlg = LoginDialog(connection)  # from Part 1
+    if logdlg.exec_() != logdlg.Accepted:
+        sys.exit(0)
+    user_id = logdlg.user_id
+    user_group = logdlg.user_group
+
+    # If you prefer SSO approach, comment out the above normal login and do:
+    # sso_dlg = SSOLoginDialog(connection)
+    # ... implement your SSO logic ...
+    # user_id = sso_dlg.user_id
+    # user_group = sso_dlg.user_group
+    # if not user_id:
+    #     sys.exit(0)
+
+    # 4) Create and show the BRMTool main window (from Part 5 or 6 or your final version)
+    window = BRMTool()
+    # If your BRMTool constructor automatically does the connection+login, 
+    # pass them in or set them:
+    #
+    # window.connection = connection
+    # window.user_id = user_id
+    # window.user_group = user_group
+    #
+    # Possibly you have a set_user_info(...) method, depending on your design.
+
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
 
 
