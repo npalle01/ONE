@@ -1,0 +1,198 @@
+Below is a high-level Data Flow Diagram (text-based) representing how the BRM Tool’s components interact in order when a user launches the application, logs in, manages rules (CRUD), executes BFS logic, handles approvals, etc. Since we can’t embed images here, this is written as an extended textual diagram describing the major data flows among the user, the UI, and the database.
+
+1. Application Startup & Database Connection
+
+   +----------------------+        (1)        +-----------------------+
+   |  User double-clicks  | ----------------->|  BRMTool application |
+   |  or runs python .py  |                  | (MainWindow + Parts) |
+   +----------------------+                  +-----------------------+
+                                                     |
+   |-------------------------------------------------|
+   |(2) Show DatabaseConnectionDialog (Part 1)       |
+   v
++----------------------------+
+| DatabaseConnectionDialog   |
+| - user picks DSN or string |
++----------------------------+
+       |
+       | (3) pyodbc.connect(...)
+       v
++----------------------------+
+|   SQL Server (DB)         |
++----------------------------+
+
+	1.	User starts the .py application (after combining all 8 parts).
+	2.	The DatabaseConnectionDialog (Part 1) appears; user picks an ODBC DSN or enters a connection string.
+	3.	The dialog calls pyodbc.connect(...), establishing a DB connection stored in self.connection.
+
+2. Login and Main Window Initialization
+
+(MainWindow -> ) LoginDialog
+   +---------------------------------+
+   |  Enter username/password        |
+   |  Validate with [USERS] table    |
+   +---------------------------------+
+       |
+       | (4) SELECT * FROM USERS 
+       |     WHERE username=? 
+       |     AND password=?
+       v
+   +-------------------------+
+   |   SQL Server [USERS]   |
+   +-------------------------+
+
+	4.	The LoginDialog (Part 1) checks the USERS table for valid credentials. If valid, we store user_id and user_group.
+
+3. Main Window UI Setup
+
+     +-------------------------+
+     |    BRMTool (QMainWindow)| 
+     |-------------------------|
+     | - user_group?=Admin?    |
+     +-------------------------+
+       | 
+       |(5) create tabs: 
+       |   Approvals, BFS, 
+       |   Scheduling, etc. 
+       v
++----------------------------------+
+| QTabWidget with multiple tabs:   |
+| - Business Rules (RuleDashboard) |
+| - Approvals (MultiStep...)       |
+| - Scheduling (SchedulesTab)      |
+| - Hierarchy + LineageGraph       |
+| - Group Mgmt, User Mgmt          |
+| - etc.                           |
++----------------------------------+
+
+	5.	After successful login, the BRMTool main window is constructed. We conditionally add tabs like “Global/Critical Admin” if user_group=="Admin".
+
+4. Business Rules CRUD & Data Flow
+
+When the user adds or updates a rule (in the RuleEditorDialog), the flow is:
+
+(6) User clicks "Add Rule" or "Update Rule"
+       |
+       v
++------------------------------+
+| RuleEditorDialog appears     |
+| - user inputs: name, SQL, etc.
+| - calls add_rule(...) or
+|   update_rule(...) (Part 2)  |
++------------------------------+
+       |
+       | (7) Validate logic, parse SQL => 
+       |     check group permissions 
+       v
++------------------------------------------+
+| Table Insert or Update in [BRM_RULES]    |
+| Also [BRM_RULE_TABLE_DEPENDENCIES], etc. |
++------------------------------------------+
+
+	7.	Inside add_rule(...) or update_rule(...):
+
+	•	We do a SQL parse (Part 1 advanced parser).
+	•	Check GROUP_PERMISSIONS (to see if the user’s group has rights to the table).
+	•	Insert/Update BRM_RULES and BRM_RULE_TABLE_DEPENDENCIES.
+	•	Possibly call create_multistep_approvals(...) if not global or if admin.
+	•	Write an audit log entry in BRM_AUDIT_LOG.
+
+5. BFS Execution & ETL
+
+When the user presses “Run ETL (BFS)” in the Business Rules tab:
+
+(8) BFS => "execute_rules_in_order"
+       |
+       v
++---------------------------------------+
+| build_rule_adjacency(...) => parent/  |
+|   child from [BRM_RULES] (PARENT_ID). |
+| load_global_critical_links(...)       |
+| => gcr. BFS => run each rule's SQL    |
++---------------------------------------+
+       |
+       |(9) For each rule, do 
+       |    "BEGIN TRANSACTION"
+       |    then run SQL => row[0][0]==1 => PASS?
+       v
++--------------------------------------+
+| If FAIL and is_crit => skip children |
+| else => move on, "COMMIT"           |
++--------------------------------------+
+       |
+       |(10) Insert rule outcome => [RULE_EXECUTION_LOGS]
+       v
+ done BFS
+
+8–10. BFS logic (Part 2) fetches rules, runs them in order, commits or rolls back each. If a critical rule fails, we skip children. Each result is stored in RULE_EXECUTION_LOGS.
+
+6. Approvals (MultiStepApprovalTab)
+
+When the user opens the Approvals tab:
+
+(11) Approvals tab => load_approvals():
+       SELECT from BRM_RULE_APPROVALS
+       for current user 
+       => filter to min stage 
+       => show "Approve" or "Reject"
+
+(12) On Approve => 
+    UPDATE BRM_RULE_APPROVALS set APPROVED_FLAG=1
+    If no more pending => [BRM_RULES] => status=ACTIVE 
+       + lifecycle_state=ACTIVE
+(13) On Reject =>
+    APPROVED_FLAG=2 => 
+    [BRM_RULES] => status=INACTIVE, approval_status='REJECTED'
+
+7. Scheduling
+
+(14) The user may:
+    - open "Scheduling" tab => 
+       see [RULE_SCHEDULES].
+    - press "Add New Schedule" => 
+       EnhancedScheduleDialog => 
+       => INSERT into RULE_SCHEDULES
+(15) check_due_schedules() => 
+    runs every 60s => 
+    SELECT * FROM RULE_SCHEDULES 
+    WHERE STATUS='Scheduled' 
+      AND SCHEDULE_TIME <= now
+    => run the rule’s SQL => 
+       if fail => status='Failed'
+       else => status='Executed'
+
+8. Hierarchy + Lineage
+
+(16) "Hierarchy" tab => QTreeWidget:
+    SELECT GROUP_ID, GROUP_NAME FROM BRM_RULE_GROUPS
+    SELECT RULE_ID, PARENT_RULE_ID, ...
+    Display + optional drag-drop re-parent 
+    => If user drops => update DB
+
+(17) "Lineage" => EnhancedLineageGraphWidget:
+    SELECT RULE_ID,... plus [BRM_RULE_TABLE_DEPENDENCIES]
+    layout => parent->child edges
+    + table references
+    => user can see diagram
+
+9. Other Features
+	•	Custom Groups (Part 7) => user can create, rename, backup, restore custom groups, and assign rules to them. This updates BRM_CUSTOM_RULE_GROUPS, BRM_CUSTOM_GROUP_MEMBERS, and BRM_CUSTOM_GROUP_BACKUPS.
+	•	Decision Tables => user can manage them in DECISION_TABLES and optionally “run” them to see hypothetical results.
+	•	Conflict Priority, Composite Rules, Snapshots, Tags, Data Validation => each has its own table or tab for CRUD and optional “run” or “apply” logic.
+	•	Alerts => an “AlertsAndDashboardsTab” checks old approvals, upcoming schedules, etc.
+
+Detailed Order Summarized
+	1.	Startup: Show DatabaseConnectionDialog → connect to DB.
+	2.	Login: Show LoginDialog → authenticate user → store user_id/user_group.
+	3.	MainWindow: Build UI tabs (Business Rules, Approvals, Scheduling, etc.) based on user’s group.
+	4.	Rule CRUD: Add/Update in RuleEditorDialog → parse SQL → check group perms → insert/update DB → create approvals → log audit.
+	5.	BFS Execution: “Run ETL” → execute_rules_in_order → store pass/fail in RULE_EXECUTION_LOGS.
+	6.	Approvals: “Approvals” tab → show user’s pending → Approve or Reject → update BRM_RULE_APPROVALS, BRM_RULES.
+	7.	Scheduling: “Scheduling” tab → user sees RULE_SCHEDULES → can add/update. Timed checks call check_due_schedules() → run or fail.
+	8.	Hierarchy: “Hierarchy” tab → QTreeWidget of groups & rules. Possibly drag-drop to re-parent.
+	9.	Lineage: “Lineage Visualization” → EnhancedLineageGraphWidget displays rule → child edges, plus rule → table references.
+	10.	Custom Groups: can create custom group → members → BFS. Also backup/restore a custom group to/from JSON in BRM_CUSTOM_GROUP_BACKUPS.
+	11.	Alerts: “AlertsAndDashboards” tab → queries stale approvals, upcoming schedules.
+	12.	Other advanced features: Decision Tables, Conflict Priority, Composite Rules, Data Validation, etc.
+
+This textual diagram gives you an overall bird’s-eye data flow for the entire tool.
