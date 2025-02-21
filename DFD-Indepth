@@ -1,0 +1,265 @@
+
+Top-Level Overview
+
++-------------------+           +------------------------------------+
+|     [  User  ]    |  (1)       | [BRMTool (MainWindow) + All Tabs ]|
+|  (interacts via   | ---------->|------------------------------------|
+|   PyQt UI)        |           | - DB connection (pyodbc)           |
++-------------------+           | - BFS logic, Approvals, etc.       |
+                                +-----------------+-------------------+
+                                                  |
+                                            (2)   | Requests/Queries
+                                                  v
+                                  +-----------------------------------+
+                                  |        SQL Server Database        |
+                                  |   (All the BRM_*  +   RULE_* )    |
+                                  +-----------------------------------+
+
+	1.	User launches the combined .py. The MainWindow is constructed.
+	2.	The MainWindow (and all tabs) repeatedly send queries to or update the SQL Server tables (no foreign key constraints in your DDL, but logically they’re related).
+
+A. Database Connection & Login
+
+Detailed flow for initial startup:
+
+(1) Start .py => Show DatabaseConnectionDialog
+       +-------------------------------------+
+       |  [DatabaseConnectionDialog]         |
+       |   user picks DSN or connection str  |
+       +-------------------------------------+
+          | (2) pyodbc.connect(...) 
+          v
+       [SQL Server DB]
+
+(3) If successful => Show LoginDialog
+       +-----------------------+
+       |   [LoginDialog]      |
+       |   user enters UN/PW  |
+       +-----------------------+
+          | (4) SELECT * FROM USERS 
+          |     WHERE username=? 
+          |     AND password=?
+          v
+       [SQL Server -> USERS table]
+
+(5) If valid => store user_id, user_group => 
+                proceed to MainWindow
+
+	•	(2) We physically connect to the DB.
+	•	(4) For each login attempt, we check the USERS table.
+	•	(5) On success, we know the user_group (e.g., "BG1" or "Admin").
+
+B. MainWindow Construction + Tabs
+
+(1) [BRMTool QMainWindow]
+       +------------------------------------+
+       |  - sees user_group=Admin? => add   |
+       |    Global/Critical Admin tab       |
+       |  - sets up:                        |
+       |    * Business Rules (Dashboard)    |
+       |    * Approvals tab (MultiStep...)  |
+       |    * Scheduling tab               |
+       |    * HierarchyView                |
+       |    * Lineage Graph                |
+       |    * Group Mgmt, User Mgmt, etc.   |
+       +------------------------------------+
+
+The main window checks user_group:
+	•	If Admin, it adds the GlobalCriticalAdminTab and user impersonation combo.
+	•	Otherwise, it omits those features.
+
+C. Adding / Updating a Rule (RuleEditorDialog)
+
+User => (click "Add Rule" or "Update Rule" in Dashboard)
+   |
+   v
+ [RuleEditorDialog appears]
+   +------------------------------------+
+   | user fills: name, rule SQL, etc.   |
+   | on "Save": calls add_rule(...)     |
+   |  or update_rule(...) in code       |
+   +------------------------------------+
+       |(1) parse SQL => 
+       |    detect tables => check 
+       |    group perms => if invalid => fail
+       |(2) Insert/Update [BRM_RULES], 
+       |    [BRM_RULE_TABLE_DEPENDENCIES]
+       |(3) Possibly create approvals => 
+       |    [BRM_RULE_APPROVALS], 
+       |    if not global or user=Admin
+       |(4) add_audit_log(...) => 
+       |    [BRM_AUDIT_LOG]
+       v
+ [SQL Server]
+
+Steps in detail:
+	1.	SQL parse (via advanced parser) extracts used tables.
+	2.	We check GROUP_PERMISSIONS for each table. If unauthorized => error. Otherwise, we do an INSERT or UPDATE into BRM_RULES, incrementing VERSION if it’s an update.
+	3.	We also delete old dependencies from BRM_RULE_TABLE_DEPENDENCIES and insert new ones based on the parser’s results.
+	4.	We insert an “INSERT” or “UPDATE” record into BRM_AUDIT_LOG.
+	5.	If IS_GLOBAL=0, we call create_multistep_approvals(...), populating BRM_RULE_APPROVALS with BG1, BG2, BG3, or “FINAL” plus any conditional logic (like if certain tables require BG2, etc.).
+
+D. BFS Execution (ETL)
+
+From the “Business Rules” Dashboard:
+
+(1) user => click "Run ETL (BFS)"
+
+(2) code => execute_rules_in_order(...)
+       +----------------------------------+
+       |  build_rule_adjacency(...) =>    |
+       |   parent->child from [BRM_RULES] |
+       |  load_global_critical_links(...) |
+       | => BFS => for each rule:         |
+       |   => "BEGIN TRAN" => run SQL     |
+       |   => if returns row[0][0]==1 =>  |
+       |        PASS => COMMIT            |
+       |     else => ROLLBACK, if rule is |
+       |       critical => skip children  |
+       +----------------------------------+
+             |(3) Insert => RULE_EXECUTION_LOGS
+             v
+         [SQL Server]
+
+Key BFS points:
+	•	Parent/child relationships come from BRM_RULES.PARENT_RULE_ID.
+	•	Additional GCR links come from BRM_GLOBAL_CRITICAL_LINKS. If a critical rule fails, we skip its children in BFS.
+	•	After each rule’s attempt, we log results in RULE_EXECUTION_LOGS.
+
+E. Multi-Step Approvals
+
+User => open "Approvals" tab
+    +------------------------------------+
+    | [MultiStepApprovalTab] => queries: |
+    | SELECT from BRM_RULE_APPROVALS     |
+    |  WHERE USERNAME=? 
+    |   AND APPROVED_FLAG=0
+    +------------------------------------+
+       | 
+       v
+[SQL Server => BRM_RULE_APPROVALS, BRM_RULES (JOIN for names)]
+ 
+(1) show only approvals at 
+    minimal stage => user can 
+    Approve or Reject
+
+(2) On Approve => 
+    APPROVED_FLAG=1 => 
+    if no more pending => 
+       BRM_RULES => approval_status='APPROVED', 
+                     status='ACTIVE'
+
+(3) On Reject => 
+    APPROVED_FLAG=2 => 
+    BRM_RULES => approval_status='REJECTED', 
+                 status='INACTIVE'
+
+Conditional logic for approvals can also incorporate the columns from BRM_RULE_TABLE_DEPENDENCIES to decide which business groups get inserted into BRM_RULE_APPROVALS.
+
+F. Scheduling & check_due_schedules()
+
+(1) "Scheduling" tab => load [RULE_SCHEDULES]
+   user can add => EnhancedScheduleDialog => 
+   => INSERT RULE_SCHEDULES(rule_id, schedule_time, status='Scheduled')
+
+(2) QTimer calls check_due_schedules() every 60s:
+    => SELECT * FROM RULE_SCHEDULES 
+       WHERE status='Scheduled'
+       AND schedule_time <= now
+    => for each => run that rule's SQL 
+       if fail => RULE_SCHEDULES => status='Failed'
+          else => status='Executed'
+
+G. Hierarchy & Lineage
+
+G1. Hierarchy
+
+(1) "Hierarchy" tab => 
+    [HierarchyViewTab] => 
+    loads [BRM_RULE_GROUPS], 
+          [BRM_RULES].
+(2) Displays 
+    Group -> child rules
+(3) If drag-drop => user 
+    re-parents => stub calls 
+    QTreeWidget dropEvent => 
+    code could do 
+    UPDATE BRM_RULES 
+    SET PARENT_RULE_ID=? 
+    or GROUP_ID=? 
+    to reflect new hierarchy
+
+G2. Lineage
+
+(1) "Lineage" tab => EnhancedLineageGraphWidget 
+(2) queries [BRM_RULES] => 
+    build adjacency from PARENT_RULE_ID
+(3) queries [BRM_RULE_TABLE_DEPENDENCIES] => 
+    adds edges to "table ellipse" nodes
+(4) draws them in QGraphicsScene => 
+    user can pan/zoom.
+
+H. Custom Rule Groups
+
+(1) "Custom Groups" tab => 
+    [CustomRuleGroupEnhancedTab]
+
+(2) load group list => 
+    [BRM_CUSTOM_RULE_GROUPS], 
+    members => [BRM_CUSTOM_GROUP_MEMBERS]
+
+(3) user can:
+    * create group => INSERT 
+      -> BRM_CUSTOM_RULE_GROUPS
+    * rename => UPDATE
+    * delete => DELETE
+    * backup => insert row in 
+      [BRM_CUSTOM_GROUP_BACKUPS] (json)
+    * restore => load backup json => 
+      overwrite group name 
+      + membership
+(4) user can assign rules => 
+    inserts in BRM_CUSTOM_GROUP_MEMBERS
+
+A “simulate group” BFS just runs all rules in that group, ignoring parent/child relationships. Or you can combine BFS logic with custom grouping.
+
+I. Additional Advanced Features
+	1.	Decision Tables (Part 3) => separate CRUD on DECISION_TABLES. Possibly run them integrated with BFS or as a separate “Run Decision Table.”
+	2.	Conflict Priority => store pairs in RULE_CONFLICTS. If conflicting rules are both active, the user can set priority.
+	3.	Composite Rules => store CRULE_NAME + LOGIC_EXPR in COMPOSITE_RULES. The UI might interpret LOGIC_EXPR to run a combination of rule pass/fail.
+	4.	Data Validation => DATA_VALIDATIONS table. The user can define “NOT NULL,” “RANGE,” or other constraints. The BFS or run_dry_run could check them if integrated.
+	5.	Snapshots => RULE_SNAPSHOTS. The user can “Take Snapshot” (export all BRM_RULES to JSON) or “Delete Snapshot.”
+	6.	Tags => RULE_TAGS for quick labeling.
+
+J. Alerts & Dashboards
+
+(1) "Alerts & Dashboards" => 
+    [AlertsAndDashboardsTab] => 
+    queries old approvals => 
+      SELECT from BRM_RULE_APPROVALS
+      older than 3 days
+    queries upcoming schedules => 
+      SELECT from RULE_SCHEDULES 
+      next 24h
+(2) shows them in a QPlainTextEdit
+
+K. Lifecycles & Audit Logs
+
+Lifecycle states can be stored in BRM_RULES.LIFECYCLE_STATE. For instance:
+	•	“DRAFT” → “UNDER_APPROVAL” → “APPROVED” → “ACTIVE” → “INACTIVE” → “ARCHIVED.”
+	•	Each transition triggered by rule CRUD or approvals.
+
+Audit Logs (BRM_AUDIT_LOG):
+	•	Every time we do add_rule(...), update_rule(...), delete_rule(...), we call add_audit_log(...).
+	•	Also used for approvals (flag changes).
+
+The user can open the “View Audit Logs” tool menu => AuditLogViewer => loads up to 1000 rows from BRM_AUDIT_LOG, with search + CSV export.
+
+Putting It All Together
+	1.	User Launch
+	2.	DB Connect → Login → MainWindow.
+	3.	Tabs for each advanced feature.
+	4.	When user performs an action (Add Rule, BFS, Approve, etc.), the corresponding tab calls the relevant function, which writes to the DB and possibly writes an audit log.
+	5.	Timers automatically reload Approvals or check Schedules.
+
+This more detailed textual diagram should give you a thorough, in-depth look at how data flows among the user, the UI, and each DB table in the system.
