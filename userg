@@ -1,0 +1,518 @@
+Below is a comprehensive usage guide that provides an example for each major functionality of the BRM Tool, along with in-depth explanations of how each part works. The guide follows the structure of the tool’s source code, showing how everything integrates into a full Business Rules Management system.
+
+1. OVERALL WORKFLOW
+	1.	Start the Application
+	•	The script’s main function (main() in Part 8) launches the GUI.
+	2.	Database Connection
+	•	A dialog prompts for either an ODBC DSN or a custom connection string.
+	•	If you pick a DSN (say MyDSN), the tool tries pyodbc.connect("DSN=MyDSN;Trusted_Connection=yes;").
+	3.	Login
+	•	A second dialog appears, requesting your username and password from the USERS table in the database.
+	4.	Main Window
+	•	Once logged in, the main QMainWindow with multiple tabs is displayed:
+	•	Business Rules (dashboard)
+	•	Approvals
+	•	Global/Critical Admin (if you’re Admin)
+	•	Hierarchy, Lineage, Scheduling, Custom Groups, etc.
+	•	The menu bar provides shortcuts to additional dialogs and advanced features.
+
+Throughout your usage, audit logs record changes to rules, email notifications can be sent if configured, and scheduled rules run automatically in the background once their time arrives.
+
+2. CORE FUNCTIONALITIES AND EXAMPLES
+
+Below we walk through each major functionality in the script, with real-world examples of how you might use them.
+
+2.1 LOGGING
+	•	Where: Configured at the top (Part 1) via logging.basicConfig(...).
+	•	What: The tool logs errors, info messages, and more to brm_tool_enhanced.log.
+
+Example Usage
+
+try:
+    # Something that might fail
+    do_something()
+except Exception as e:
+    logger.error("Encountered an error: %s", e)
+
+	•	How to See It: After running the tool, open brm_tool_enhanced.log. You’ll see lines like:
+
+2025-01-10 14:22:51,123:ERROR:__main__:Encountered an error: ...
+
+2.2 EMAIL NOTIFICATIONS
+	•	Function: send_email_notification(subject, body, recipients).
+	•	Purpose: Sends SMTP emails if a rule fails or if you want to alert a user group.
+
+Example Usage
+
+send_email_notification(
+    subject="Critical Rule #123 Failed",
+    body="The BFS run determined rule #123 returned FAIL. Please investigate.",
+    recipients=["team_lead@example.com"]
+)
+
+	•	Result: The tool attempts to connect to smtp.example.com with your credentials (as configured in EMAIL_CONFIG) and send out the email.
+	•	Tip: Make sure the SMTP server, port, username, and password are correct.
+
+2.3 DATABASE CONNECTION DIALOG
+	•	Class: DatabaseConnectionDialog
+	•	Purpose: Prompts user for ODBC DSN or a custom connection string.
+
+Example Interaction
+	1.	Upon launching, you see a dialog:
+
+Select a SQL Server ODBC DSN or enter a custom connection string:
+[Dropdown with DSNs like "MyDSN", "SQLServerDSN", ... ]
+[ Or custom ODBC connection string field ]
+[ Connect ]  [ Cancel ]
+
+
+	2.	If you select ODBC DSN: MyDSN and click Connect, the tool calls pyodbc.connect("DSN=MyDSN;Trusted_Connection=yes;").
+	3.	If that succeeds, the dialog closes and the next step (Login) appears.
+
+2.4 DB HELPERS
+	•	Functions:
+	1.	get_cursor_rows(cursor)
+	2.	get_cursor_one(cursor)
+
+These help convert pyodbc cursor results to lists/dicts.
+
+Example Usage
+
+c = conn.cursor()
+c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES")
+rows = get_cursor_rows(c)
+# rows might be: [ { 'RULE_ID': 1, 'RULE_NAME': 'CheckAge' }, ... ]
+
+c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=123")
+row = get_cursor_one(c)
+# row might be: { 'RULE_ID': 123, 'RULE_NAME': 'CheckAge', ... }
+
+2.5 AUDIT LOGGING
+	•	Function: add_audit_log(...)
+	•	Table: BRM_AUDIT_LOG(ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP)
+
+Example Usage
+
+old_data = { "RULE_NAME": "Check Age" }
+new_data = { "RULE_NAME": "Check Age and Gender" }
+
+add_audit_log(
+    conn=conn,
+    action="UPDATE",
+    table_name="BRM_RULES",
+    record_id=123,
+    action_by="Alice",
+    old_data=old_data,
+    new_data=new_data
+)
+
+	•	The function inserts a record in BRM_AUDIT_LOG with a JSON dump of old and new data.
+
+2.6 LOGIN
+	•	Class: LoginDialog
+	•	Flow:
+	1.	User enters Username and Password.
+	2.	The code checks SELECT USER_ID, USER_GROUP FROM USERS WHERE USERNAME=? AND PASSWORD=?.
+	3.	If found, sets self.user_id and self.user_group, and calls .accept().
+
+Example Interaction
+	•	Suppose the USERS table has a row (USER_ID=5, USERNAME='Bob', PASSWORD='secure123', USER_GROUP='BG1').
+	•	The user types “Bob” / “secure123.” If correct, the dialog closes, storing user_id=5, user_group='BG1' for the main window to use.
+
+2.7 DETECT OPERATION TYPE
+	•	Function: detect_operation_type(sql_text: str) -> str
+	•	Logic: Checks if sql_text starts with INSERT, UPDATE, DELETE, SELECT (case-insensitive), else returns "OTHER".
+
+Example Usage
+
+op = detect_operation_type("INSERT INTO MyTable VALUES(1)")
+# op -> "INSERT"
+op = detect_operation_type("SELECT * FROM Orders")
+# op -> "SELECT"
+
+Used when adding/updating rules to mark whether the rule SQL is effectively “READ” (SELECT) or “WRITE” (INSERT/UPDATE/DELETE).
+
+2.8 ADVANCED SQL PARSER
+	•	Function: enhanced_advanced_extract_tables(sql_text).
+	•	Purpose: Identifies tables, columns, aliases, and CTE usage in the rule’s SQL.
+
+Example
+
+sql_text = """
+WITH cte AS (
+  SELECT CustomerID, SUM(Amount) as Total
+  FROM dbo.Sales
+  GROUP BY CustomerID
+)
+SELECT CASE WHEN COUNT(cte.CustomerID) > 100 THEN 1 ELSE 0 END
+FROM cte
+JOIN dbo.Customers ON cte.CustomerID = Customers.ID
+"""
+parse_info = enhanced_advanced_extract_tables(sql_text)
+# parse_info["tables"] might be:
+# [("dbo", "Customers", None, False)]
+# parse_info["cte_tables"] might be something referencing dbo.Sales
+
+The tool then inserts these references into BRM_RULE_TABLE_DEPENDENCIES.
+
+2.9 RULE LIFECYCLE CONSTANTS
+
+A Python list:
+
+RULE_LIFECYCLE_STATES = ["DRAFT", "UNDER_APPROVAL", "APPROVED", "ACTIVE", "INACTIVE", "ARCHIVED"]
+
+When you add/update rules, they move through these states. For instance, new rules often start at "DRAFT" or "UNDER_APPROVAL".
+
+2.10 ONBOARDING WIZARD
+	•	Class: OnboardingWizard
+	•	If triggered, it gives a 3-step guide for new users:
+	1.	Add a Group
+	2.	Add a Rule
+	3.	Schedule the Rule
+
+Example Usage
+
+wizard = OnboardingWizard(connection)
+wizard.exec_()  # Shows the wizard steps
+
+	•	This is optional but helpful the first time someone uses the tool.
+
+2.11 BFS RULE EXECUTION
+	•	Key Function: execute_rules_in_order(conn)
+
+	1.	Finds root rules (rules with no parent).
+	2.	Runs them in BFS order.
+	3.	If a rule is CRITICAL_RULE=1 and fails, it skips all its descendants.
+
+Example
+	1.	Suppose you have the following parent-child structure:
+
+Rule #10 (root)
+  -> Rule #11
+    -> Rule #12
+  -> Rule #13
+
+
+	2.	execute_rules_in_order attempts to run #10’s SQL, commits if pass, or rolls back if fail.
+	3.	Moves on to #11, etc. If #11 is critical and fails, #12 and any sub-children are skipped.
+
+2.12 MULTI-STEP APPROVALS (CONDITIONAL)
+	•	Functions: create_multistep_approvals, get_child_rules_bfs.
+	•	The tool checks table dependencies or group memberships to decide if BG2 or BG3 is needed. It inserts rows in BRM_RULE_APPROVALS with various APPROVAL_STAGE values.
+
+Example
+If the new rule references a table named “dbo.FinanceData,” the wizard might require BG2 approval. So it automatically inserts lines like:
+
+RULE_ID=200, GROUP_NAME=BG1, USERNAME=someApprover1, APPROVAL_STAGE=1
+RULE_ID=200, GROUP_NAME=BG2, USERNAME=someApprover2, APPROVAL_STAGE=2
+RULE_ID=200, GROUP_NAME=FINAL, USERNAME=final_approver, APPROVAL_STAGE=3
+
+The rule must be approved in that order. Each user sees the rule in their Approvals tab once it’s their turn.
+
+2.13 RULE IMPACT ANALYSIS
+	•	Function: analyze_rule_impact(conn, rule_id)
+	•	Traverses child rules in BFS (including global-critical links) to see who depends on a given rule.
+
+Example
+
+impact = analyze_rule_impact(conn, rule_id=10)
+print("Downstream rules:", impact["downstream_rules"])
+
+If you plan to deactivate or delete rule #10, you might check downstream rules #11, #12, etc.
+
+2.14 RULE CRUD (CREATE, UPDATE, DEACTIVATE, DELETE)
+	•	Functions: add_rule, update_rule, deactivate_rule, delete_rule.
+	•	Each function:
+	1.	Validates input
+	2.	Checks constraints (e.g., uniqueness, references)
+	3.	Uses detect_operation_type + enhanced_advanced_extract_tables
+	4.	Inserts/updates DB + BRM_RULE_TABLE_DEPENDENCIES
+	5.	Writes an audit log
+	6.	Possibly sets approvals or triggers re-approval
+
+Example: Add a Rule
+
+rule_data = {
+  "GROUP_ID": 1,
+  "RULE_NAME": "CheckMinBalance",
+  "RULE_SQL": "SELECT CASE WHEN MIN(Balance) >= 0 THEN 1 ELSE 0 END FROM dbo.Accounts",
+  "EFFECTIVE_START_DATE": "2025-03-01 00:00:00",
+  "DESCRIPTION": "Ensure accounts never drop below 0",
+  "OWNER_GROUP": "BG1",
+  "CRITICAL_RULE": 1,
+  "CRITICAL_SCOPE": "GROUP"
+}
+new_id = add_rule(conn, rule_data, created_by="Alice", user_group="BG1")
+print(f"New rule created with ID={new_id}")
+
+Example: Deactivate a Rule
+
+deactivate_rule(conn, rule_id=123, updated_by="BGAdmin", user_group="Admin")
+
+If the rule is not fully approved or still has active children, it raises an error.
+
+2.15 SINGLE/CHAIN/GROUP SIMULATION
+
+These are purely “dry-run” tests (BEGIN TRANSACTION → run SQL → ROLLBACK).
+	1.	SingleRuleSimulationDialog:
+	•	Lets you pick one rule’s SQL, run it, see if it returns 1 (PASS) or 0 (FAIL).
+Example:
+	•	Suppose rule #123’s SQL is SELECT CASE WHEN COUNT(*) > 100 THEN 1 ELSE 0 END FROM dbo.Customers.
+	•	The dialog shows “PASS => Returned: 1” if there are > 100 customers in the table.
+	2.	ChainSimulationDialog:
+	•	BFS from a parent rule, running each child if the parent passes.
+	3.	GroupSimulationDialog:
+	•	For a “custom group,” run each rule’s SQL in that group, see PASS or FAIL.
+
+2.16 SYNC METADATA (IMPROVED)
+	•	Function: sync_metadata_improved(conn)
+	•	Compares real table names from sys.tables to your recorded dependencies in BRM_RULE_TABLE_DEPENDENCIES.
+	•	Flags any mismatch as MISSING_....
+
+Example
+
+sync_metadata_improved(conn)
+# Suppose a rule references "dbo.NoSuchTable".
+# The dependency row might be updated to "MISSING_dbo.NoSuchTable".
+
+From the menu bar: File → Sync Metadata triggers this.
+
+2.17 SCHEDULING
+	•	EnhancedScheduleDialog: A pop-up to pick a rule and a datetime.
+	•	ScheduleManagementTab: Lists all schedules (up to 1000), letting you edit or delete them.
+	•	A background timer in the main window checks if SCHEDULE_TIME <= now and runs that rule.
+
+Example
+	1.	In the scheduling tab, click “Add New Schedule.”
+	2.	Pick rule #45.
+	3.	Choose date/time “2025-05-01 09:00:00.”
+	4.	The record in RULE_SCHEDULES is (SCHEDULE_ID=10, RULE_ID=45, SCHEDULE_TIME='2025-05-01 09:00:00', STATUS='Scheduled').
+	5.	Once 9 AM arrives, the tool attempts that rule’s SQL. If it’s successful, the schedule’s STATUS becomes “Executed.”
+
+2.18 ADVANCED FEATURE TABS
+
+These optional features add more sophisticated rule management capabilities.
+
+2.18.1 DECISION TABLES
+	•	Tab: DecisionTablesTab
+	•	CRUD for records in DECISION_TABLES.
+	•	“Run Decision Table” just shows a placeholder message (demo approach).
+
+Example:
+	1.	Add a new decision table named LoanEligibility with a short description “Decides if a loan can be approved.”
+	2.	This inserts (TABLE_NAME='LoanEligibility', DESCRIPTION='...') into DECISION_TABLES.
+	3.	“Run Decision Table” might pop up a “Decision Table 3 run => results are hypothetical.”
+
+2.18.2 CONFLICT PRIORITY MANAGER
+	•	Tab: ConflictPriorityManagerTab
+	•	Manages RULE_CONFLICTS(RULE_ID1, RULE_ID2, PRIORITY).
+
+Example:
+	•	Add conflict: (RULE_ID1=10, RULE_ID2=20, PRIORITY=2).
+	•	If both #10 and #20 produce contradictory outcomes, the higher priority might “win.”
+
+2.18.3 COMPOSITE RULES
+	•	Tab: CompositeRulesTab
+	•	Merges multiple rule outcomes into a single “composite” expression.
+
+Example:
+	•	A composite rule: CRULE_NAME='AllMustPass', LOGIC_EXPR='Rule10==PASS AND Rule20==PASS', ACTION_ON_PASS='SendNotification'.
+
+2.18.4 SNAPSHOT MANAGER
+	•	Tab: SnapshotManagerTab
+	•	“Take Snapshot” pulls all rows from BRM_RULES, dumps them in RULE_SNAPSHOTS(SNAPSHOT_JSON).
+
+Example:
+	•	“Release_1.0 Snapshot” → the tool saves the entire set of rules in JSON form, e.g. [{"RULE_ID":1,"RULE_NAME":"..."}].
+
+2.18.5 TAGS MANAGER
+	•	Tab: TagsManagerTab
+	•	You can attach short textual tags to rules.
+
+Example:
+	1.	Add a tag “HighPriority” to rule #50.
+	2.	Now RULE_TAGS has (TAG_ID=..., RULE_ID=50, TAG_NAME='HighPriority').
+
+2.18.6 DATA VALIDATION
+	•	Tab: DataValidationTab
+	•	Manages records in DATA_VALIDATIONS.
+
+Example:
+	•	Add (TABLE_NAME='dbo.Customers', COLUMN_NAME='Email', VALIDATION_TYPE='NOT NULL', PARAMS='').
+	•	A future check might ensure all Email fields are non-null.
+
+2.19 WHAT-IF TESTING
+	•	Tab: WhatIfTestTab
+	•	Lets you pick a rule (by ID in the dropdown) and do a quick “dry run.”
+	•	“Upload CSV” is a placeholder demonstration—no actual CSV ingestion logic by default, but you could extend it.
+
+Example:
+	1.	You have rule #100 with SQL SELECT CASE WHEN AVG(Score) > 700 THEN 1 ELSE 0 END FROM dbo.CreditScores.
+	2.	You pick rule #100, click “Run Test.”
+	3.	The tool starts a transaction, runs the SQL, fetches the first row, shows “PASS => Returned: 1” or “FAIL => Returned: 0,” then rolls back.
+
+2.20 PART 4 DIALOGS & COMPONENTS
+
+2.20.1 AUDIT LOG VIEWER
+	•	Class: AuditLogViewer
+	•	Reads up to 1000 rows from BRM_AUDIT_LOG.
+	•	Example:
+	1.	Tools → “View Audit Logs.”
+	2.	You see columns like (AuditID, Action, Table, RecordID, OldData, NewData, Timestamp).
+	3.	Type a search substring to filter.
+
+2.20.2 RULE SEARCH
+	•	Class: SearchRuleDialog
+	•	Type partial name/SQL, see matching BRM_RULES.
+
+Example:
+	•	Type “balance” → results might show rules that have “balance” in their name or SQL.
+
+2.20.3 VERSION HISTORY DIALOG
+	•	Class: VersionHistoryDialog
+	•	Takes a RULE_ID, fetches relevant BRM_AUDIT_LOG entries with INSERT or UPDATE actions.
+	•	Allows “Rollback to selected version.”
+
+Example:
+	1.	Enter rule ID = 101.
+	2.	Sees entries like “INSERT” at 2025-01-01, “UPDATE” at 2025-02-05.
+	3.	“Rollback” replaces the current rule data with the chosen “old_data” from the audit log.
+
+2.20.4 RULE DASHBOARD
+	•	Class: RuleDashboard
+	•	A paginated table of all rules, with text search and status filter.
+	•	“Previous” / “Next” buttons for navigating 50 records per page (configurable).
+
+2.20.5 RULE EDITOR DIALOG
+	•	Class: RuleEditorDialog
+	•	Adds or updates a single rule.
+	•	Fields for group, parent rule, name, type, status, effective dates, CDC type, rule SQL, description, justification, global/critical flags, etc.
+
+Example:
+	•	“Add Rule” → Fill out the form → Press “Save.”
+	•	The tool calls add_rule(...) internally, capturing dependencies, setting approvals, etc.
+
+2.21 PART 5: APPROVALS, GLOBAL/CRITICAL ADMIN, HIERARCHY, LINEAGE
+
+2.21.1 MULTI-STEP APPROVAL TAB
+	•	Class: MultiStepApprovalTab
+	•	Shows only those approvals where your username matches the “unapproved” record at the earliest stage.
+
+Example:
+	•	If your username is “bob,” and the table has (RULE_ID=200, GROUP_NAME='BG2', USERNAME='bob', APPROVED_FLAG=0, APPROVAL_STAGE=2), then you see it if stage 1 is already approved.
+	•	You can click Approve or Reject.
+
+2.21.2 GLOBAL/CRITICAL ADMIN TAB
+	•	Class: GlobalCriticalAdminTab
+	•	If user_group==“Admin”, you can set IS_GLOBAL=1, CRITICAL_RULE=1, or define CRITICAL_SCOPE.
+	•	Also link/unlink children in BRM_GLOBAL_CRITICAL_LINKS.
+
+Example:
+	1.	Check the box “Set Global?” and “Set Critical?” → Scope “GLOBAL.”
+	2.	Click “Apply” to selected rules → updates them in BRM_RULES.
+
+2.21.3 HIERARCHY VIEW TAB
+	•	Class: HierarchyViewTab
+	•	Tree of business groups → child items are rules within that group.
+	•	Intended for drag-and-drop re-parenting stubs.
+
+Example:
+	•	“BG1 (ID=1)” as a top-level item, with “Rule 10: CheckAge” child.
+	•	If you drag “Rule 10” to “BG2,” you could handle logic to update that rule’s GROUP_ID.
+
+2.21.4 ENHANCED LINEAGE GRAPH
+	•	Class: EnhancedLineageGraphWidget
+	•	Draws rules as colored shapes, lines from parent to child, lines to tables used.
+	•	“Search” can highlight or center on a node, “Refresh Graph” re-builds the scene.
+
+Example:
+	•	If rule #10 references dbo.Customers, you see a node for “Rule #10” and an ellipse for dbo.Customers with an edge between them.
+
+2.22 PART 6: METRICS, CONTROL TABLES, GROUP MANAGEMENT, USER MANAGEMENT
+
+2.22.1 METRICS DASHBOARD
+	•	Class: MetricsDashboardTab
+	•	Simple bar chart of rule counts by status.
+
+Example:
+	•	Shows “ACTIVE=15,” “INACTIVE=10,” “APPROVAL_IN_PROGRESS=3,” etc.
+
+2.22.2 CONTROL TABLES TAB
+	•	Class: CtrlTablesTab
+	•	Lets you choose from a set of known admin tables (like BRM_RULES, BRM_AUDIT_LOG) and loads top-1000 rows.
+
+2.22.3 GROUP MANAGEMENT TAB (Admin Only)
+	•	Manages: BUSINESS_GROUPS (like BG1, BG2, etc.), user membership, group permissions, and group-level approvers.
+	•	Example:
+	•	Add a new group “BG3” with an email.
+	•	Assign user #10 to “BG3.”
+	•	Grant “SELECT” permission on dbo.CreditData to BG3.
+	•	Add an approver “jane_doe” to BG3 so she can sign off on BG3 approvals.
+
+2.22.4 USER MANAGEMENT TAB (Admin Only)
+	•	Add users, remove users, change passwords.
+	•	Data stored in the USERS table.
+
+Example:
+	•	“Add User” → Name “charlie,” pass “p4ssword,” group “BG2.” → Inserts a row in USERS.
+
+2.23 PART 7: CUSTOM RULE GROUPS (ENHANCED), ALERTS & DASHBOARDS
+
+2.23.1 CUSTOM RULE GROUP (ENHANCED) TAB
+	•	Distinct from standard “business groups.”
+	•	You can create your own groups to hold sets of rules, rename them, assign or remove rules, and even backup/restore these group definitions.
+
+Example:
+	1.	Create a custom group named “DataQualityChecks.”
+	2.	Assign rule #10, #20, #30 to this group.
+	3.	“Backup Group” saves the membership to BRM_CUSTOM_GROUP_BACKUPS.
+	4.	If you need to revert, “Restore Group” from a chosen version.
+
+2.23.2 ALERTS & DASHBOARDS TAB
+	•	Shows:
+	•	Approvals older than 3 days.
+	•	Schedules happening in the next 24 hours.
+
+Example:
+	•	If rule #200 is stuck in “approval stage 2” for 4 days, it appears in the text box here with age=4.
+
+2.24 PART 8: MAIN WINDOW (BRMTool)
+	•	Class: BRMTool
+	•	Combines all the above pieces.
+	•	Launch sequence:
+	1.	DatabaseConnectionDialog
+	2.	LoginDialog
+	3.	Optionally OnboardingWizard
+	4.	The main BRMTool window with all tabs.
+
+Two background timers:
+	1.	Approvals: Refresh every 5s so the “Approvals” tab is up-to-date.
+	2.	Schedules: Every 60s checks if a rule is due to run.
+
+3. COMPLETE USAGE EXAMPLE (HIGH-LEVEL)
+	1.	Launch the tool (python brm_tool.py or calling main()).
+	2.	Connect to DB (pick “ODBC DSN: MyDSN”).
+	3.	Login with user “Alice,” pass “password123,” who is in group “Admin.”
+	4.	(Optional) Onboarding wizard runs, instructing you to create a group, rule, schedule.
+	5.	Business Rules tab:
+	•	Click Add Rule. Fill out “CheckNegativeBalances,” SQL = SELECT CASE WHEN MIN(Balance)>=0 THEN 1 ELSE 0 END FROM dbo.Accounts.
+	•	Save. It’s now in APPROVAL_IN_PROGRESS => “Approvals” tab.
+	6.	Switch to Approvals tab:
+	•	If you’re an approver for BG1 or if the rule is under Admin, click “Approve.” If more stages exist, others must do it.
+	7.	Once fully approved, the rule becomes ACTIVE.
+	8.	Run ETL (BFS) to execute all root rules. If the “CheckNegativeBalances” rule passes, it commits. If it fails, you see logs of the failure.
+	9.	Schedule the rule for tomorrow. The next day, the background scheduler picks it up and updates the schedule’s status to “Executed” (or “Failed”).
+	10.	Audit Log Viewer (Tools → “View Audit Logs”) shows the insert, approvals, etc.
+	11.	Search for “Balance.” The “Search Rule” dialog shows your new rule.
+	12.	Group Management (Admin) → create a new group “BG3,” or manage user membership.
+	13.	Custom Rule Group → create “HighValueChecks,” assign your rule #1 to it.
+	14.	Alerts tab → if any approvals are old or schedules are soon, it displays them.
+
+4. CONCLUSION
+
+Each functionality in the BRM Tool—from logging and advanced SQL parsing to BFS execution, multi-step approvals, scheduling, custom groups, and user management—works in tandem to deliver a complete Business Rules Management platform.
+	•	Add or Update a rule, watch it go through Approvals and become Active.
+	•	Simulate or Schedule that rule, check if it passes or fails.
+	•	Keep track of all changes via Audit Logs and manage everything from the Main Window tabs.
+
+With these examples and detailed explanations, you should have a clear, practical understanding of how to use each part of the BRM Tool and how to integrate it into your organization’s rule governance processes.
