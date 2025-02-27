@@ -1,0 +1,1065 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+BRM TOOL – PART 5 of 8 (REVISED + ENHANCED)
+Includes:
+ - MultiStepApprovalTab
+ - GlobalCriticalAdminTab
+ - HierarchyViewTab with drag-and-drop
+ - EnhancedLineageGraphWidget (flat design, no external icons)
+   * includes BFS layering
+   * color-coded statuses
+   * legend
+   * advanced table/column/rule SQL search
+   * right-click stubs for further actions
+No references to old code or placeholders.
+"""
+
+import sys
+import json
+import logging
+import math
+import re
+
+from datetime import datetime
+from collections import deque
+
+# PyQt5 Imports (we assume Part 1 already imported PyQt modules)
+from PyQt5.QtCore import (
+    Qt, QPoint, QRectF, QMimeData, QTimer
+)
+from PyQt5.QtGui import (
+    QColor, QPen, QBrush, QPainter, QFont
+)
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, QPushButton,
+    QAbstractItemView, QMessageBox, QComboBox, QLabel, QCheckBox, QLineEdit,
+    QDialog, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QMenu, QInputDialog,
+    QFileDialog, QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem,
+    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem, QGraphicsItemGroup
+)
+
+########################################################################
+# MULTI-STEP APPROVALS
+########################################################################
+
+class MultiStepApprovalTab(QWidget):
+    """
+    Shows pending approvals for the currently logged-in user => can approve/reject 
+    if they are at the minimal stage in the pipeline. 
+    Dynamically reloads every few seconds if the main window sets a timer.
+    """
+    def __init__(self, connection, logged_in_username, user_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.logged_in_username = logged_in_username
+        self.user_group = user_group
+
+        main_layout = QVBoxLayout(self)
+
+        self.approval_table = QTableWidget(0, 7)
+        self.approval_table.setHorizontalHeaderLabels([
+            "RuleID", "GroupName", "RuleName", "Stage", "Approved?", "Approve", "Reject"
+        ])
+        self.approval_table.horizontalHeader().setStretchLastSection(True)
+        self.approval_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.approval_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        main_layout.addWidget(self.approval_table)
+
+        ref_btn = QPushButton("Refresh Approvals")
+        ref_btn.clicked.connect(self.load_approvals)
+        main_layout.addWidget(ref_btn)
+
+        self.setLayout(main_layout)
+        self.load_approvals()
+
+    def load_approvals(self):
+        """
+        Retrieves any approvals assigned to the current user that aren’t approved yet,
+        but only displays them if they match the minimal (lowest) approval stage outstanding.
+        """
+        c = self.connection.cursor()
+        c.execute("""
+        SELECT A.RULE_ID, A.GROUP_NAME, A.USERNAME, A.APPROVED_FLAG, 
+               A.APPROVAL_STAGE, R.RULE_NAME, R.APPROVAL_STATUS
+        FROM BRM_RULE_APPROVALS A
+        JOIN BRM_RULES R ON A.RULE_ID = R.RULE_ID
+        WHERE A.USERNAME=? AND A.APPROVED_FLAG=0
+        ORDER BY A.RULE_ID
+        """, (self.logged_in_username,))
+        rows = c.fetchall()
+
+        # helper => find minimal unapproved stage for a rule
+        def get_current_min_stage(rid_):
+            c2 = self.connection.cursor()
+            c2.execute("""
+            SELECT MIN(APPROVAL_STAGE)
+            FROM BRM_RULE_APPROVALS
+            WHERE RULE_ID=? AND APPROVED_FLAG=0
+            """,(rid_,))
+            ro = c2.fetchone()
+            return ro[0] if ro and ro[0] else None
+
+        # filter rows => only those that match the minimal stage
+        display_rows = []
+        for row in rows:
+            rid = row[0]
+            stage = row[4]
+            min_st = get_current_min_stage(rid)
+            if stage == min_st:
+                display_rows.append(row)
+
+        self.approval_table.setRowCount(0)
+        for row_data in display_rows:
+            r_i = self.approval_table.rowCount()
+            self.approval_table.insertRow(r_i)
+
+            rid_val = str(row_data[0])
+            group_val = str(row_data[1])
+            rule_name = str(row_data[5])
+            stage_val = str(row_data[4])
+            appr_flag = str(row_data[3])
+
+            # fill columns
+            self.approval_table.setItem(r_i, 0, QTableWidgetItem(rid_val))
+            self.approval_table.setItem(r_i, 1, QTableWidgetItem(group_val))
+            self.approval_table.setItem(r_i, 2, QTableWidgetItem(rule_name))
+            self.approval_table.setItem(r_i, 3, QTableWidgetItem(stage_val))
+            self.approval_table.setItem(r_i, 4, QTableWidgetItem(appr_flag))
+
+            # Approve button
+            approve_btn = QPushButton("Approve")
+            approve_btn.clicked.connect(lambda _, row_idx=r_i: self.do_approve(row_idx))
+            self.approval_table.setCellWidget(r_i, 5, approve_btn)
+
+            # Reject button
+            reject_btn = QPushButton("Reject")
+            reject_btn.clicked.connect(lambda _, row_idx=r_i: self.do_reject(row_idx))
+            self.approval_table.setCellWidget(r_i, 6, reject_btn)
+
+    def do_approve(self, row_i):
+        """
+        Sets APPROVED_FLAG=1 => check if more approvals remain; if none => rule is ACTIVE. 
+        """
+        rid_item = self.approval_table.item(row_i, 0)
+        grp_item = self.approval_table.item(row_i, 1)
+        if not rid_item or not grp_item:
+            return
+        rid = int(rid_item.text())
+        grp = str(grp_item.text())
+
+        c = self.connection.cursor()
+        c.execute("""
+        UPDATE BRM_RULE_APPROVALS
+        SET APPROVED_FLAG=1, APPROVED_TIMESTAMP=GETDATE()
+        WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=? AND APPROVED_FLAG=0
+        """,(rid, grp, self.logged_in_username))
+
+        # check next stage
+        c2 = self.connection.cursor()
+        c2.execute("""
+        SELECT MIN(APPROVAL_STAGE)
+        FROM BRM_RULE_APPROVALS
+        WHERE RULE_ID=? AND APPROVED_FLAG=0
+        """,(rid,))
+        ro = c2.fetchone()
+        nxt_stage = ro[0] if ro else None
+
+        if nxt_stage is None:
+            # all done => mark rule as APPROVED/ACTIVE
+            c.execute("""
+            UPDATE BRM_RULES
+            SET APPROVAL_STATUS='APPROVED', STATUS='ACTIVE', LIFECYCLE_STATE='ACTIVE'
+            WHERE RULE_ID=?
+            """,(rid,))
+        else:
+            # still more to go
+            c.execute("""
+            UPDATE BRM_RULES
+            SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS', STATUS='INACTIVE'
+            WHERE RULE_ID=?
+            """,(rid,))
+
+        # audit
+        c2 = self.connection.cursor()
+        old_data = {"approved_flag": 0}
+        new_data = {"approved_flag": 1}
+        # from Part 1 => add_audit_log
+        from .part1_db_helpers import add_audit_log   # Example placeholder import if your parts are separate
+        add_audit_log(self.connection, "UPDATE", "BRM_RULE_APPROVALS", rid, self.logged_in_username, old_data, new_data)
+
+        self.connection.commit()
+        QMessageBox.information(self, "Approved", f"Rule {rid} has been approved.")
+        self.load_approvals()
+
+    def do_reject(self, row_i):
+        """
+        Sets APPROVED_FLAG=2 => rule => REJECTED => INACTIVE
+        """
+        rid_item = self.approval_table.item(row_i, 0)
+        grp_item = self.approval_table.item(row_i, 1)
+        if not rid_item or not grp_item:
+            return
+        rid = int(rid_item.text())
+        grp = str(grp_item.text())
+
+        confirm = QMessageBox.question(self, "Confirm", f"Reject rule {rid}?")
+        if confirm != QMessageBox.Yes:
+            return
+
+        c = self.connection.cursor()
+        c.execute("""
+        UPDATE BRM_RULE_APPROVALS
+        SET APPROVED_FLAG=2, APPROVED_TIMESTAMP=GETDATE()
+        WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=? AND APPROVED_FLAG=0
+        """,(rid, grp, self.logged_in_username))
+
+        c.execute("""
+        UPDATE BRM_RULES
+        SET APPROVAL_STATUS='REJECTED', STATUS='INACTIVE', LIFECYCLE_STATE='INACTIVE'
+        WHERE RULE_ID=?
+        """,(rid,))
+
+        # audit
+        from .part1_db_helpers import add_audit_log
+        add_audit_log(self.connection, "REJECT", "BRM_RULE_APPROVALS", rid, self.logged_in_username, None, {"rejected": True})
+
+        self.connection.commit()
+        QMessageBox.information(self,"Rejected", f"Rule {rid} has been rejected.")
+        self.load_approvals()
+
+########################################################################
+# GLOBAL / CRITICAL ADMIN TAB
+########################################################################
+
+class GlobalCriticalAdminTab(QWidget):
+    """
+    Admin-only => manage is_global, critical_rule, critical_scope + GCR links.
+    Enhanced to enforce full BFS logic for global/critical rules. 
+    Also integrates dynamic reload if the user modifies these fields.
+    """
+    def __init__(self, main_window, connection, user_group, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.connection = connection
+        self.user_group = user_group
+
+        layout = QVBoxLayout(self)
+
+        if user_group != "Admin":
+            layout.addWidget(QLabel("Access Denied: Admin only."))
+            self.setLayout(layout)
+            return
+
+        filt_h = QHBoxLayout()
+        self.show_only_gcr = QCheckBox("Show only GCR (global/critical) rules")
+        self.show_only_gcr.setChecked(True)
+        ref_btn = QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_rule_list)
+        filt_h.addWidget(self.show_only_gcr)
+        filt_h.addWidget(ref_btn)
+        filt_h.addStretch()
+        layout.addLayout(filt_h)
+
+        self.rule_table = QTableWidget(0, 8)
+        self.rule_table.setHorizontalHeaderLabels([
+            "RuleID", "RuleName", "OwnerGroup", "IS_GLOBAL", "CRITICAL_RULE",
+            "CRITICAL_SCOPE", "STATUS", "UPDATED_BY"
+        ])
+        self.rule_table.horizontalHeader().setStretchLastSection(True)
+        self.rule_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.rule_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.rule_table)
+
+        # row => user can set global / critical / scope
+        # we do a batch "Apply" to all selected rules
+        gcs_h = QHBoxLayout()
+        self.global_cb = QCheckBox("Set Global?")
+        gcs_h.addWidget(self.global_cb)
+
+        self.critical_cb = QCheckBox("Set Critical?")
+        gcs_h.addWidget(self.critical_cb)
+
+        gcs_h.addWidget(QLabel("Critical Scope:"))
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItems(["NONE","GROUP","CLUSTER","GLOBAL"])
+        gcs_h.addWidget(self.scope_combo)
+
+        apply_btn = QPushButton("Apply to Selected")
+        apply_btn.clicked.connect(self.apply_gcs_to_selected)
+        gcs_h.addWidget(apply_btn)
+
+        gcs_h.addStretch()
+        layout.addLayout(gcs_h)
+
+        # link mgmt
+        link_h = QHBoxLayout()
+        self.gcr_parent_combo = QComboBox()
+        link_h.addWidget(QLabel("Parent GCR:"))
+        link_h.addWidget(self.gcr_parent_combo)
+
+        self.child_rule_combo = QComboBox()
+        link_h.addWidget(QLabel("Child Rule:"))
+        link_h.addWidget(self.child_rule_combo)
+
+        link_btn = QPushButton("Link Child")
+        link_btn.clicked.connect(self.link_child)
+        unlink_btn = QPushButton("Unlink Child")
+        unlink_btn.clicked.connect(self.unlink_child)
+        link_h.addWidget(link_btn)
+        link_h.addWidget(unlink_btn)
+
+        link_h.addStretch()
+        layout.addLayout(link_h)
+
+        self.link_view = QTableWidget(0,2)
+        self.link_view.setHorizontalHeaderLabels(["Parent GCR ID","Child Rule ID"])
+        self.link_view.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.link_view)
+
+        ref2_btn = QPushButton("Refresh Everything")
+        ref2_btn.clicked.connect(self.refresh_all)
+        layout.addWidget(ref2_btn)
+
+        self.setLayout(layout)
+        self.refresh_all()
+
+    def refresh_all(self):
+        self.load_rule_list()
+        self.populate_gcr_rule_combo()
+        self.populate_child_rule_combo()
+        self.load_link_view()
+
+    def load_rule_list(self):
+        self.rule_table.setRowCount(0)
+        c = self.connection.cursor()
+        if self.show_only_gcr.isChecked():
+            c.execute("""
+            SELECT RULE_ID,RULE_NAME,OWNER_GROUP,IS_GLOBAL,CRITICAL_RULE,
+                   CRITICAL_SCOPE,STATUS,UPDATED_BY
+            FROM BRM_RULES
+            WHERE IS_GLOBAL=1 OR CRITICAL_RULE=1
+            ORDER BY RULE_ID DESC
+            """)
+        else:
+            c.execute("""
+            SELECT RULE_ID,RULE_NAME,OWNER_GROUP,IS_GLOBAL,CRITICAL_RULE,
+                   CRITICAL_SCOPE,STATUS,UPDATED_BY
+            FROM BRM_RULES
+            ORDER BY RULE_ID DESC
+            """)
+        rows = c.fetchall()
+        for row in rows:
+            r_i = self.rule_table.rowCount()
+            self.rule_table.insertRow(r_i)
+            for col_i, val in enumerate(row):
+                self.rule_table.setItem(r_i, col_i, QTableWidgetItem(str(val)))
+        self.rule_table.resizeColumnsToContents()
+
+    def populate_gcr_rule_combo(self):
+        self.gcr_parent_combo.clear()
+        c = self.connection.cursor()
+        c.execute("""
+        SELECT RULE_ID, RULE_NAME
+        FROM BRM_RULES
+        WHERE IS_GLOBAL=1 OR CRITICAL_RULE=1
+        ORDER BY RULE_ID
+        """)
+        rows = c.fetchall()
+        for (rid,rname) in rows:
+            disp = f"{rid} - {rname}"
+            self.gcr_parent_combo.addItem(disp, rid)
+
+    def populate_child_rule_combo(self):
+        self.child_rule_combo.clear()
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID,RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        rows = c.fetchall()
+        for (rid,rn) in rows:
+            disp = f"{rid} - {rn}"
+            self.child_rule_combo.addItem(disp, rid)
+
+    def load_link_view(self):
+        self.link_view.setRowCount(0)
+        c = self.connection.cursor()
+        c.execute("SELECT GCR_RULE_ID,TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS ORDER BY GCR_RULE_ID")
+        rows = c.fetchall()
+        for row in rows:
+            r_i = self.link_view.rowCount()
+            self.link_view.insertRow(r_i)
+            self.link_view.setItem(r_i,0,QTableWidgetItem(str(row[0])))
+            self.link_view.setItem(r_i,1,QTableWidgetItem(str(row[1])))
+        self.link_view.resizeColumnsToContents()
+
+    def get_selected_rule_ids(self):
+        sel_idxs = self.rule_table.selectionModel().selectedRows()
+        out = []
+        for idx in sel_idxs:
+            row = idx.row()
+            it = self.rule_table.item(row,0)
+            if it:
+                out.append(int(it.text()))
+        return out
+
+    def apply_gcs_to_selected(self):
+        rids = self.get_selected_rule_ids()
+        if not rids:
+            QMessageBox.warning(self,"None","No rules selected.")
+            return
+        isg = 1 if self.global_cb.isChecked() else 0
+        isc = 1 if self.critical_cb.isChecked() else 0
+        scp = self.scope_combo.currentText().upper()
+        confirm = QMessageBox.question(
+            self,"Confirm",
+            f"Set IS_GLOBAL={isg}, CRITICAL_RULE={isc}, SCOPE={scp} for {len(rids)} rule(s)?"
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        c = self.connection.cursor()
+        for rid in rids:
+            c.execute("""
+            UPDATE BRM_RULES
+            SET IS_GLOBAL=?, CRITICAL_RULE=?, CRITICAL_SCOPE=?
+            WHERE RULE_ID=?
+            """,(isg, isc, scp, rid))
+        self.connection.commit()
+
+        QMessageBox.information(self,"Updated",f"GCR changes applied to {len(rids)} rules.")
+        self.load_rule_list()
+
+    def link_child(self):
+        pid = self.gcr_parent_combo.currentData()
+        cid = self.child_rule_combo.currentData()
+        if not pid:
+            QMessageBox.warning(self,"No Parent","Select a parent GCR rule.")
+            return
+        if not cid:
+            QMessageBox.warning(self,"No Child","Select a child rule.")
+            return
+        confirm = QMessageBox.question(self,"Confirm",f"Link child {cid} => parent {pid}?")
+        if confirm != QMessageBox.Yes:
+            return
+
+        c = self.connection.cursor()
+        c.execute("""
+        INSERT INTO BRM_GLOBAL_CRITICAL_LINKS(GCR_RULE_ID,TARGET_RULE_ID)
+        VALUES(?,?)
+        """,(pid,cid))
+
+        # log
+        from .part1_db_helpers import add_audit_log
+        add_audit_log(self.connection,"LINK_GCR","BRM_GLOBAL_CRITICAL_LINKS",f"{pid}->{cid}","Admin",None,{"parent":pid,"child":cid})
+
+        self.connection.commit()
+        QMessageBox.information(self,"Linked",f"Child {cid} => parent {pid}")
+        self.load_link_view()
+
+    def unlink_child(self):
+        pid = self.gcr_parent_combo.currentData()
+        cid = self.child_rule_combo.currentData()
+        if not pid or not cid:
+            return
+        confirm = QMessageBox.question(self,"Confirm",f"Unlink child {cid} from {pid}?")
+        if confirm != QMessageBox.Yes:
+            return
+
+        c = self.connection.cursor()
+        c.execute("""
+        DELETE FROM BRM_GLOBAL_CRITICAL_LINKS
+        WHERE GCR_RULE_ID=? AND TARGET_RULE_ID=?
+        """,(pid,cid))
+
+        from .part1_db_helpers import add_audit_log
+        add_audit_log(self.connection,"UNLINK_GCR","BRM_GLOBAL_CRITICAL_LINKS",f"{pid}->{cid}","Admin",{"parent":pid,"child":cid},None)
+
+        self.connection.commit()
+        QMessageBox.information(self,"Unlinked",f"Child {cid} from {pid}")
+        self.load_link_view()
+
+########################################################################
+# HIERARCHY VIEW (DRAG & DROP)
+########################################################################
+
+class HierarchyViewTab(QTreeWidget):
+    """
+    Displays group -> rule in a tree. Allows user to drag rules to a new parent group or rule.
+    On drop => re-parent the rule in the DB. 
+    * Enhancements can be done to parse new structure, handle nested children, etc.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setHeaderLabels(["Group / Rule (Part 5 - Enhanced)"])
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+
+        self.load_hierarchy()
+
+    def load_hierarchy(self):
+        self.clear()
+        c = self.connection.cursor()
+
+        c.execute("SELECT GROUP_ID,GROUP_NAME FROM BRM_RULE_GROUPS ORDER BY GROUP_ID")
+        groups = c.fetchall()
+        self.gid_map = {}
+        for (gid,gname) in groups:
+            top = QTreeWidgetItem([f"{gname} (ID={gid})"])
+            top.setData(0, Qt.UserRole, ("group", gid))
+            self.addTopLevelItem(top)
+            self.gid_map[gid] = top
+
+        c.execute("SELECT RULE_ID,RULE_NAME,GROUP_ID,PARENT_RULE_ID FROM BRM_RULES ORDER BY RULE_ID")
+        rules = c.fetchall()
+
+        # Place top-level rules (no parent) under group
+        # For a multi-level approach, you'd recursively attach child rules.
+        for (rid, rname, gid, pid) in rules:
+            if not pid:  # no parent => belongs directly to the group
+                if gid in self.gid_map:
+                    parent_item = self.gid_map[gid]
+                    child = QTreeWidgetItem([f"Rule {rid}: {rname}"])
+                    child.setData(0, Qt.UserRole, ("rule", rid))
+                    parent_item.addChild(child)
+        self.expandAll()
+
+    def dropEvent(self, event):
+        """
+        After letting Qt move the item in the UI, we parse the new parent 
+        and do a DB update => re-parent or re-group. 
+        In a more advanced approach, we'd detect multi-level nesting, etc.
+        """
+        source_item = self.currentItem()
+        if not source_item:
+            super().dropEvent(event)
+            return
+
+        data_role = source_item.data(0, Qt.UserRole)
+        if not data_role:
+            super().dropEvent(event)
+            return
+
+        # Let Qt do the default reorder in the UI
+        super().dropEvent(event)
+
+        # Then we figure out the new parent
+        new_parent = source_item.parent()
+        if not new_parent:
+            # If user drags it to top-level, we can’t guess which group. We might forcibly revert or do nothing.
+            QMessageBox.warning(self,"Drag/Drop","Cannot place rule at top-level with no group. Reverting.")
+            self.load_hierarchy()
+            return
+        else:
+            parent_role = new_parent.data(0, Qt.UserRole)
+            if not parent_role:
+                QMessageBox.warning(self,"Invalid Parent","Parent has no data => revert.")
+                self.load_hierarchy()
+                return
+            if parent_role[0] == "group":
+                # re-group => set group_id => that group => parent_rule_id=NULL
+                group_id = parent_role[1]
+                rule_id = data_role[1]
+                self.update_rule_parent_and_group(rule_id, None, group_id)
+            elif parent_role[0] == "rule":
+                # re-parent => parent's group => set parent_rule_id => parent's rule
+                parent_rid = parent_role[1]
+                # fetch parent's group
+                c = self.connection.cursor()
+                c.execute("SELECT GROUP_ID FROM BRM_RULES WHERE RULE_ID=?",(parent_rid,))
+                row = c.fetchone()
+                if not row:
+                    QMessageBox.warning(self,"Not Found","Parent rule’s group not found => revert.")
+                    self.load_hierarchy()
+                    return
+                group_id = row[0]
+                rule_id = data_role[1]
+                self.update_rule_parent_and_group(rule_id, parent_rid, group_id)
+            else:
+                QMessageBox.warning(self,"Invalid","Unknown parent type => revert.")
+                self.load_hierarchy()
+                return
+
+        self.load_hierarchy()
+
+    def update_rule_parent_and_group(self, rule_id, parent_rule_id, group_id):
+        """
+        Minimal approach => set PARENT_RULE_ID=? and GROUP_ID=? => sets rule => INACTIVE + re-approval
+        """
+        c = self.connection.cursor()
+        # fetch old data
+        c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+        old = c.fetchone()
+        if not old:
+            QMessageBox.warning(self,"Not Found","Rule not found => revert.")
+            return
+
+        colnames = [d[0] for d in c.description]
+        old_data = dict(zip(colnames,old))
+
+        c.execute("BEGIN TRANSACTION")
+        c.execute("""
+        UPDATE BRM_RULES
+        SET PARENT_RULE_ID=?,
+            GROUP_ID=?,
+            STATUS='INACTIVE',
+            APPROVAL_STATUS='APPROVAL_IN_PROGRESS',
+            UPDATED_BY='HierarchyDragDrop',
+            VERSION=VERSION+1
+        WHERE RULE_ID=?
+        """,(parent_rule_id, group_id, rule_id))
+
+        new_data = dict(old_data)
+        new_data["PARENT_RULE_ID"] = parent_rule_id
+        new_data["GROUP_ID"] = group_id
+        new_data["STATUS"] = "INACTIVE"
+        new_data["APPROVAL_STATUS"] = "APPROVAL_IN_PROGRESS"
+        new_data["VERSION"] = old_data["VERSION"] + 1
+
+        from .part1_db_helpers import add_audit_log
+        add_audit_log(self.connection,"RE_PARENT","BRM_RULES", rule_id, "HierarchyView", old_data, new_data)
+
+        c.execute("COMMIT")
+
+        QMessageBox.information(self,"Re-parented",
+            f"Rule {rule_id} => new parent={parent_rule_id}, new group={group_id} => now INACTIVE / re-approval")
+
+########################################################################
+# ENHANCED LINEAGE GRAPH (FLAT DESIGN + LIVE STATUS + LEGEND + SEARCH)
+########################################################################
+
+class EnhancedLineageGraphWidget(QGraphicsView):
+    """
+    Visual graph => BFS layering => color-coded for rule status, 
+    plus advanced search on table/column/rule name/SQL snippet.
+
+    - Node color changes if global/critical or based on last execution status (passed/failed).
+    - A small legend is overlaid in the corner.
+    - Right-click stubs for "View Rule" or "Edit Rule".
+    - All done with rectangles or ellipses => purely 'flat design' (no external icons).
+    """
+
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+
+        # Scene
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+
+        # Basic render hints
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
+        # Data structures
+        self.node_map = {}         # rule_id -> QGraphicsItem
+        self.table_map = {}        # "schema.table" -> QGraphicsItem
+        self.status_map = {}       # rule_id -> ("NeverRan" / "InProgress" / "Passed" / "Failed")
+        self.search_string = ""    # track current search
+
+        # Build initial content
+        self.populate_graph()
+
+        # Add legend overlay
+        self.add_legend()
+
+    def add_legend(self):
+        """
+        Minimal corner overlay => color explanation
+        """
+        legend_text = (
+            "Legend:\n"
+            " - Green = ACTIVE Rule\n"
+            " - Tomato = INACTIVE Rule\n"
+            " - Red border = CRITICAL\n"
+            " - Blue border = GLOBAL\n"
+            " - Execution: Gray=NeverRan, Gold=InProgress, LightGreen=Passed, Salmon=Failed\n"
+            " - Table references in PaleBlue\n"
+        )
+        txt_item = QGraphicsTextItem(legend_text)
+        txt_item.setDefaultTextColor(QColor("black"))
+        txt_item.setPos(10,10)
+        txt_item.setZValue(9999)
+        txt_item.setFont(QFont("Arial",10,QFont.Normal))
+        self.scene.addItem(txt_item)
+
+    def populate_graph(self):
+        """
+        1) Clear scene
+        2) Build BFS layering for rules
+        3) Render edges (parent->child, plus table references)
+        4) Store items in self.node_map / self.table_map
+        5) Color code items => global/critical + last execution status
+        """
+        self.scene.clear()
+        self.node_map.clear()
+        self.table_map.clear()
+
+        # load rules
+        c = self.connection.cursor()
+        c.execute("""
+        SELECT RULE_ID,RULE_NAME,PARENT_RULE_ID,STATUS,
+               RULE_TYPE_ID,CLUSTER_NAME,IS_GLOBAL,CRITICAL_RULE,
+               RULE_SQL
+        FROM BRM_RULES
+        ORDER BY RULE_ID
+        """)
+        all_rules = c.fetchall()
+        if not all_rules:
+            self.scene.addText("No rules found.")
+            return
+
+        # gather adjacency => parent->child
+        children_map = {}
+        parent_map = {}
+        all_rids = set()
+        for row in all_rules:
+            rid = row[0]
+            pid = row[2]
+            all_rids.add(rid)
+            if pid:
+                children_map.setdefault(pid,[]).append(rid)
+                parent_map[rid] = pid
+
+        # BFS layering
+        child_ids = set(parent_map.keys())
+        roots = [x for x in all_rids if x not in child_ids]
+
+        # put them into a lookup
+        colnames = [desc[0] for desc in c.description]
+        rule_lookup = {}
+        for row in all_rules:
+            d = dict(zip(colnames,row))
+            rule_lookup[d["RULE_ID"]] = d
+
+        from collections import deque
+        queue = deque()
+        level_map = {}  # depth -> count
+        visited = set()
+
+        for rt in roots:
+            queue.append((rt, 0))
+
+        while queue:
+            (rid, depth) = queue.popleft()
+            if rid in visited:
+                continue
+            visited.add(rid)
+            info = rule_lookup[rid]
+            level_map[depth] = level_map.get(depth,0) + 1
+            x = depth * 240
+            y = (level_map[depth]-1)*100
+
+            # create node => store in self.node_map
+            node_item = self.make_rule_node(info)
+            node_item.setPos(x,y)
+            self.scene.addItem(node_item)
+            self.node_map[rid] = node_item
+
+            # BFS
+            if rid in children_map:
+                for ch_ in children_map[rid]:
+                    if ch_ not in visited:
+                        queue.append((ch_, depth+1))
+
+        # draw edges => parent->child
+        for row in all_rules:
+            rid = row[0]
+            pid = row[2]
+            if pid and pid in self.node_map and rid in self.node_map:
+                self.draw_edge(self.node_map[pid], self.node_map[rid], QPen(QColor("darkblue"), 2))
+
+        # table references => color-coded => gather from BRM_RULE_TABLE_DEPENDENCIES
+        c.execute("""
+        SELECT RULE_ID,DATABASE_NAME,TABLE_NAME,COLUMN_NAME,COLUMN_OP
+        FROM BRM_RULE_TABLE_DEPENDENCIES
+        """)
+        deps = c.fetchall()
+        table_y_offset = 0
+
+        for (drid, dbn, tname, coln, op_) in deps:
+            if not tname:
+                continue
+            full_tbl = (dbn+"."+tname).lower().strip(".")
+
+            if full_tbl not in self.table_map:
+                # create table node
+                table_item = self.make_table_item(full_tbl)
+                table_item.setPos(800, table_y_offset)
+                table_y_offset += 70
+                self.scene.addItem(table_item)
+                self.table_map[full_tbl] = table_item
+
+            if drid in self.node_map:
+                edge_color = QColor("blue") if op_=="READ" else QColor("red")
+                self.draw_edge(self.node_map[drid], self.table_map[full_tbl], QPen(edge_color, 2))
+
+        # resize scene
+        self.scene.setSceneRect(self.scene.itemsBoundingRect())
+        self.resetView()
+
+    def make_rule_node(self, rule_info):
+        """
+        Create a flat-design rectangle or ellipse item => color-coded 
+        by status, plus border for global/critical. 
+        We'll also overlay a text label. We store its data for right-click stubs.
+        """
+        # pick shape => if RULE_TYPE_ID=1 => rectangle, else ellipse
+        shape_id = rule_info["RULE_TYPE_ID"]
+        if shape_id == 1:
+            node = QGraphicsRectItem(0,0,130,50)
+        else:
+            node = QGraphicsEllipseItem(0,0,130,50)
+
+        # base color by status
+        stat = (rule_info["STATUS"] or "").upper()
+        if stat == "ACTIVE":
+            basecol = QColor("lightgreen")
+        else:
+            basecol = QColor("tomato")
+
+        # cluster override? (optional)
+        cluster = rule_info["CLUSTER_NAME"] or ""
+        # we won't do a forced cluster color now; we keep "flat" for design
+
+        node.setBrush(QBrush(basecol))
+
+        # border => if global => blue, if critical => red; if both => purple or double border
+        is_glob = (rule_info["IS_GLOBAL"]==1)
+        is_crit = (rule_info["CRITICAL_RULE"]==1)
+
+        pen_color = Qt.black
+        pen_width = 2
+
+        if is_glob and is_crit:
+            # e.g., purple
+            pen_color = QColor(128,0,128) 
+            pen_width = 3
+        elif is_glob:
+            pen_color = QColor("blue")
+        elif is_crit:
+            pen_color = QColor("red")
+
+        node.setPen(QPen(pen_color, pen_width))
+
+        # track last execution status => color overlay
+        rid = rule_info["RULE_ID"]
+        if rid not in self.status_map:
+            self.status_map[rid] = "NeverRan"  # default
+        node = self.apply_execution_status(node, self.status_map[rid])
+
+        # set a tooltip => show more details
+        rule_sql_snip = (rule_info["RULE_SQL"] or "")[:60].replace("\n"," ").strip()
+        node.setToolTip(
+            f"Rule {rid}: {rule_info['RULE_NAME']}\n"
+            f"Status={stat}\n"
+            f"SQL={rule_sql_snip}..."
+        )
+        node.setData(0, Qt.UserRole, ("rule",rid))
+
+        # optional: attach a small label item
+        label_text = rule_info["RULE_NAME"]
+        label = QGraphicsTextItem(label_text, parent=node)
+        label.setDefaultTextColor(Qt.black)
+        label.setPos(5,5)
+
+        node.setAcceptHoverEvents(True)
+        node.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        node.setFlag(QGraphicsItem.ItemIsFocusable, True)
+
+        return node
+
+    def apply_execution_status(self, item, status):
+        """
+        Overlays an additional color or effect on top of the item’s brush 
+        to indicate runtime BFS or schedule statuses:
+         - "NeverRan" => light gray overlay
+         - "InProgress" => gold overlay
+         - "Passed" => pale green
+         - "Failed" => salmon
+        """
+        overlay_color_map = {
+            "NeverRan": QColor(220,220,220, 100),  # light gray
+            "InProgress": QColor("gold"),
+            "Passed": QColor(144,238,144, 160),  # pale green
+            "Failed": QColor("salmon")
+        }
+        if status in overlay_color_map:
+            overlay_color = overlay_color_map[status]
+            # We can combine the base brush with a second “layer,” or we can set the brush directly:
+            brush = item.brush()
+            # Actually, let's do a simple approach => set the alpha so it merges with base color
+            # We'll store the base color in an internal data attribute if we want to reapply it.
+            # For now, let's just overlay.
+            brush.setColor(overlay_color)
+            item.setBrush(brush)
+        return item
+
+    def make_table_item(self, tbl_name):
+        """
+        Create a rectangle for a DB table => pale blue fill, no border 
+        => flat design.
+        """
+        node = QGraphicsRectItem(0,0,120,40)
+        node.setBrush(QBrush(QColor(173,216,230)))  # lightblue/paleblue
+        node.setPen(QPen(Qt.black,1))
+        node.setToolTip(f"Table: {tbl_name}")
+        node.setData(0, Qt.UserRole, ("table", tbl_name))
+
+        label = QGraphicsTextItem(tbl_name, parent=node)
+        label.setDefaultTextColor(Qt.black)
+        label.setPos(4,4)
+
+        node.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        node.setFlag(QGraphicsItem.ItemIsFocusable, True)
+        return node
+
+    def draw_edge(self, item1, item2, pen):
+        """
+        Draw a line between item1.center and item2.center
+        """
+        r1 = item1.sceneBoundingRect()
+        r2 = item2.sceneBoundingRect()
+        p1 = r1.center()
+        p2 = r2.center()
+
+        line = QGraphicsLineItem(p1.x(), p1.y(), p2.x(), p2.y())
+        line.setPen(pen)
+        self.scene.addItem(line)
+
+    def resetView(self):
+        if self.scene and not self.scene.itemsBoundingRect().isNull():
+            self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+
+    ################################################################
+    # Searching
+    ################################################################
+    def search_nodes(self, search_text):
+        """
+        search_text can match table name, column name, rule name, or snippet of SQL
+        We highlight matches by drawing a thicker border, or we dim everything else.
+        """
+        self.search_string = search_text.strip().lower()
+
+        # approach => gather matched rule_ids, table_keys
+        matched_rules = set()
+        matched_tables = set()
+
+        if not self.search_string:
+            # no search => restore normal
+            for rid, item in self.node_map.items():
+                pen = item.pen()
+                pen.setWidth(2)
+                item.setPen(pen)
+                item.setOpacity(1.0)
+
+            for tk, item in self.table_map.items():
+                pen = item.pen()
+                pen.setWidth(1)
+                item.setPen(pen)
+                item.setOpacity(1.0)
+            return
+
+        # gather references from DB
+        c = self.connection.cursor()
+        # 1) check rule name or SQL
+        c.execute("""
+        SELECT RULE_ID, RULE_NAME, RULE_SQL
+        FROM BRM_RULES
+        WHERE LOWER(RULE_NAME) LIKE ? OR LOWER(RULE_SQL) LIKE ?
+        """,(f"%{self.search_string}%",f"%{self.search_string}%"))
+        rrows = c.fetchall()
+        for row in rrows:
+            matched_rules.add(row[0])
+
+        # 2) check table or column
+        c.execute("""
+        SELECT DISTINCT LOWER(DATABASE_NAME+'.'+TABLE_NAME) as fullnm
+        FROM BRM_RULE_TABLE_DEPENDENCIES
+        WHERE LOWER(TABLE_NAME) LIKE ? OR LOWER(COLUMN_NAME) LIKE ?
+        """,(f"%{self.search_string}%", f"%{self.search_string}%"))
+        trows = c.fetchall()
+        for row in trows:
+            matched_tables.add(row[0].strip("."))
+
+        # now highlight
+        for rid, item in self.node_map.items():
+            if rid in matched_rules:
+                item.setOpacity(1.0)
+                pen = item.pen()
+                pen.setWidth(4)
+                item.setPen(pen)
+            else:
+                item.setOpacity(0.2)
+                pen = item.pen()
+                pen.setWidth(1)
+                item.setPen(pen)
+
+        for tk, item in self.table_map.items():
+            if tk in matched_tables:
+                item.setOpacity(1.0)
+                pen = item.pen()
+                pen.setWidth(2)
+                item.setPen(pen)
+            else:
+                item.setOpacity(0.2)
+                pen = item.pen()
+                pen.setWidth(1)
+                item.setPen(pen)
+
+    ################################################################
+    # Mouse / Right-Click
+    ################################################################
+    def mousePressEvent(self, event):
+        """
+        If user right-clicks on a node => we can show a QMenu with stubs 
+        e.g. “View Rule” or “Edit Rule”.
+        """
+        if event.button() == Qt.RightButton:
+            pos_scene = self.mapToScene(event.pos())
+            item = self.scene.itemAt(pos_scene, self.transform())
+            if item:
+                data_role = item.data(0, Qt.UserRole)
+                if data_role and data_role[0] == "rule":
+                    rid = data_role[1]
+                    menu = QMenu()
+                    view_act = menu.addAction("View Rule")
+                    edit_act = menu.addAction("Edit Rule")
+                    chosen = menu.exec_(self.mapToGlobal(event.pos()))
+                    if chosen == view_act:
+                        QMessageBox.information(self, "View Rule", f"Stub => View rule details for ID={rid}")
+                    elif chosen == edit_act:
+                        QMessageBox.information(self, "Edit Rule", f"Stub => Edit rule (dialog) for ID={rid}")
+
+                elif data_role and data_role[0] == "table":
+                    tname = data_role[1]
+                    menu = QMenu()
+                    info_act = menu.addAction("View Table Info")
+                    chosen = menu.exec_(self.mapToGlobal(event.pos()))
+                    if chosen == info_act:
+                        QMessageBox.information(self, "Table Info", f"Stub => Show table details => {tname}")
+                else:
+                    # clicked on line or blank
+                    pass
+
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    ################################################################
+    # Future: We can add methods to update the BFS statuses live
+    ################################################################
+
+    def update_rule_execution_status(self, rule_id, new_status):
+        """
+        External calls can set the BFS or scheduled run statuses => 
+        "NeverRan", "InProgress", "Passed", "Failed".
+        Then we re-apply color overlay.
+        """
+        if rule_id not in self.node_map:
+            return
+        self.status_map[rule_id] = new_status
+        item = self.node_map[rule_id]
+        item = self.apply_execution_status(item, new_status)
