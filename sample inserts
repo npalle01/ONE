@@ -1,279 +1,287 @@
-------------------------------------------------------------------------------
--- 1) USERS: Create a few users (including an 'Admin')
-------------------------------------------------------------------------------
-INSERT INTO dbo.USERS (USERNAME, [PASSWORD], USER_GROUP)
-VALUES
-('admin','adminpass','Admin'),
-('user1','user1pass','BG1'),
-('user2','user2pass','BG2'),
-('john','john123','BG1');
+Below is a practical testing scenario for the BRM Tool, including a set of example rules (with actual T-SQL statements) that exercise inserts, updates, data quality checks, BFS chaining, conflicts, and decision tables. We also provide sample data (in Customers and Archive) plus data validations you can insert to see how the tool handles these cases.
+
+Use these as a comprehensive suite to walk through add_rule, update_rule, BFS execution, multi-step approvals, data validations, conflict handling, scheduling, etc.
+
+1) Sample Database Tables & Test Data
+
+You’ll need at least two user-facing tables to see real data movement:
+	1.	Customers (the primary table we reference)
+	2.	Archive (where we might move or copy rows)
+
+Here’s a minimal script to create them plus some sample rows:
+
+-- 1) A Customers table for testing
+CREATE TABLE dbo.Customers(
+    CustomerID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    FirstName  VARCHAR(50) NOT NULL,
+    Age        INT         NOT NULL,
+    Score      INT         NOT NULL,
+    Tier       VARCHAR(20) NULL
+);
 GO
 
-------------------------------------------------------------------------------
--- 2) BUSINESS_GROUPS
-------------------------------------------------------------------------------
-INSERT INTO dbo.BUSINESS_GROUPS (GROUP_NAME, DESCRIPTION, EMAIL)
+INSERT INTO dbo.Customers (FirstName, Age, Score, Tier)
 VALUES
-('BG1','Main business group','bg1@example.com'),
-('BG2','Secondary business group','bg2@example.com'),
-('Admin','Administrator group','admin@example.com');
+('Alice',  17, 500,  'Silver'),
+('Bob',    20, 600,  'Silver'),
+('Carol',  25, 950,  'Gold'),
+('Dave',   -1, 700,  'Bronze'), -- negative age => test data quality
+('Eve',    45, 1200, 'Platinum');
 GO
 
-------------------------------------------------------------------------------
--- 3) GROUP_PERMISSIONS (optional example)
-------------------------------------------------------------------------------
-INSERT INTO dbo.GROUP_PERMISSIONS (GROUP_NAME, TARGET_TABLE)
-VALUES
-('BG1','dbo.SomeTable'),
-('BG2','dbo.ChildTable');
+-- 2) An Archive table
+CREATE TABLE dbo.Archive(
+    ArchiveID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    CustomerID INT NOT NULL,
+    Reason     VARCHAR(100),
+    LoggedDate DATETIME NOT NULL DEFAULT(GETDATE())
+);
 GO
 
-------------------------------------------------------------------------------
--- 4) BRM_RULE_TYPES
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULE_TYPES (RULE_TYPE_NAME)
-VALUES
-('Standard'),
-('Advanced'),
-('Lookup');
-GO
+Now you have:
+	•	Customers: Some have negative ages, some have high scores, etc.
+	•	Archive: Used by certain rules for data movement or logging.
 
-------------------------------------------------------------------------------
--- 5) BRM_RULE_GROUPS
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULE_GROUPS (GROUP_NAME, DESCRIPTION)
-VALUES
-('RG1','Sample rule group'),
-('RG2','Another sample group');
-GO
+2) Data Validations (to test data quality checks)
 
-------------------------------------------------------------------------------
--- 6) BRM_RULES
---   Some rules referencing above groups, with varied statuses/operation types
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULES (
-  GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
-  EFFECTIVE_START_DATE, EFFECTIVE_END_DATE, STATUS, VERSION,
-  CREATED_BY, DESCRIPTION, OPERATION_TYPE, BUSINESS_JUSTIFICATION,
-  CREATED_TIMESTAMP, UPDATED_BY, OWNER_GROUP, CLUSTER_NAME,
-  APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE,
-  CDC_TYPE, LIFECYCLE_STATE, DECISION_TABLE_ID
+We’ll add a few validations in DATA_VALIDATIONS. For example:
+
+INSERT INTO dbo.DATA_VALIDATIONS (
+    TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
 )
 VALUES
--- Rule #1
-(1, NULL, 1, 'Rule1_SimpleSelect', 
- 'SELECT 1;', 
- '2025-01-01', NULL, 'ACTIVE', 1,
- 'admin', 'Rule returning 1 => pass', 'SELECT', 'Test only', 
- GETDATE(), NULL, 'BG1', 'ClusterA',
- 'APPROVED', 0, 0, 'NONE', 'NONE', 'ACTIVE', NULL),
+('dbo.Customers', 'Age', 'NOT NULL', ''),
+('dbo.Customers', 'Age', 'RANGE', 'min=0,max=150'),
+('dbo.Customers', 'Score', 'RANGE', 'min=0,max=2000');
 
--- Rule #2
-(1, NULL, 2, 'Rule2_Insert',
- 'INSERT INTO SomeTable (Col) VALUES (1); SELECT 1;',
- '2025-01-01', NULL, 'INACTIVE', 1,
- 'admin', 'Sample rule doing an INSERT', 'INSERT', 'ETL Insert usage',
- GETDATE(), NULL, 'BG1', 'ClusterA',
- 'APPROVAL_IN_PROGRESS', 0, 1, 'GROUP', 'NONE', 'UNDER_APPROVAL', NULL),
+Meaning:
+	•	The first validation ensures Age is not null (already covered by the table schema, but the tool can re-check).
+	•	The second ensures Age is in the [0..150] range. Our data with Dave having Age=-1 should fail this.
+	•	The third ensures Score is between 0 and 2000 (all current sample rows should pass).
 
--- Rule #3
-(2, 1,   1, 'Rule3_ChildOfRule1',
- 'SELECT 0;', 
- '2025-02-01', NULL, 'ACTIVE', 2,
- 'user1','Child rule returning 0 => fail','SELECT','Test child rule',
- GETDATE(), 'admin','BG2','ClusterB',
- 'APPROVED', 0, 0, 'NONE','NONE','ACTIVE', NULL);
+When the tool executes or dry-runs certain rules referencing dbo.Customers, it’ll run these validations if configured.
+
+3) Sample Rules (BFS, Conflicts, Decision Table)
+
+Below are five example rules, each with specific goals:
+	1.	Rule 101: CheckNegativeAges
+	2.	Rule 102: MoveYoungCustomers
+	3.	Rule 103: UpdateGoldMembers
+	4.	Rule 104: DecisionTableRule
+	5.	Rule 105: ConflictExample
+
+We’ll show how they chain in BFS (101 → 102 → 103) plus a conflict (105) that references 102, and a decision table stub (104).
+
+3.1 Insert the Rules into BRM_RULES
+
+------------------------------------------------------------------------------
+-- 101) CheckNegativeAges
+--     BFS root. If any negative Age in Customers => FAIL => skip children.
+------------------------------------------------------------------------------
+INSERT INTO dbo.BRM_RULES(
+  GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
+  STATUS, VERSION, CREATED_BY, DESCRIPTION, OPERATION_TYPE,
+  BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP, UPDATED_BY, OWNER_GROUP,
+  CLUSTER_NAME, APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
+  CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE, DECISION_TABLE_ID
+)
+VALUES(
+  1,  -- assume group RG1 or any valid group
+  NULL,
+  1,  -- Standard
+  'CheckNegativeAges',
+  'SELECT CASE WHEN (SELECT COUNT(*) FROM dbo.Customers WHERE Age<0)=0 THEN 1 ELSE 0 END;',
+  'INACTIVE',
+  1,
+  'admin',
+  'Fails if negative Age is found in Customers',
+  'SELECT',
+  'Data quality check for Age >=0',
+  GETDATE(),
+  NULL,
+  'BG1',
+  'ClusterA',
+  'APPROVAL_IN_PROGRESS',
+  0,
+  1,  -- CRITICAL_RULE=1 => skip children if fail
+  'GROUP', -- if fail => skip children in BFS
+  'NONE',
+  'UNDER_APPROVAL',
+  NULL
+);
 GO
 
 ------------------------------------------------------------------------------
--- 7) BRM_RULE_TABLE_DEPENDENCIES
+-- 102) MoveYoungCustomers
+--     Child of 101. If 101 passes, we run an INSERT that moves all <18 to Archive
 ------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULE_TABLE_DEPENDENCIES 
-(RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP)
-VALUES
-(1, 'SampleDB','dbo.SomeTable','Col1','READ'),
-(2, 'SampleDB','dbo.SomeTable','Col','WRITE'),
-(3, 'SampleDB','dbo.ChildTable','ChildCol','READ');
+INSERT INTO dbo.BRM_RULES(
+  GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
+  STATUS, VERSION, CREATED_BY, DESCRIPTION, OPERATION_TYPE,
+  BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP, UPDATED_BY, OWNER_GROUP,
+  CLUSTER_NAME, APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
+  CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE, DECISION_TABLE_ID
+)
+VALUES(
+  1,
+  101,   -- parent => BFS chain
+  2,     -- advanced
+  'MoveYoungCustomers',
+  'INSERT INTO dbo.Archive(CustomerID,Reason) '+
+  'SELECT CustomerID, ''Under18'' FROM dbo.Customers WHERE Age<18; '+
+  'SELECT 1;',
+  'INACTIVE',
+  1,
+  'admin',
+  'Moves underage customers into Archive for compliance',
+  'INSERT',
+  'Example of data movement + BFS child',
+  GETDATE(),
+  NULL,
+  'BG1',
+  'ClusterA',
+  'APPROVAL_IN_PROGRESS',
+  0,
+  0,
+  'NONE',
+  'NONE',
+  'UNDER_APPROVAL',
+  NULL
+);
 GO
 
 ------------------------------------------------------------------------------
--- 8) BRM_AUDIT_LOG (example logs for rules #1 and #2)
+-- 103) UpdateGoldMembers
+--     Another child of 102 or same BFS chain? 
+--     Let's say parent=102 => BFS: 101->102->103
 ------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_AUDIT_LOG 
-(ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA)
-VALUES
-('INSERT','BRM_RULES','1','admin',NULL,'{ "RULE_NAME": "Rule1_SimpleSelect" }'),
-('INSERT','BRM_RULES','2','admin',NULL,'{ "RULE_NAME": "Rule2_Insert" }'),
-('UPDATE','BRM_RULES','2','admin','{ "STATUS": "INACTIVE" }','{ "STATUS": "ACTIVE" }');
+INSERT INTO dbo.BRM_RULES(
+  GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
+  STATUS, VERSION, CREATED_BY, DESCRIPTION, OPERATION_TYPE,
+  BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP, OWNER_GROUP,
+  APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
+  CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE
+)
+VALUES(
+  1,
+  102,
+  2,
+  'UpdateGoldMembers',
+  'UPDATE dbo.Customers SET Tier=''Gold'' WHERE Score>900; SELECT 1;',
+  'INACTIVE',1,'admin',
+  'Promote customers with Score>900 to Gold Tier',
+  'UPDATE',
+  'Simple BFS child => further data update',
+  GETDATE(),
+  'BG1',
+  'APPROVAL_IN_PROGRESS',
+  0,0,'NONE','NONE','UNDER_APPROVAL'
+);
 GO
 
 ------------------------------------------------------------------------------
--- 9) BRM_RULE_LINEAGE (optional example data)
+-- 104) DecisionTableRule
+--     No SQL => DECISION_TABLE_ID=1 => OPERATION_TYPE='DECISION_TABLE'
 ------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULE_LINEAGE (SOURCE_RULE_ID, TARGET_RULE_ID, RELATION_TYPE)
-VALUES
-(1, 3, 'Child'),
-(2, 3, 'GlobalCritical');
+INSERT INTO dbo.BRM_RULES(
+  GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
+  STATUS, VERSION, CREATED_BY, DESCRIPTION, OPERATION_TYPE,
+  BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP, OWNER_GROUP,
+  APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
+  CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE, DECISION_TABLE_ID
+)
+VALUES(
+  1,
+  NULL,
+  3, -- e.g. 'Lookup'
+  'DecisionTableRule',
+  '',   -- no SQL
+  'INACTIVE',
+  1,
+  'admin',
+  'Example rule that references a decision table rather than raw SQL',
+  'DECISION_TABLE',
+  'Use the DECISION_TABLES for logic',
+  GETDATE(),
+  'BG1',
+  'APPROVAL_IN_PROGRESS',
+  0,0,'NONE','NONE','UNDER_APPROVAL',
+  1   -- must exist in DECISION_TABLES
+);
 GO
 
 ------------------------------------------------------------------------------
--- 10) BRM_GROUP_BACKUPS (optional stub)
+-- 105) ConflictExample
+--     A rule that might conflict with MoveYoungCustomers (rule 102).
+--     For BFS demonstration. If 105 & 102 conflict, priority decides which runs first or if skip.
 ------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_GROUP_BACKUPS (GROUP_NAME, BACKUP_DATA)
-VALUES
-('BG1','{"backup":"some data"}');
+INSERT INTO dbo.BRM_RULES(
+  GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
+  STATUS, VERSION, CREATED_BY, DESCRIPTION, OPERATION_TYPE,
+  BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP, OWNER_GROUP,
+  APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
+  CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE
+)
+VALUES(
+  1,
+  NULL,
+  2,
+  'ConflictExample',
+  'INSERT INTO dbo.Archive(CustomerID,Reason) '+
+  'SELECT CustomerID, ''Conflict'' FROM dbo.Customers WHERE Age<25; SELECT 1;',
+  'INACTIVE',1,'admin',
+  'Potentially conflicting with MoveYoungCustomers logic',
+  'INSERT',
+  'Demonstrates conflict with BFS or priority usage',
+  GETDATE(),
+  'BG1',
+  'APPROVAL_IN_PROGRESS',
+  0,0,'NONE','NONE','UNDER_APPROVAL'
+);
 GO
 
-------------------------------------------------------------------------------
--- 11) BRM_COLUMN_MAPPING (optional example)
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_COLUMN_MAPPING (SOURCE_RULE_ID, RULE_ID, COLUMN_NAME, MAPPING_DETAILS)
-VALUES
-(1,2,'Col','Map from rule1 col => rule2 col'),
-(2,3,'Col','Chained mapping');
+3.2 Mark the Conflict in RULE_CONFLICTS
+
+If you want a conflict between rule 102 (MoveYoungCustomers) and rule 105 (ConflictExample), insert:
+
+INSERT INTO dbo.RULE_CONFLICTS(RULE_ID1,RULE_ID2,PRIORITY)
+VALUES(102,105,10);
 GO
 
-------------------------------------------------------------------------------
--- 12) BRM_CUSTOM_RULE_GROUPS
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_CUSTOM_RULE_GROUPS 
-(CUSTOM_GROUP_NAME, OWNER_BUSINESS_GROUP, CREATED_BY, CREATED_TIMESTAMP)
-VALUES
-('MyCustomGroup1','BG1','admin', GETDATE()),
-('MyCustomGroup2','BG2','user1', GETDATE());
-GO
+So if rule 102 fails (or if it’s a higher priority?), the BFS might skip 105, or vice versa, depending on your BFS logic.
 
-------------------------------------------------------------------------------
--- 13) BRM_CUSTOM_GROUP_MEMBERS
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_CUSTOM_GROUP_MEMBERS (CUSTOM_GROUP_ID, RULE_ID)
-VALUES
-(1, 1),
-(1, 3),
-(2, 2);
-GO
+4) How to Test
+	1.	Ensure you have the necessary groups (like BG1) and BRM_RULE_GROUPS row. For example:
 
-------------------------------------------------------------------------------
--- 14) BUSINESS_GROUP_APPROVERS
-------------------------------------------------------------------------------
-INSERT INTO dbo.BUSINESS_GROUP_APPROVERS (GROUP_NAME, USERNAME)
-VALUES
-('BG1','user1'),
-('BG1','admin'),
-('BG2','user2');
-GO
+INSERT INTO dbo.BRM_RULE_GROUPS(GROUP_NAME,DESCRIPTION)
+VALUES('RG1','Sample rule group');
 
-------------------------------------------------------------------------------
--- 15) BRM_RULE_APPROVALS (example approvals for rule #2)
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULE_APPROVALS 
-(RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVED_TIMESTAMP, APPROVAL_STAGE)
-VALUES
-(2, 'BG1','user1',0, NULL, 1),  -- waiting for user1
-(2, 'BG1','admin',0, NULL, 2);  -- then admin
-GO
+Then ensure GROUP_ID=1 actually maps to RG1. Or simply edit the GROUP_ID used in the rules above if needed.
 
-------------------------------------------------------------------------------
--- 16) BRM_CUSTOM_GROUP_BACKUPS
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_CUSTOM_GROUP_BACKUPS 
-(CUSTOM_GROUP_ID, BACKUP_TIMESTAMP, BACKUP_VERSION, BACKUP_JSON)
-VALUES
-(1, GETDATE(), 1, '{"group_name":"MyCustomGroup1","members":[1,3]}');
-GO
+	2.	Check that each rule is in APPROVAL_IN_PROGRESS and STATUS=INACTIVE.
+	3.	Approve them in your Approvals tab so they become APPROVED => ACTIVE. If you require multi-step approvals, do that.
+	4.	Load Data in dbo.Customers:
+	•	We inserted negative Age for Dave, which should cause Rule 101 to FAIL and skip BFS children.
+	5.	Run BFS from the Business Rules tab by clicking Run ETL BFS.
+	•	If Rule 101 sees negative Age => FAIL, it’s CRITICAL_RULE=1, SCOPE=GROUP, so it skips its child (Rule 102) and grandchild (Rule 103).
+	•	Fix that by updating Dave’s Age to 30 (UPDATE dbo.Customers SET Age=30 WHERE FirstName='Dave'), then BFS again => 101 passes => 102 runs => moves under-18 folks (Alice) to Archive. => 103 runs => sets high-score folks to Gold.
+	6.	Conflict: If rule 102 and 105 are both BFS roots or children in the chain, the conflict priority might cause one to skip or override. Depending on your BFS code, you might see that if 102 fails, 105 also is impacted, or vice versa.
+	7.	Decision Table: Rule 104 (DecisionTableRule) has no SQL, so it should pass automatically or be handled as 'DECISION_TABLE' in BFS.
+	8.	Data Validations: If you have the code set to run validations automatically on each BFS or single rule execution, then Age<0 fails that “RANGE” check. The BFS result for Rule 101 might fail even earlier. If you also have a Data Validation tab, you can pick the row for 'dbo.Customers' 'Age' 'RANGE' and run it => sees “-1” => fail.
+	9.	Insert Additional Schedules: If you want to schedule these rules, add rows in RULE_SCHEDULES (or use the UI), e.g.:
 
-------------------------------------------------------------------------------
--- 17) BRM_GLOBAL_CRITICAL_LINKS (link rule2 => rule3)
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_GLOBAL_CRITICAL_LINKS (GCR_RULE_ID, TARGET_RULE_ID)
-VALUES
-(2,3);
-GO
+INSERT INTO dbo.RULE_SCHEDULES(RULE_ID, SCHEDULE_TIME, STATUS)
+VALUES(101, DATEADD(MINUTE,5,GETDATE()), 'Scheduled');
 
-------------------------------------------------------------------------------
--- 18) RULE_SCHEDULES
-------------------------------------------------------------------------------
-INSERT INTO dbo.RULE_SCHEDULES (RULE_ID, SCHEDULE_TIME, STATUS, CREATED_TIMESTAMP)
-VALUES
-(1, DATEADD(HOUR,1,GETDATE()), 'Scheduled', GETDATE()),
-(3, DATEADD(HOUR,2,GETDATE()), 'Scheduled', GETDATE());
-GO
+Then your scheduling timer code (running every minute) will pick it up and attempt to run the BFS for rule 101.
 
-------------------------------------------------------------------------------
--- 19) BRM_RULE_COMMENTS (optional example)
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULE_COMMENTS (RULE_ID, COMMENT_TEXT)
-VALUES
-(1, 'Initial comment on Rule1'),
-(2, 'Comment regarding insertion rule');
-GO
+5) Summary
 
-------------------------------------------------------------------------------
--- 20) DECISION_TABLES
-------------------------------------------------------------------------------
-INSERT INTO dbo.DECISION_TABLES (TABLE_NAME, DESCRIPTION)
-VALUES
-('MyDecisionTable','Simple decision table sample');
-GO
+With these sample rules:
+	•	101: Data quality check (fail if negative Age).
+	•	102: Data movement (archive under-18).
+	•	103: Data update (promote high score to Gold).
+	•	104: No SQL => references a “Decision Table.”
+	•	105: Potential conflict with 102 (inserting more customers to Archive with reason “Conflict”).
 
-------------------------------------------------------------------------------
--- 21) RULE_CONFLICTS
-------------------------------------------------------------------------------
-INSERT INTO dbo.RULE_CONFLICTS (RULE_ID1, RULE_ID2, PRIORITY)
-VALUES
-(1, 2, 10),
-(2, 3, 5);
-GO
-
-------------------------------------------------------------------------------
--- 22) COMPOSITE_RULES
-------------------------------------------------------------------------------
-INSERT INTO dbo.COMPOSITE_RULES (CRULE_NAME, LOGIC_EXPR, ACTION_ON_PASS)
-VALUES
-('Composite1','Rule1==PASS AND Rule3==PASS','Send alert'),
-('Composite2','Rule2==PASS','Write to table');
-GO
-
-------------------------------------------------------------------------------
--- 23) RULE_SNAPSHOTS
-------------------------------------------------------------------------------
-INSERT INTO dbo.RULE_SNAPSHOTS (SNAPSHOT_NAME, CREATED_BY, SNAPSHOT_JSON)
-VALUES
-('InitialSnapshot','admin','[{\"RULE_ID\":1,\"RULE_NAME\":\"Rule1_SimpleSelect\"}]');
-GO
-
-------------------------------------------------------------------------------
--- 24) RULE_TAGS
-------------------------------------------------------------------------------
-INSERT INTO dbo.RULE_TAGS (RULE_ID, TAG_NAME)
-VALUES
-(1, 'Finance'),
-(2, 'CriticalInsert'),
-(3, 'TestRule');
-GO
-
-------------------------------------------------------------------------------
--- 25) DATA_VALIDATIONS
-------------------------------------------------------------------------------
-INSERT INTO dbo.DATA_VALIDATIONS (TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS)
-VALUES
-('dbo.SomeTable','Col','NOT NULL',''),
-('dbo.ChildTable','ChildCol','RANGE','min=0,max=100');
-GO
-
-------------------------------------------------------------------------------
--- 26) RULE_EXECUTION_LOGS
-------------------------------------------------------------------------------
-INSERT INTO dbo.RULE_EXECUTION_LOGS (RULE_ID, PASS_FLAG, MESSAGE, RECORD_COUNT)
-VALUES
-(1, 1, 'Returned 1 => pass', 1),
-(3, 0, 'Returned 0 => fail', 0);
-GO
-
-------------------------------------------------------------------------------
--- 27) BRM_RULE_LOCKS (optional example to show a locked rule)
-------------------------------------------------------------------------------
-INSERT INTO dbo.BRM_RULE_LOCKS (RULE_ID, LOCKED_BY, LOCK_TIMESTAMP)
-VALUES
-(2, 'admin', GETDATE());
-GO
+This covers inserts, updates, data validations, BFS skipping on fail, conflict usage, and a decision table example. By toggling the data in Customers (like negative ages or different scores), you can see Rule 101 pass/fail, Rule 102 move rows to Archive, and so forth.
