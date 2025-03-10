@@ -1,271 +1,134 @@
-Below is a set of patches/fixes you can insert into your existing 8‑part BRM Tool code to resolve the major missing references and inconsistencies identified:
-	1.	Remove/Adapt the old RULE_LOCKS-table approach in favor of lock columns in BRM_RULES.
-	2.	Add the missing DATA_VALIDATION_RESULTS table creation.
-	3.	Define or rename the function execute_rules_with_conflicts_composites_bfs so it actually exists.
-	4.	Provide minimal implementations for ChainSimulationDialog, GroupSimulationDialog, and SingleRuleSimulationDialog.
-	5.	Add resetView() and dim_non_matches_and_highlight() methods to EnhancedLineageGraphWidget.
-
-You do not need to rewrite all eight parts—just replace or add these snippets in your code where appropriate.
-
-⸻
-
-1) Unified Lock/Unlock Code Using BRM_RULES Columns
-
-In Part 1 (or wherever you placed your lock/unlock logic), remove any references to a separate RULE_LOCKS table. Instead, adapt the code so it checks/updates columns in BRM_RULES (LOCKED_BY, LOCKED_AT, and possibly LOCK_STATUS):
-
-def lock_rule_for_edit(conn, rule_id, locked_by, force=False):
-    """
-    Lock a rule by setting BRM_RULES.LOCKED_BY, LOCKED_AT, LOCK_STATUS=1.
-    If force=True, override existing lock.
-    """
-    c = conn.cursor()
-
-    # Check if already locked
-    c.execute("""
-        SELECT LOCKED_BY
-        FROM BRM_RULES
-        WHERE RULE_ID=?
-    """, (rule_id,))
-    row = c.fetchone()
-    if not row:
-        raise ValueError(f"Rule {rule_id} not found.")
-
-    current_lock = row[0]  # might be None if unlocked
-
-    if current_lock and current_lock != locked_by:
-        if not force:
-            raise ValueError(f"Rule {rule_id} is locked by {current_lock}. Use force if admin.")
-        # else force override
-
-    # Apply or overwrite lock
-    c.execute("""
-        UPDATE BRM_RULES
-        SET LOCKED_BY=?, LOCKED_AT=GETDATE(), LOCK_STATUS=1
-        WHERE RULE_ID=?
-    """, (locked_by, rule_id))
-    conn.commit()
-
-
-def unlock_rule(conn, rule_id, locked_by, force=False):
-    """
-    Unlock if owned by locked_by or force if admin.
-    """
-    c = conn.cursor()
-    c.execute("""
-        SELECT LOCKED_BY
-        FROM BRM_RULES
-        WHERE RULE_ID=?
-    """, (rule_id,))
-    row = c.fetchone()
-    if not row:
-        raise ValueError(f"Rule {rule_id} not found.")
-
-    current_lock = row[0]
-    if not current_lock:
-        # Already unlocked
-        return
-
-    if current_lock != locked_by and not force:
-        raise ValueError(
-            f"Cannot unlock rule {rule_id} - locked by {current_lock}."
-        )
-
-    # Clear lock
-    c.execute("""
-        UPDATE BRM_RULES
-        SET LOCKED_BY=NULL, LOCKED_AT=NULL, LOCK_STATUS=0
-        WHERE RULE_ID=?
-    """, (rule_id,))
-    conn.commit()
-
-	•	Remove the old logic that was inserting/selecting from RULE_LOCKS.
-	•	Ensure your final DDL includes columns in BRM_RULES:
-
-ALTER TABLE BRM_RULES
-  ADD [LOCKED_BY] VARCHAR(100) NULL,
-      [LOCKED_AT] DATETIME NULL,
-      [LOCK_STATUS] BIT NOT NULL DEFAULT(0);
-
-
-
-⸻
-
-2) Create the Missing DATA_VALIDATION_RESULTS Table
-
-Anywhere in your final DDL, add:
-
-CREATE TABLE [dbo].[DATA_VALIDATION_RESULTS] (
-    [RESULT_ID]      INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-    [VALIDATION_ID]  INT NOT NULL,
-    [PASS_FLAG]      BIT NOT NULL,
-    [MESSAGE]        VARCHAR(500) NULL,
-    [RUN_TIMESTAMP]  DATETIME NOT NULL DEFAULT(GETDATE())
-);
-
-This matches the code in run_data_validations():
-
-c2.execute("""
-    INSERT INTO DATA_VALIDATION_RESULTS(
-      VALIDATION_ID, PASS_FLAG, MESSAGE, RUN_TIMESTAMP
-    )
-    VALUES(?,?,?,GETDATE())
-""", (vid, 1 if pass_flag else 0, message))
-
-
-
-⸻
-
-3) Define or Rename execute_rules_with_conflicts_composites_bfs
-
-If your final Part 8 calls:
-
-(executed, skipped) = execute_rules_with_conflicts_composites_bfs(self.connection)
-
-… but only execute_rules_unified_bfs (or similar) exists, simply add a short wrapper or rename the call. Wrapper approach:
-
-def execute_rules_with_conflicts_composites_bfs(conn, dry_run=False):
-    """
-    Wrapper or final BFS function that calls any extended logic 
-    from execute_rules_unified_bfs or similar.
-    """
-    # If you already have "execute_rules_unified_bfs", call it:
-    return execute_rules_unified_bfs(conn, dry_run=dry_run)
-
-Or just rename the Part 8 call to execute_rules_unified_bfs(...) if that is your actual BFS function.
-
-⸻
-
-4) Minimal Dialogs for Chain / Group / Single Simulations
-
-In Part 8 you have methods like:
-
-def launch_chain_sim(self):
-    dlg = ChainSimulationDialog(self.connection, self)
-    dlg.exec_()
-
-Below are stub PyQt definitions to avoid “NameError: ChainSimulationDialog not defined.” Put them near your other dialog classes:
-
-class ChainSimulationDialog(QtWidgets.QDialog):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.setWindowTitle("Chain Simulation")
-        self.resize(400, 300)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Chain Simulation Dialog Stub."))
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
-        self.setLayout(layout)
-
-
-class GroupSimulationDialog(QtWidgets.QDialog):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.setWindowTitle("Group Simulation")
-        self.resize(400, 300)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Group Simulation Dialog Stub."))
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
-        self.setLayout(layout)
-
-
-class SingleRuleSimulationDialog(QtWidgets.QDialog):
-    def __init__(self, connection, rule_id, rule_sql, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.rule_id = rule_id
-        self.rule_sql = rule_sql
-        self.setWindowTitle(f"Single Rule Simulation (Rule {rule_id})")
-        self.resize(450, 300)
-
-        layout = QVBoxLayout(self)
-        self.info_label = QLabel(
-            f"Simulating rule {rule_id}:\n\n{rule_sql[:200]}..."
-        )
-        layout.addWidget(self.info_label)
-
-        run_btn = QPushButton("Run Simulation")
-        run_btn.clicked.connect(self.do_sim)
-        layout.addWidget(run_btn)
-
-        self.result_text = QPlainTextEdit()
-        self.result_text.setReadOnly(True)
-        layout.addWidget(self.result_text)
-
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
-        self.setLayout(layout)
-
-    def do_sim(self):
-        # Minimal 'dry-run' approach:
-        c = self.connection.cursor()
-        c.execute("BEGIN TRANSACTION")
-        pass_flag = True
-        msg = ""
-        try:
-            c.execute(self.rule_sql)
-            rows = c.fetchall()
-            if rows:
-                val = rows[0][0]
-                pass_flag = (val == 1)
-                msg = f"Returned: {val}"
-            else:
-                msg = "No rows => PASS"
-            c.execute("ROLLBACK")  # always rollback for sim
-        except Exception as ex:
-            c.execute("ROLLBACK")
-            pass_flag = False
-            msg = str(ex)
-
-        self.result_text.setPlainText(
-            f"Simulated rule {self.rule_id} => PASS={pass_flag}\n{msg}"
-        )
-
-Now those calls in Part 8 to ChainSimulationDialog(...), etc. will succeed (even if they only show a stub UI).
-
-⸻
-
-5) Add resetView() and dim_non_matches_and_highlight() to EnhancedLineageGraphWidget
-
-Your code references:
-
-self.adv_lineage_view.resetView()
-self.adv_lineage_view.dim_non_matches_and_highlight(text)
-
-If your EnhancedLineageGraphWidget only has populate_graph and search_lineage, you can add placeholders like so:
+from PyQt5.QtWidgets import (
+    QPlainTextEdit, QWidget, QVBoxLayout, QLabel,
+    QLineEdit, QPushButton, QHBoxLayout
+)
+from PyQt5.QtCore import Qt
+import logging
 
 class EnhancedLineageGraphWidget(QPlainTextEdit):
+    """
+    A textual placeholder for an 'advanced' lineage or 'brain-map' display.
+    Provides:
+      - populate_graph() to gather BFS adjacency
+      - resetView() to restore original text
+      - dim_non_matches_and_highlight() for searching lines
+      - optional advanced flag in constructor
+    """
+
     def __init__(self, connection, advanced=False, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.advanced = advanced
+        self.advanced = advanced  # if you want to toggle advanced mode
         self.setReadOnly(True)
-        self.setPlaceholderText("Lineage placeholder...")
+        self.setPlaceholderText(
+            "Enhanced lineage 'brain map' (textual fallback).\n"
+            "Use 'populate_graph()' to load adjacency. Use 'search_lineage()' or "
+            "'dim_non_matches_and_highlight()' to highlight lines."
+        )
 
         self.current_lineage_data = []
-        self.populate_graph()  # Optionally auto-populate
+        # Optionally auto-populate the text on creation
+        self.populate_graph()
 
     def populate_graph(self):
-        # ... your existing logic ...
+        """
+        Build a textual lineage representation using BFS.
+        We'll read from BRM_RULES, plus any adjacency like PARENT_RULE_ID,
+        global-critical links, child links, table dependencies, etc.
+        Then we'll produce lines of text in self.current_lineage_data.
+        """
         self.clear()
-        lines = [
-            "=== Sample Brain-map Lineage ===",
-            "Root Rule 1 => Child Rule 2 => etc."
-        ]
-        self.current_lineage_data = lines
-        self.appendPlainText("\n".join(lines))
+        self.current_lineage_data = []
+
+        # 1) Gather basic rule info
+        c = self.connection.cursor()
+        c.execute("""
+            SELECT RULE_ID, RULE_NAME, STATUS, CRITICAL_RULE, IS_GLOBAL
+            FROM BRM_RULES
+            ORDER BY RULE_ID
+        """)
+        all_rules = c.fetchall()
+        rule_map = {}
+        for (rid, name, st, crit, glob) in all_rules:
+            rule_map[rid] = {
+                "RULE_NAME": name,
+                "STATUS": st,
+                "CRITICAL": crit,
+                "GLOBAL": glob
+            }
+
+        # 2) Build adjacency from parent->child
+        adjacency = {}
+        # gather parent->child from PARENT_RULE_ID
+        c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES WHERE PARENT_RULE_ID IS NOT NULL")
+        for (child_id, parent_id) in c.fetchall():
+            adjacency.setdefault(parent_id, []).append(child_id)
+
+        # 3) (Optional) gather global-critical links if needed:
+        c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
+        gcr_links = c.fetchall()
+        # We'll store them separately for textual display
+        gcr_map = {}
+        for (gcr, tgt) in gcr_links:
+            gcr_map.setdefault(gcr, []).append(tgt)
+
+        # 4) Identify "root" rules (no parent). BFS from each root.
+        # We'll gather all RULE_ID => see which ones are children
+        all_rule_ids = set(rule_map.keys())
+        children_ids = set()
+        for prnt, childs in adjacency.items():
+            for c_ in childs:
+                children_ids.add(c_)
+        # root = those not in children_ids
+        roots = [r for r in all_rule_ids if r not in children_ids]
+
+        out_lines = []
+        out_lines.append("=== LINEAGE MAP (Text-based BFS) ===")
+
+        from collections import deque
+        queue = deque(roots)
+        depth_map = {}
+        for r_ in roots:
+            depth_map[r_] = 0
+
+        visited = set()
+        while queue:
+            cur = queue.popleft()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            d_ = depth_map.get(cur, 0)
+
+            # info about the rule
+            info = rule_map.get(cur, {})
+            nm = info.get("RULE_NAME", f"Rule{cur}")
+            st = info.get("STATUS", "UNKNOWN")
+            cval = info.get("CRITICAL", 0)
+            gval = info.get("GLOBAL", 0)
+            prefix = "  " * d_
+
+            # Build a descriptive line
+            line = f"{prefix}- Rule {cur}: {nm} [status={st}, crit={cval}, global={gval}]"
+            out_lines.append(line)
+
+            # If current rule has a GCR link in gcr_map => show them
+            if cur in gcr_map:
+                for child_gcr in gcr_map[cur]:
+                    out_lines.append(f"{prefix}   -> GCR link => Rule {child_gcr}")
+
+            # Enqueue children from adjacency
+            if cur in adjacency:
+                for ch in adjacency[cur]:
+                    if ch not in visited:
+                        depth_map[ch] = d_ + 1
+                        queue.append(ch)
+
+        self.current_lineage_data = out_lines
+        self.appendPlainText("\n".join(out_lines))
 
     def resetView(self):
         """
-        Clear any highlighting/dimming and re-show the original
-        lineage text or diagram.
+        Restore the original 'current_lineage_data' lines.
         """
         self.clear()
         if self.current_lineage_data:
@@ -273,36 +136,25 @@ class EnhancedLineageGraphWidget(QPlainTextEdit):
 
     def dim_non_matches_and_highlight(self, text):
         """
-        Example: highlight lines containing `text`, dim others.
-        In a real QGraphicsView, you'd highlight certain nodes.
+        Simple text-based approach to highlight lines that contain `text`
+        and 'dim' lines that do not.
         """
-        text_l = text.lower()
-        out = []
+        text_lower = text.lower()
+        output_lines = []
         for line in self.current_lineage_data:
-            if text_l in line.lower():
+            if text_lower in line.lower():
                 # highlight
-                out.append(f">>> {line} <<<")
+                output_lines.append(f">>> {line} <<<")
             else:
                 # dim
-                out.append(f"(dim) {line}")
+                output_lines.append(f"(dim) {line}")
 
         self.clear()
-        self.appendPlainText("\n".join(out))
+        self.appendPlainText("\n".join(output_lines))
 
     def search_lineage(self, text):
-        # This was your existing approach. You can unify or remove.
-        pass
-
-	•	In a real QGraphics-based solution, you would highlight/dim actual nodes. Here we do a quick text approach to demonstrate the concept.
-	•	Now calls to resetView() / dim_non_matches_and_highlight(text) will not crash.
-
-⸻
-
-Putting It All Together
-	1.	Locking: Remove references to RULE_LOCKS and use the new lock_rule_for_edit/unlock_rule functions that operate on BRM_RULES.
-	2.	DATA_VALIDATION_RESULTS: Create that table in your DDL, or remove run_data_validations() inserts if you do not need it.
-	3.	execute_rules_with_conflicts_composites_bfs: Provide a wrapper (or rename your BFS call).
-	4.	Dialog Classes: Insert those minimal definitions so your .exec_() calls succeed.
-	5.	resetView() & dim_non_matches_and_highlight(): Add them to EnhancedLineageGraphWidget so the final Part 8 code references are valid.
-
-With these fixes, you should have no more “missing reference” errors, and the code base will be consistent from Parts 1–8.
+        """
+        Optional approach if you want a single method to do searching.
+        Could just call dim_non_matches_and_highlight(text).
+        """
+        self.dim_non_matches_and_highlight(text)
