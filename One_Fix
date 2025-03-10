@@ -1,109 +1,308 @@
-CREATE TABLE BRM_RULES (
-  RULE_ID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-  GROUP_ID INT NULL,
-  PARENT_RULE_ID INT NULL,
-  RULE_TYPE_ID INT NULL,
-  RULE_NAME VARCHAR(200) NOT NULL,
-  RULE_SQL VARCHAR(MAX) NULL,
-  EFFECTIVE_START_DATE DATETIME NULL,
-  EFFECTIVE_END_DATE DATETIME NULL,
-  STATUS VARCHAR(50) NOT NULL DEFAULT('INACTIVE'),
-  VERSION INT NOT NULL DEFAULT(1),
-  CREATED_BY VARCHAR(100) NULL,
-  DESCRIPTION VARCHAR(1000) NULL,
-  OPERATION_TYPE VARCHAR(50) NULL,
-  BUSINESS_JUSTIFICATION VARCHAR(1000) NULL,
-  CREATED_TIMESTAMP DATETIME NOT NULL DEFAULT(GETDATE()),
-  UPDATED_BY VARCHAR(100) NULL,
-  OWNER_GROUP VARCHAR(100) NOT NULL,
-  CLUSTER_NAME VARCHAR(100) NULL,
-  APPROVAL_STATUS VARCHAR(50) NULL,
-  IS_GLOBAL BIT NOT NULL DEFAULT(0),
-  CRITICAL_RULE BIT NOT NULL DEFAULT(0),
-  CRITICAL_SCOPE VARCHAR(50) NULL,
-  CDC_TYPE VARCHAR(50) NULL,
-  LIFECYCLE_STATE VARCHAR(50) NULL,
-  DECISION_TABLE_ID INT NULL,
-  PERF_USAGE_COUNTER INT NOT NULL DEFAULT(0)  -- (25th insertable column)
-);
+Below is a set of patches/fixes you can insert into your existing 8‑part BRM Tool code to resolve the major missing references and inconsistencies identified:
+	1.	Remove/Adapt the old RULE_LOCKS-table approach in favor of lock columns in BRM_RULES.
+	2.	Add the missing DATA_VALIDATION_RESULTS table creation.
+	3.	Define or rename the function execute_rules_with_conflicts_composites_bfs so it actually exists.
+	4.	Provide minimal implementations for ChainSimulationDialog, GroupSimulationDialog, and SingleRuleSimulationDialog.
+	5.	Add resetView() and dim_non_matches_and_highlight() methods to EnhancedLineageGraphWidget.
 
-import datetime
+You do not need to rewrite all eight parts—just replace or add these snippets in your code where appropriate.
 
-def add_rule(conn, rule_data, created_by, user_group):
+⸻
+
+1) Unified Lock/Unlock Code Using BRM_RULES Columns
+
+In Part 1 (or wherever you placed your lock/unlock logic), remove any references to a separate RULE_LOCKS table. Instead, adapt the code so it checks/updates columns in BRM_RULES (LOCKED_BY, LOCKED_AT, and possibly LOCK_STATUS):
+
+def lock_rule_for_edit(conn, rule_id, locked_by, force=False):
     """
-    Final snippet with 25 columns in BRM_RULES (excluding RULE_ID IDENTITY),
-    including PERF_USAGE_COUNTER. Adjust if your schema differs.
+    Lock a rule by setting BRM_RULES.LOCKED_BY, LOCKED_AT, LOCK_STATUS=1.
+    If force=True, override existing lock.
     """
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Suppose we detect final_op from the rule SQL or something:
-    final_op = rule_data.get("OPERATION_TYPE", "SELECT")
-
-    # Build parameter tuple in the exact order:
-    params = (
-        rule_data.get("GROUP_ID"),            # 1
-        rule_data.get("PARENT_RULE_ID"),      # 2
-        rule_data["RULE_TYPE_ID"],            # 3
-        rule_data["RULE_NAME"].strip(),       # 4
-        rule_data.get("RULE_SQL",""),         # 5
-
-        rule_data.get("EFFECTIVE_START_DATE"),# 6
-        rule_data.get("EFFECTIVE_END_DATE"),  # 7
-
-        rule_data.get("STATUS","INACTIVE"),   # 8
-        1,  # VERSION=1 initially              # 9
-
-        created_by,                           # 10
-        rule_data.get("DESCRIPTION",""),      # 11
-        final_op,                             # 12 OPERATION_TYPE
-
-        rule_data.get("BUSINESS_JUSTIFICATION",""),  # 13
-        now_str,                              # 14 CREATED_TIMESTAMP
-        None,                                 # 15 UPDATED_BY
-        rule_data["OWNER_GROUP"],             # 16
-
-        rule_data.get("CLUSTER_NAME",""),     # 17
-        rule_data.get("APPROVAL_STATUS","APPROVAL_IN_PROGRESS"), # 18
-        rule_data.get("IS_GLOBAL", 0),        # 19
-        rule_data.get("CRITICAL_RULE", 0),    # 20
-
-        rule_data.get("CRITICAL_SCOPE","NONE"),# 21
-        rule_data.get("CDC_TYPE","NONE"),     # 22
-        rule_data["LIFECYCLE_STATE"],         # 23
-        rule_data.get("DECISION_TABLE_ID"),   # 24
-
-        rule_data.get("PERF_USAGE_COUNTER",0) # 25
-    )
-
     c = conn.cursor()
+
+    # Check if already locked
     c.execute("""
-      INSERT INTO BRM_RULES(
-        GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
-        EFFECTIVE_START_DATE, EFFECTIVE_END_DATE,
-        STATUS, VERSION,
-        CREATED_BY, DESCRIPTION, OPERATION_TYPE,
-        BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP, UPDATED_BY, OWNER_GROUP,
-        CLUSTER_NAME, APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
-        CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE, DECISION_TABLE_ID,
-        PERF_USAGE_COUNTER
-      )
-      OUTPUT inserted.RULE_ID
-      VALUES(
-        ?,?,?,?,?,
-        ?,?,
-        ?,?,
-        ?,?,?,?,
-        ?,?,?,?,
-        ?,?,?,?,
-        ?,?,?,
-        ?
-      )
-    """, params)
+        SELECT LOCKED_BY
+        FROM BRM_RULES
+        WHERE RULE_ID=?
+    """, (rule_id,))
     row = c.fetchone()
     if not row:
-        raise ValueError("Insert failed: no RULE_ID returned.")
-    new_id = row[0]
+        raise ValueError(f"Rule {rule_id} not found.")
 
-    # commit
+    current_lock = row[0]  # might be None if unlocked
+
+    if current_lock and current_lock != locked_by:
+        if not force:
+            raise ValueError(f"Rule {rule_id} is locked by {current_lock}. Use force if admin.")
+        # else force override
+
+    # Apply or overwrite lock
+    c.execute("""
+        UPDATE BRM_RULES
+        SET LOCKED_BY=?, LOCKED_AT=GETDATE(), LOCK_STATUS=1
+        WHERE RULE_ID=?
+    """, (locked_by, rule_id))
     conn.commit()
-    return new_id
 
+
+def unlock_rule(conn, rule_id, locked_by, force=False):
+    """
+    Unlock if owned by locked_by or force if admin.
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT LOCKED_BY
+        FROM BRM_RULES
+        WHERE RULE_ID=?
+    """, (rule_id,))
+    row = c.fetchone()
+    if not row:
+        raise ValueError(f"Rule {rule_id} not found.")
+
+    current_lock = row[0]
+    if not current_lock:
+        # Already unlocked
+        return
+
+    if current_lock != locked_by and not force:
+        raise ValueError(
+            f"Cannot unlock rule {rule_id} - locked by {current_lock}."
+        )
+
+    # Clear lock
+    c.execute("""
+        UPDATE BRM_RULES
+        SET LOCKED_BY=NULL, LOCKED_AT=NULL, LOCK_STATUS=0
+        WHERE RULE_ID=?
+    """, (rule_id,))
+    conn.commit()
+
+	•	Remove the old logic that was inserting/selecting from RULE_LOCKS.
+	•	Ensure your final DDL includes columns in BRM_RULES:
+
+ALTER TABLE BRM_RULES
+  ADD [LOCKED_BY] VARCHAR(100) NULL,
+      [LOCKED_AT] DATETIME NULL,
+      [LOCK_STATUS] BIT NOT NULL DEFAULT(0);
+
+
+
+⸻
+
+2) Create the Missing DATA_VALIDATION_RESULTS Table
+
+Anywhere in your final DDL, add:
+
+CREATE TABLE [dbo].[DATA_VALIDATION_RESULTS] (
+    [RESULT_ID]      INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [VALIDATION_ID]  INT NOT NULL,
+    [PASS_FLAG]      BIT NOT NULL,
+    [MESSAGE]        VARCHAR(500) NULL,
+    [RUN_TIMESTAMP]  DATETIME NOT NULL DEFAULT(GETDATE())
+);
+
+This matches the code in run_data_validations():
+
+c2.execute("""
+    INSERT INTO DATA_VALIDATION_RESULTS(
+      VALIDATION_ID, PASS_FLAG, MESSAGE, RUN_TIMESTAMP
+    )
+    VALUES(?,?,?,GETDATE())
+""", (vid, 1 if pass_flag else 0, message))
+
+
+
+⸻
+
+3) Define or Rename execute_rules_with_conflicts_composites_bfs
+
+If your final Part 8 calls:
+
+(executed, skipped) = execute_rules_with_conflicts_composites_bfs(self.connection)
+
+… but only execute_rules_unified_bfs (or similar) exists, simply add a short wrapper or rename the call. Wrapper approach:
+
+def execute_rules_with_conflicts_composites_bfs(conn, dry_run=False):
+    """
+    Wrapper or final BFS function that calls any extended logic 
+    from execute_rules_unified_bfs or similar.
+    """
+    # If you already have "execute_rules_unified_bfs", call it:
+    return execute_rules_unified_bfs(conn, dry_run=dry_run)
+
+Or just rename the Part 8 call to execute_rules_unified_bfs(...) if that is your actual BFS function.
+
+⸻
+
+4) Minimal Dialogs for Chain / Group / Single Simulations
+
+In Part 8 you have methods like:
+
+def launch_chain_sim(self):
+    dlg = ChainSimulationDialog(self.connection, self)
+    dlg.exec_()
+
+Below are stub PyQt definitions to avoid “NameError: ChainSimulationDialog not defined.” Put them near your other dialog classes:
+
+class ChainSimulationDialog(QtWidgets.QDialog):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Chain Simulation")
+        self.resize(400, 300)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Chain Simulation Dialog Stub."))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+        self.setLayout(layout)
+
+
+class GroupSimulationDialog(QtWidgets.QDialog):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Group Simulation")
+        self.resize(400, 300)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Group Simulation Dialog Stub."))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+        self.setLayout(layout)
+
+
+class SingleRuleSimulationDialog(QtWidgets.QDialog):
+    def __init__(self, connection, rule_id, rule_sql, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.rule_id = rule_id
+        self.rule_sql = rule_sql
+        self.setWindowTitle(f"Single Rule Simulation (Rule {rule_id})")
+        self.resize(450, 300)
+
+        layout = QVBoxLayout(self)
+        self.info_label = QLabel(
+            f"Simulating rule {rule_id}:\n\n{rule_sql[:200]}..."
+        )
+        layout.addWidget(self.info_label)
+
+        run_btn = QPushButton("Run Simulation")
+        run_btn.clicked.connect(self.do_sim)
+        layout.addWidget(run_btn)
+
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+        self.setLayout(layout)
+
+    def do_sim(self):
+        # Minimal 'dry-run' approach:
+        c = self.connection.cursor()
+        c.execute("BEGIN TRANSACTION")
+        pass_flag = True
+        msg = ""
+        try:
+            c.execute(self.rule_sql)
+            rows = c.fetchall()
+            if rows:
+                val = rows[0][0]
+                pass_flag = (val == 1)
+                msg = f"Returned: {val}"
+            else:
+                msg = "No rows => PASS"
+            c.execute("ROLLBACK")  # always rollback for sim
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            pass_flag = False
+            msg = str(ex)
+
+        self.result_text.setPlainText(
+            f"Simulated rule {self.rule_id} => PASS={pass_flag}\n{msg}"
+        )
+
+Now those calls in Part 8 to ChainSimulationDialog(...), etc. will succeed (even if they only show a stub UI).
+
+⸻
+
+5) Add resetView() and dim_non_matches_and_highlight() to EnhancedLineageGraphWidget
+
+Your code references:
+
+self.adv_lineage_view.resetView()
+self.adv_lineage_view.dim_non_matches_and_highlight(text)
+
+If your EnhancedLineageGraphWidget only has populate_graph and search_lineage, you can add placeholders like so:
+
+class EnhancedLineageGraphWidget(QPlainTextEdit):
+    def __init__(self, connection, advanced=False, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.advanced = advanced
+        self.setReadOnly(True)
+        self.setPlaceholderText("Lineage placeholder...")
+
+        self.current_lineage_data = []
+        self.populate_graph()  # Optionally auto-populate
+
+    def populate_graph(self):
+        # ... your existing logic ...
+        self.clear()
+        lines = [
+            "=== Sample Brain-map Lineage ===",
+            "Root Rule 1 => Child Rule 2 => etc."
+        ]
+        self.current_lineage_data = lines
+        self.appendPlainText("\n".join(lines))
+
+    def resetView(self):
+        """
+        Clear any highlighting/dimming and re-show the original
+        lineage text or diagram.
+        """
+        self.clear()
+        if self.current_lineage_data:
+            self.appendPlainText("\n".join(self.current_lineage_data))
+
+    def dim_non_matches_and_highlight(self, text):
+        """
+        Example: highlight lines containing `text`, dim others.
+        In a real QGraphicsView, you'd highlight certain nodes.
+        """
+        text_l = text.lower()
+        out = []
+        for line in self.current_lineage_data:
+            if text_l in line.lower():
+                # highlight
+                out.append(f">>> {line} <<<")
+            else:
+                # dim
+                out.append(f"(dim) {line}")
+
+        self.clear()
+        self.appendPlainText("\n".join(out))
+
+    def search_lineage(self, text):
+        # This was your existing approach. You can unify or remove.
+        pass
+
+	•	In a real QGraphics-based solution, you would highlight/dim actual nodes. Here we do a quick text approach to demonstrate the concept.
+	•	Now calls to resetView() / dim_non_matches_and_highlight(text) will not crash.
+
+⸻
+
+Putting It All Together
+	1.	Locking: Remove references to RULE_LOCKS and use the new lock_rule_for_edit/unlock_rule functions that operate on BRM_RULES.
+	2.	DATA_VALIDATION_RESULTS: Create that table in your DDL, or remove run_data_validations() inserts if you do not need it.
+	3.	execute_rules_with_conflicts_composites_bfs: Provide a wrapper (or rename your BFS call).
+	4.	Dialog Classes: Insert those minimal definitions so your .exec_() calls succeed.
+	5.	resetView() & dim_non_matches_and_highlight(): Add them to EnhancedLineageGraphWidget so the final Part 8 code references are valid.
+
+With these fixes, you should have no more “missing reference” errors, and the code base will be consistent from Parts 1–8.
