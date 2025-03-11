@@ -1,0 +1,162 @@
+def skip_bfs_descendants(start_id, adjacency, skip_set):
+    """
+    Mark all descendant rules of 'start_id' as skipped, so BFS won't process them.
+    """
+    stack = [start_id]
+    while stack:
+        cur = stack.pop()
+        if cur in skip_set:
+            continue
+        skip_set.add(cur)
+        if cur in adjacency:
+            for child_id in adjacency[cur]:
+                if child_id not in skip_set:
+                    stack.append(child_id)
+
+
+def rule_is_locked_by_other(conn, rule_id, current_user_id, current_user_group):
+    """
+    Optional check:
+      Return True if 'rule_id' is locked by another user (not 'current_user_id').
+      If user_group is 'Admin', we might allow forced override. 
+      This is up to your logic—here we simply return True/False.
+    """
+    if current_user_group == "Admin":
+        return False  # Admin can override
+    c = conn.cursor()
+    c.execute("""
+        SELECT LOCKED_BY
+        FROM BRM_RULE_LOCKS
+        WHERE RULE_ID=? AND ACTIVE_LOCK=1
+    """,(rule_id,))
+    row = c.fetchone()
+    if row:
+        locked_by = row[0]
+        # if locked_by is None or same user => not locked by another
+        if locked_by and locked_by != current_user_id:
+            return True
+    return False
+
+
+def run_data_validations_for_rule(conn, rule_id):
+    """
+    Optional function:
+      1) load table dependencies for 'rule_id'
+      2) run data validations for each table
+      Return True if all pass, else False.
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT DATABASE_NAME, TABLE_NAME
+        FROM BRM_RULE_TABLE_DEPENDENCIES
+        WHERE RULE_ID=?
+    """,(rule_id,))
+    deps = c.fetchall()
+    for (dbn, tb) in deps:
+        if not tb:
+            continue
+        full_name = (dbn + "." + tb).lower()
+        pass_ok = run_data_validations_for_table(conn, full_name)
+        if not pass_ok:
+            return False
+    return True
+
+
+def run_single_rule_with_validations(conn, rule_info, current_user_id, current_user_group):
+    """
+    Combines data validation + lock check + actual SQL run:
+      - If locked by another user => skip/fail
+      - If data validation fails => skip/fail
+      - Otherwise run the rule's SQL => pass/fail => return (True/False, message, rec_count, elapsed)
+    """
+    rid = rule_info["RULE_ID"]
+
+    # 1) Check if locked by someone else
+    if rule_is_locked_by_other(conn, rid, current_user_id, current_user_group):
+        return (False, "LockedByOther", 0, 0.0)
+
+    # 2) Data validations
+    val_ok = run_data_validations_for_rule(conn, rid)
+    if not val_ok:
+        return (False, "DataValidationFail", 0, 0.0)
+
+    # 3) Run the rule itself (your existing run_single_rule logic)
+    (ok_flag, msg, rec_count, elapsed) = run_single_rule(conn, rule_info)
+    return (ok_flag, msg, rec_count, elapsed)
+
+
+def execute_rules_with_conflicts_composites_bfs(
+    conn, 
+    selected_rule_ids=None, 
+    current_user_id=None, 
+    current_user_group=None
+):
+    """
+    A BFS that merges adjacency from parent->child, conflict, GCR, composite.
+    Prevents infinite loops by checking 'visited' set *before* re-enqueuing.
+    Includes:
+      - data validation check
+      - lock check
+      - skipping BFS for children if a rule fails & is critical
+    Returns (executed_list, skipped_set).
+    """
+
+    # 1) Build adjacency + get root rules
+    adjacency, roots, parent_map = load_rule_relationships(conn)
+    # ensure 'load_rule_relationships' merges child, conflict, GCR, composite references into one adjacency dict
+
+    # 2) get all rules => e.g. get_rule_map
+    rule_map = get_rule_map(conn)
+
+    # BFS start
+    if selected_rule_ids:
+        queue = list(selected_rule_ids)
+    else:
+        queue = list(roots)
+
+    visited = set()
+    executed = []
+    skipped = set()
+
+    while queue:
+        rid = queue.pop(0)
+
+        # cycle check
+        if rid in visited:
+            continue
+        visited.add(rid)
+
+        if rid not in rule_map:
+            # unknown => skip
+            skipped.add(rid)
+            continue
+
+        rule_info = rule_map[rid]
+
+        # run single rule with optional validations + lock checks
+        (ok_flag, msg, rec_count, elapsed) = run_single_rule_with_validations(
+            conn, rule_info, current_user_id, current_user_group
+        )
+
+        # log
+        insert_rule_execution_log(conn, rid, ok_flag, msg, rec_count, elapsed)
+
+        if ok_flag:
+            executed.append(rid)
+            # BFS => enqueue adjacency
+            if rid in adjacency:
+                for nxt in adjacency[rid]:
+                    # do not re-add if visited
+                    if nxt not in visited:
+                        queue.append(nxt)
+        else:
+            # if fails => check if critical => skip BFS
+            is_crit = (rule_info.get("CRITICAL_RULE", 0) == 1 or rule_info.get("IS_GLOBAL",0) == 1)
+            scope = (rule_info.get("CRITICAL_SCOPE","NONE") or "NONE").upper()
+            if is_crit and scope!="NONE":
+                # skip children
+                if rid in adjacency:
+                    skip_bfs_descendants(rid, adjacency, skipped)
+            skipped.add(rid)
+
+    return (executed, skipped)
