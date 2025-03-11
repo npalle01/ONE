@@ -1,27 +1,139 @@
-    # Insert dependencies from parsed SQL (deps["tables"])
-    # Determine column operation based on the SQL operation type.
+def add_rule(conn, rule_data, created_by_user_id, created_by_group):
+    """
+    Inserts a new rule into BRM_RULES along with its parsed dependencies,
+    creates an audit log entry, and sets up the approval pipeline.
+    
+    Parameters:
+      - conn: pyodbc connection object.
+      - rule_data: dict containing keys such as "GROUP_ID", "RULE_TYPE_ID",
+                   "RULE_NAME", "RULE_SQL", "EFFECTIVE_START_DATE", "OWNER_GROUP", etc.
+      - created_by_user_id: user ID (will be converted to string when used).
+      - created_by_group: group of the creator.
+    
+    Returns:
+      new_rule_id: the RULE_ID generated after insertion.
+    """
+    from datetime import datetime
+    # Validate that RULE_SQL is provided.
+    rule_sql = rule_data.get("RULE_SQL", "").strip()
+    if not rule_sql:
+        raise ValueError("RULE_SQL must be provided.")
+    
+    # Determine the operation type (e.g., INSERT, UPDATE, etc.)
+    op_type = detect_operation_type(rule_sql)
+    
+    # Parse the SQL to extract dependencies.
+    deps = parse_sql_dependencies(rule_sql)
+    
+    c = conn.cursor()
+    
+    # Check for duplicate rule name in the same owner group.
+    c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP = ? AND RULE_NAME = ?",
+              (rule_data["OWNER_GROUP"], rule_data["RULE_NAME"].strip()))
+    if c.fetchone():
+        raise ValueError("Duplicate rule name in that group.")
+    
+    # Check for duplicate SQL (optional)
+    c.execute("SELECT RULE_ID FROM BRM_RULES WHERE RULE_SQL = ?", (rule_sql,))
+    if c.fetchone():
+        raise ValueError("Another rule with the exact same SQL already exists.")
+    
+    # Ensure only Admin can create a global rule.
+    if rule_data.get("IS_GLOBAL", 0) == 1 and created_by_group != "Admin":
+        raise ValueError("Only Admin can create a global rule.")
+    
+    # Set lifecycle state to DRAFT.
+    rule_data["LIFECYCLE_STATE"] = "DRAFT"
+    
+    nowstr = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Insert the new rule into BRM_RULES and capture the new RULE_ID.
+    row = c.execute("""
+        INSERT INTO BRM_RULES(
+            GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID,
+            RULE_NAME, RULE_SQL,
+            EFFECTIVE_START_DATE, EFFECTIVE_END_DATE,
+            STATUS, VERSION, CREATED_BY,
+            DESCRIPTION, OPERATION_TYPE, BUSINESS_JUSTIFICATION,
+            CREATED_TIMESTAMP, UPDATED_BY, OWNER_GROUP,
+            APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
+            CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE
+        )
+        OUTPUT inserted.RULE_ID
+        VALUES (?, ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?)
+    """, (
+         rule_data.get("GROUP_ID"),
+         rule_data.get("PARENT_RULE_ID"),
+         rule_data["RULE_TYPE_ID"],
+         rule_data["RULE_NAME"].strip(),
+         rule_sql,
+         rule_data["EFFECTIVE_START_DATE"],
+         rule_data.get("EFFECTIVE_END_DATE"),
+         rule_data.get("STATUS", "INACTIVE"),
+         1,  # initial version
+         str(created_by_user_id),
+         rule_data.get("DESCRIPTION", ""),
+         op_type,
+         rule_data.get("BUSINESS_JUSTIFICATION", ""),
+         nowstr,
+         None,
+         rule_data["OWNER_GROUP"],
+         "APPROVAL_IN_PROGRESS",
+         rule_data.get("IS_GLOBAL", 0),
+         rule_data.get("CRITICAL_RULE", 0),
+         rule_data.get("CRITICAL_SCOPE", "NONE"),
+         rule_data.get("CDC_TYPE", "NONE"),
+         rule_data["LIFECYCLE_STATE"]
+    )).fetchone()
+    
+    if not row:
+        raise ValueError("Insert failed: no RULE_ID returned.")
+    new_rule_id = row[0]
+    
+    # Insert dependencies extracted from the SQL.
+    # Determine column operation type.
     col_op = "WRITE" if op_type in ("INSERT", "UPDATE", "DELETE") else "READ"
     
-    # Ensure deps["tables"] exists; otherwise, skip.
     for dep in deps.get("tables", []):
+        # Ensure the dependency is a tuple.
         if not isinstance(dep, tuple):
-            logger.error(f"Invalid dependency (not a tuple): {dep}")
+            logger.error(f"Dependency is not a tuple: {dep}")
             continue
-
-        # Safely unpack dependency tuple:
-        schema = dep[0] if len(dep) >= 1 else None
-        table = dep[1] if len(dep) >= 2 else None
-        alias = dep[2] if len(dep) >= 3 else None
-        is_sub = dep[3] if len(dep) >= 4 else False
-
-        # Only process if table is valid and is not a CTE reference.
-        if table and not table.startswith("(CTE)"):
+        # Safely unpack the tuple. Expect either 3 or 4 elements.
+        if len(dep) == 4:
+            schema, table, alias, is_sub = dep
+        elif len(dep) == 3:
+            schema, table, alias = dep
+            is_sub = False
+        else:
+            logger.error(f"Dependency tuple has unexpected length {len(dep)}: {dep}")
+            continue
+        
+        # Process only if the table is valid and not a CTE.
+        if table and not table.upper().startswith("(CTE)"):
             dbn = schema if schema else "dbo"
             try:
                 c.execute("""
                     INSERT INTO BRM_RULE_TABLE_DEPENDENCIES (
                         RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
-                    ) VALUES (?, ?, ?, ?, ?)
+                    )
+                    VALUES (?, ?, ?, ?, ?)
                 """, (new_rule_id, dbn, table, "AutoCol", col_op))
             except Exception as ex:
                 logger.error(f"Error inserting dependency {dep}: {ex}")
+    
+    # Log the insertion in the audit log.
+    insert_audit_log(conn, "INSERT", "BRM_RULES", new_rule_id, str(created_by_user_id), None, rule_data)
+    conn.commit()
+    
+    # Create the multi-step approval pipeline.
+    create_multistep_approvals(conn, new_rule_id)
+    
+    return new_rule_id
