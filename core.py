@@ -3,16 +3,15 @@
 """
 core.py – Core Foundation Utilities for the BRM Tool
 
-This module provides production‐ready foundational utilities:
-  • Comprehensive logging configuration (with rotating file handler for large platforms)
-  • Advanced email configuration and sender (with error handling and logging)
-  • A robust Database Connection Dialog (supporting both ODBC DSNs and custom connection strings)
-  • Database helper functions (fetch all/one as dicts)
-  • Audit logging functions (recording detailed simulation logs, including number of records impacted)
-  • Locking/unlocking functionality to prevent concurrent edits (with forced override support)
-  • Utility functions such as detect_operation_type and an advanced SQL parser (fully implemented)
+Features:
+  • Robust logging configuration and email notification setup.
+  • Production‑ready DatabaseConnectionDialog (using PyQt5) for establishing DB connections.
+  • Comprehensive DB helper functions (fetch_all_dict, fetch_one_dict, audit logging).
+  • Advanced locking functions to prevent concurrent edits.
+  • Advanced SQL parsing functions using sqlparse to extract table dependencies,
+    handle CTEs, subqueries, and aliases.
   
-All functions include robust error handling and logging for production-level scalability.
+All functions include robust error handling and proper logging.
 """
 
 import sys
@@ -21,40 +20,30 @@ import json
 import math
 import smtplib
 import logging
-import logging.handlers
 import pyodbc
 import sqlparse
 import re
 import csv
 import time
+
 from datetime import datetime, date, time, timedelta
 from collections import deque
 from email.mime.text import MIMEText
 
-from PyQt5 import QtWidgets
-from PyQt5.QtWidgets import (
-    QApplication, QDialog, QMessageBox, QLineEdit, QComboBox, QPushButton, QLabel,
-    QVBoxLayout, QHBoxLayout
+# ----------------------------
+# Logging Configuration
+# ----------------------------
+LOG_FILE = 'brm_tool_enhanced.log'
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.DEBUG,
+    format='%(asctime)s:%(levelname)s:%(name)s:%(message)s'
 )
-from PyQt5.QtCore import Qt
+logger = logging.getLogger(__name__)
 
-# ----------------------------------------------------------------
-# Logging Configuration with Rotating File Handler for scalability
-# ----------------------------------------------------------------
-LOG_FILENAME = 'brm_tool_enhanced.log'
-LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-LOG_BACKUP_COUNT = 5
-
-logger = logging.getLogger("BRMTool")
-logger.setLevel(logging.DEBUG)
-handler = logging.handlers.RotatingFileHandler(LOG_FILENAME, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
-formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-
-# ----------------------------------------------------------------
+# ----------------------------
 # Email Configuration & Sender
-# ----------------------------------------------------------------
+# ----------------------------
 EMAIL_CONFIG = {
     "smtp_server": "smtp.example.com",
     "smtp_port": 587,
@@ -65,41 +54,44 @@ EMAIL_CONFIG = {
 
 def send_email_notification(subject: str, body: str, recipients: list):
     """
-    Send an email using the configured SMTP server.
-    Logs success and error details.
+    Send an email using SMTP with TLS.
+    Raises an exception if sending fails.
     """
     try:
         msg = MIMEText(body, 'plain')
         msg['Subject'] = subject
         msg['From'] = EMAIL_CONFIG['sender_email']
         msg['To'] = ", ".join(recipients)
-        
+
         smtp = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
         smtp.starttls()
         smtp.login(EMAIL_CONFIG['smtp_username'], EMAIL_CONFIG['smtp_password'])
         smtp.sendmail(EMAIL_CONFIG['sender_email'], recipients, msg.as_string())
         smtp.quit()
-        logger.info(f"Email sent to {recipients} with subject: {subject}")
+        logger.info(f"Email sent to {recipients}")
     except Exception as ex:
-        logger.error(f"Failed to send email to {recipients}: {ex}")
+        logger.error(f"Error sending email to {recipients}: {ex}")
+        raise
 
-# ----------------------------------------------------------------
-# Database Connection Dialog (robust and production-ready)
-# ----------------------------------------------------------------
+# ----------------------------
+# Database Connection Dialog
+# ----------------------------
+from PyQt5 import QtWidgets
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QLineEdit, QHBoxLayout, QPushButton, QMessageBox
+
 class DatabaseConnectionDialog(QDialog):
     """
-    A dialog for connecting to the SQL Server via ODBC DSN or a custom connection string.
-    Fully robust with error messages and logging.
+    Provides a dialog for the user to select an ODBC DSN or enter a custom connection string.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.connection = None
         self.setWindowTitle("DB Connection – BRM Tool")
         self.resize(400, 200)
-        
         main_layout = QVBoxLayout(self)
-        label = QLabel("Select an ODBC DSN or enter a custom connection string:")
-        main_layout.addWidget(label)
+        
+        lbl = QLabel("Select an ODBC DSN or provide a custom connection string:")
+        main_layout.addWidget(lbl)
         
         self.conn_type_combo = QComboBox()
         try:
@@ -108,209 +100,158 @@ class DatabaseConnectionDialog(QDialog):
                 if "SQL SERVER" in driver.upper():
                     self.conn_type_combo.addItem(f"ODBC DSN: {dsn_name}", dsn_name)
         except Exception as e:
-            logger.error(f"Error retrieving DSNs: {e}")
+            logger.error(f"Error listing DSNs: {e}")
         main_layout.addWidget(self.conn_type_combo)
         
         self.conn_str_edit = QLineEdit()
-        self.conn_str_edit.setPlaceholderText("Or provide a custom connection string")
+        self.conn_str_edit.setPlaceholderText("Or enter custom ODBC connection string")
         main_layout.addWidget(self.conn_str_edit)
         
-        button_layout = QHBoxLayout()
-        connect_btn = QPushButton("Connect")
-        connect_btn.clicked.connect(self.accept)
+        btn_layout = QHBoxLayout()
+        ok_btn = QPushButton("Connect")
+        ok_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(connect_btn)
-        button_layout.addWidget(cancel_btn)
-        main_layout.addLayout(button_layout)
-        self.setLayout(main_layout)
-    
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        main_layout.addLayout(btn_layout)
+
     def get_connection(self):
-        """
-        Returns a pyodbc connection object if connection is successful,
-        otherwise shows error message.
-        """
         override = self.conn_str_edit.text().strip()
         if override:
             conn_str = override
         else:
             choice = self.conn_type_combo.currentData()
             if not choice:
-                QMessageBox.critical(self, "Error", "No DSN or connection string chosen.")
+                QMessageBox.critical(self, "Error", "No DSN or connection string selected.")
                 return None
             conn_str = f"DSN={choice};Trusted_Connection=yes;"
         try:
-            conn = pyodbc.connect(conn_str)
+            connection = pyodbc.connect(conn_str)
             logger.info("Database connection established.")
-            return conn
+            return connection
         except Exception as ex:
-            logger.error(f"Database connection failed: {ex}")
             QMessageBox.critical(self, "Connection Error", str(ex))
+            logger.error(f"Database connection failed: {ex}")
             return None
 
-# ----------------------------------------------------------------
-# Database Helper Functions
-# ----------------------------------------------------------------
+# ----------------------------
+# DB Helper Functions
+# ----------------------------
 def fetch_all_dict(cursor):
     """
-    Fetch all rows from the cursor and return as a list of dictionaries.
+    Returns all fetched rows as a list of dictionaries.
     """
-    try:
-        rows = cursor.fetchall()
-        if cursor.description:
-            cols = [desc[0] for desc in cursor.description]
-            return [dict(zip(cols, row)) for row in rows]
-        return rows
-    except Exception as ex:
-        logger.error(f"Error fetching rows: {ex}")
-        return []
+    rows = cursor.fetchall()
+    if cursor.description:
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+    return rows
 
 def fetch_one_dict(cursor):
     """
-    Fetch one row from the cursor and return it as a dictionary.
+    Returns a single row as a dictionary.
     """
-    try:
-        row = cursor.fetchone()
-        if row and cursor.description:
-            cols = [desc[0] for desc in cursor.description]
-            return dict(zip(cols, row))
-        return None
-    except Exception as ex:
-        logger.error(f"Error fetching one row: {ex}")
-        return None
+    row = cursor.fetchone()
+    if row and cursor.description:
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+    return None
 
-# ----------------------------------------------------------------
-# Audit Log Function (for capturing simulation details)
-# ----------------------------------------------------------------
 def insert_audit_log(conn, action, table_name, record_id, actor, old_data, new_data):
     """
-    Inserts an audit log record capturing the action details along with a JSON dump of old and new data.
-    This function is used to log all operations including simulations and dry runs.
+    Inserts a record into the audit log table.
     """
-    try:
-        c = conn.cursor()
-        c.execute("""
-        INSERT INTO BRM_AUDIT_LOG(
-            ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
-        )
-        VALUES (?, ?, ?, ?, ?, ?, GETDATE())
-        """, (
-            action,
-            table_name,
-            str(record_id) if record_id is not None else None,
-            actor,
-            json.dumps(old_data) if old_data is not None else None,
-            json.dumps(new_data) if new_data is not None else None
-        ))
-        conn.commit()
-        logger.info(f"Audit log inserted for {action} on {table_name} (Record {record_id}) by {actor}")
-    except Exception as ex:
-        logger.error(f"Error inserting audit log: {ex}")
+    c = conn.cursor()
+    c.execute("""
+    INSERT INTO BRM_AUDIT_LOG(
+        ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
+    )
+    VALUES (?, ?, ?, ?, ?, ?, GETDATE())
+    """, (
+        action,
+        table_name,
+        str(record_id) if record_id else None,
+        actor,
+        json.dumps(old_data) if old_data else None,
+        json.dumps(new_data) if new_data else None
+    ))
+    conn.commit()
+    logger.debug(f"Audit log inserted for action '{action}' on {table_name} (Record: {record_id}).")
 
-# ----------------------------------------------------------------
+# ----------------------------
 # Locking Functions
-# ----------------------------------------------------------------
+# ----------------------------
 def lock_rule(conn, rule_id, locked_by, force=False):
     """
-    Lock a rule for editing. Auto-removes locks older than 30 minutes.
-    If the rule is already locked by someone else and force is not set, raises an error.
+    Acquires a lock on a rule to prevent concurrent edits.
+    Automatically cleans up locks older than 30 minutes.
     """
-    try:
-        c = conn.cursor()
-        # Clean up stale locks (older than 30 minutes)
-        c.execute("DELETE FROM RULE_LOCKS WHERE DATEDIFF(MINUTE, LOCK_TIMESTAMP, GETDATE()) > 30")
-        conn.commit()
-    except Exception as ex:
-        logger.error(f"Error cleaning stale locks: {ex}")
+    c = conn.cursor()
+    # Clean up stale locks
+    c.execute("DELETE FROM RULE_LOCKS WHERE DATEDIFF(MINUTE, LOCK_TIMESTAMP, GETDATE()) > 30")
+    conn.commit()
     
-    try:
-        c.execute("SELECT LOCKED_BY FROM RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
-        row = c.fetchone()
-        if row:
-            current_lock = row[0]
-            if current_lock != locked_by and not force:
-                raise ValueError(f"Rule {rule_id} is already locked by {current_lock}.")
-            else:
-                c.execute("DELETE FROM RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
-        c.execute("INSERT INTO RULE_LOCKS(RULE_ID, LOCKED_BY, LOCK_TIMESTAMP) VALUES(?, ?, GETDATE())", (rule_id, locked_by))
-        conn.commit()
-        logger.info(f"Rule {rule_id} locked by {locked_by}")
-    except Exception as ex:
-        logger.error(f"Error locking rule {rule_id}: {ex}")
-        raise
+    c.execute("SELECT LOCKED_BY FROM RULE_LOCKS WHERE RULE_ID = ?", (rule_id,))
+    row = c.fetchone()
+    if row:
+        current_lock = row[0]
+        if current_lock != locked_by and not force:
+            error_msg = f"Rule {rule_id} is already locked by {current_lock}."
+            logger.warning(error_msg)
+            raise ValueError(error_msg)
+        else:
+            c.execute("DELETE FROM RULE_LOCKS WHERE RULE_ID = ?", (rule_id,))
+    c.execute("INSERT INTO RULE_LOCKS (RULE_ID, LOCKED_BY, LOCK_TIMESTAMP) VALUES (?, ?, GETDATE())", (rule_id, locked_by))
+    conn.commit()
+    logger.debug(f"Rule {rule_id} locked by {locked_by}.")
 
 def unlock_rule(conn, rule_id, locked_by, force=False):
     """
-    Unlock a rule. Only the user who locked it (or an admin with force) can unlock.
+    Releases a lock on a rule.
     """
-    try:
-        c = conn.cursor()
-        c.execute("SELECT LOCKED_BY FROM RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
-        row = c.fetchone()
-        if row:
-            if row[0] != locked_by and not force:
-                raise ValueError(f"Rule {rule_id} is locked by {row[0]}. Cannot unlock.")
-        c.execute("DELETE FROM RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
-        conn.commit()
-        logger.info(f"Rule {rule_id} unlocked by {locked_by}")
-    except Exception as ex:
-        logger.error(f"Error unlocking rule {rule_id}: {ex}")
-        raise
-
-# ----------------------------------------------------------------
-# Utility Functions
-# ----------------------------------------------------------------
-def detect_operation_type(rule_sql: str, decision_table_id=None) -> str:
-    """
-    Determines the operation type based on the provided SQL.
-    Returns one of: INSERT, UPDATE, DELETE, SELECT, DECISION_TABLE, or OTHER.
-    """
-    if (not rule_sql.strip()) and decision_table_id:
-        return "DECISION_TABLE"
-    txt = rule_sql.strip().upper()
-    if txt.startswith("INSERT"):
-        return "INSERT"
-    elif txt.startswith("UPDATE"):
-        return "UPDATE"
-    elif txt.startswith("DELETE"):
-        return "DELETE"
-    elif txt.startswith("SELECT"):
-        return "SELECT"
-    return "OTHER"
+    c = conn.cursor()
+    c.execute("SELECT LOCKED_BY FROM RULE_LOCKS WHERE RULE_ID = ?", (rule_id,))
+    row = c.fetchone()
+    if row:
+        current_lock = row[0]
+        if current_lock != locked_by and not force:
+            error_msg = f"Cannot unlock rule {rule_id} locked by {current_lock}."
+            logger.warning(error_msg)
+            raise ValueError(error_msg)
+    c.execute("DELETE FROM RULE_LOCKS WHERE RULE_ID = ?", (rule_id,))
+    conn.commit()
+    logger.debug(f"Rule {rule_id} unlocked by {locked_by}.")
 
 # ----------------------------
-# Advanced SQL Parsing
+# Advanced SQL Parsing Functions
 # ----------------------------
 def parse_sql_dependencies(sql_text: str):
     """
-    Uses sqlparse to extract table references, common table expressions (CTEs),
-    alias mappings, and referenced columns.
-    Returns a dictionary with keys: 'tables', 'cte_tables', 'alias_map', 'columns'.
-    This implementation is fully featured.
+    Parses the given SQL text and extracts dependencies:
+      - Tables referenced (including in CTEs and subqueries)
+      - CTE names and their definitions
+      - Alias mappings and selected columns
+    Returns a dictionary with keys: 'tables', 'cte_tables', 'alias_map', 'columns'
     """
-    try:
-        statements = sqlparse.parse(sql_text)
-    except Exception as ex:
-        logger.error(f"Error parsing SQL: {ex}")
-        return {"tables": [], "cte_tables": [], "alias_map": {}, "columns": []}
-    
+    statements = sqlparse.parse(sql_text)
     all_tables = []
     cte_info = {}
     alias_map = {}
     columns = []
-
+    
     for stmt in statements:
-        # Extract WITH/CTE clauses
-        ctes = _extract_with_clauses(stmt)
-        cte_info.update(ctes)
-        # Extract main table references and aliases
-        main_tables, main_alias = _extract_main_from(stmt.tokens, set(ctes.keys()))
+        # Process WITH clauses for CTEs
+        cte_map = _extract_with_clauses(stmt)
+        cte_info.update(cte_map)
+        # Process main query to get tables and aliases, excluding CTE names
+        main_tables, main_aliases = _extract_main_from(stmt.tokens, set(cte_map.keys()))
         all_tables.extend(main_tables)
-        alias_map.update(main_alias)
-        # Extract column references from SELECT or DML statements
+        alias_map.update(main_aliases)
+        # Process column selections
         cols = _extract_columns(stmt)
         columns.extend(cols)
-
+        
     return {
         "tables": list(set(all_tables)),
         "cte_tables": cte_info,
@@ -318,8 +259,11 @@ def parse_sql_dependencies(sql_text: str):
         "columns": columns
     }
 
-# Helper functions for SQL parsing (fully implemented)
 def _extract_with_clauses(statement):
+    """
+    Extracts CTE definitions from a SQL statement.
+    Returns a dictionary mapping CTE name to a list of table dependencies extracted from its subquery.
+    """
     cte_map = {}
     tokens = list(statement.tokens)
     i = 0
@@ -333,27 +277,34 @@ def _extract_with_clauses(statement):
     return cte_map
 
 def _parse_cte_block(tokens, i, cte_map):
+    """
+    Parses the tokens for a CTE block.
+    """
     while i < len(tokens):
         token = tokens[i]
+        if token.ttype is sqlparse.tokens.Keyword and token.value.upper() in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            return i
         if isinstance(token, sqlparse.sql.Identifier):
             cte_name = token.get_real_name()
             i += 1
             i = _parse_cte_as_clause(tokens, i, cte_name, cte_map)
-        elif token.ttype is sqlparse.tokens.Keyword and token.value.upper() in ("SELECT", "INSERT", "UPDATE", "DELETE"):
-            return i
         else:
             i += 1
     return i
 
 def _parse_cte_as_clause(tokens, i, cte_name, cte_map):
+    """
+    Parses the AS clause for a given CTE.
+    """
     while i < len(tokens):
         token = tokens[i]
         if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == "AS":
             i += 1
             if i < len(tokens):
-                sub = tokens[i]
-                if isinstance(sub, sqlparse.sql.Parenthesis):
-                    cte_map[cte_name] = _extract_subselect_tokens(sub.tokens)
+                subquery = tokens[i]
+                if isinstance(subquery, sqlparse.sql.Parenthesis):
+                    sub_refs = _extract_subselect_tokens(subquery.tokens)
+                    cte_map[cte_name] = sub_refs
                     i += 1
                     return i
         else:
@@ -361,89 +312,189 @@ def _parse_cte_as_clause(tokens, i, cte_name, cte_map):
     return i
 
 def _extract_subselect_tokens(tokens):
+    """
+    Recursively extracts table references from a subquery.
+    Returns a list of tuples: (schema_name, table_name, alias, is_subquery)
+    """
     results = []
     i = 0
+    from_seen = False
     while i < len(tokens):
         token = tokens[i]
-        if token.is_group:
+        if token.is_group and _is_subselect(token):
             results.extend(_extract_subselect_tokens(token.tokens))
-        elif token.ttype is sqlparse.tokens.Keyword and token.value.upper() in ("FROM", "JOIN"):
-            # Subsequent tokens may contain table references
-            if i + 1 < len(tokens):
-                next_token = tokens[i+1]
-                if isinstance(next_token, sqlparse.sql.IdentifierList):
-                    for ident in next_token.get_identifiers():
-                        results.append(_parse_identifier(ident, set()))
-                elif isinstance(next_token, sqlparse.sql.Identifier):
-                    results.append(_parse_identifier(next_token, set()))
-            i += 1
-        else:
-            i += 1
+        if token.ttype is sqlparse.tokens.Keyword:
+            if token.value.upper() in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
+        if from_seen:
+            if isinstance(token, sqlparse.sql.IdentifierList):
+                for identifier in token.get_identifiers():
+                    res = _parse_identifier(identifier, set())
+                    results.append((*res, True))
+            elif isinstance(token, sqlparse.sql.Identifier):
+                res = _parse_identifier(token, set())
+                results.append((*res, True))
+        i += 1
     return results
 
-def _extract_main_from(tokenlist, known_cte_names):
+def _is_subselect(token):
+    if not token.is_group:
+        return False
+    for t in token.tokens:
+        if t.ttype is sqlparse.tokens.DML and t.value.upper() == "SELECT":
+            return True
+    return False
+
+def _extract_main_from(token_list, known_cte_names):
+    """
+    Extracts main FROM clause references and builds an alias mapping.
+    Returns a tuple (list of table references, alias_map) where each table reference is a tuple
+    (schema_name, table_name, alias, is_subquery).
+    """
     results = []
     alias_map = {}
-    tokens = list(tokenlist)
+    tokens = list(token_list)
     from_seen = False
     i = 0
     while i < len(tokens):
         token = tokens[i]
-        if token.ttype is sqlparse.tokens.Keyword and token.value.upper() in ("FROM", "JOIN"):
-            from_seen = True
-        elif token.ttype is sqlparse.tokens.Keyword:
-            from_seen = False
+        if token.is_group and _is_subselect(token):
+            results.extend(_extract_subselect_tokens(token.tokens))
+        if token.ttype is sqlparse.tokens.Keyword:
+            if token.value.upper() in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
         if from_seen:
             if isinstance(token, sqlparse.sql.IdentifierList):
-                for ident in token.get_identifiers():
-                    parsed = _parse_identifier(ident, known_cte_names)
-                    results.append(parsed)
-                    if parsed[2]:
-                        alias_map[parsed[2]] = (parsed[0], parsed[1])
+                for identifier in token.get_identifiers():
+                    res = _parse_identifier(identifier, known_cte_names)
+                    results.append(res)
+                    if res[2]:
+                        alias_map[res[2]] = (res[0], res[1])
             elif isinstance(token, sqlparse.sql.Identifier):
-                parsed = _parse_identifier(token, known_cte_names)
-                results.append(parsed)
-                if parsed[2]:
-                    alias_map[parsed[2]] = (parsed[0], parsed[1])
+                res = _parse_identifier(token, known_cte_names)
+                results.append(res)
+                if res[2]:
+                    alias_map[res[2]] = (res[0], res[1])
         i += 1
     return results, alias_map
 
 def _parse_identifier(identifier, known_cte_names):
+    """
+    Parses an identifier to extract (schema_name, table_name, alias, is_subquery flag).
+    """
     alias = identifier.get_alias()
     real_name = identifier.get_real_name()
-    schema_name = identifier.get_parent_name()
+    schema = identifier.get_parent_name()
     if real_name and real_name.upper() in (name.upper() for name in known_cte_names):
-        return (None, f"(CTE) {real_name}", alias)
-    return (schema_name, real_name, alias)
+        return (None, f"(CTE) {real_name}", alias, False)
+    return (schema, real_name, alias, False)
 
 def _extract_columns(statement):
+    """
+    Extracts column names from a SELECT or DML statement.
+    Returns a list of tuples: (column_name, is_dml, is_select)
+    """
     results = []
     tokens = list(statement.tokens)
     i = 0
     while i < len(tokens):
         token = tokens[i]
-        if token.ttype is sqlparse.tokens.DML and token.value.upper() == "SELECT":
-            results.extend(_parse_select_list(tokens, i+1))
+        if token.ttype is sqlparse.tokens.DML:
+            word = token.value.upper()
+            if word == "SELECT":
+                cols = _parse_select_list(tokens, i + 1)
+                results.extend([(col, False, True) for col in cols])
+            elif word in ("INSERT", "UPDATE"):
+                cols = _parse_dml_columns(tokens, i, word)
+                results.extend([(col, True, False) for col in cols])
         i += 1
     return results
 
-def _parse_select_list(tokens, start):
+def _parse_select_list(tokens, start_idx):
+    """
+    Parses the select list to extract column names.
+    """
     columns = []
-    i = start
+    i = start_idx
     while i < len(tokens):
         token = tokens[i]
-        if token.ttype is sqlparse.tokens.Keyword and token.value.upper() in ("FROM", "WHERE", "GROUP", "ORDER", "HAVING"):
+        if token.ttype is sqlparse.tokens.Keyword and token.value.upper() in ("FROM", "JOIN", "WHERE", "GROUP", "ORDER", "UNION", "INTERSECT"):
             break
         if isinstance(token, sqlparse.sql.IdentifierList):
-            for ident in token.get_identifiers():
-                col = ident.get_name()
-                if col:
-                    columns.append(col)
+            for identifier in token.get_identifiers():
+                name = identifier.get_name()
+                if name and name.upper() not in ("DISTINCT", "TOP", "ALL"):
+                    columns.append(name)
         elif isinstance(token, sqlparse.sql.Identifier):
-            col = token.get_name()
-            if col:
-                columns.append(col)
+            name = token.get_name()
+            if name and name.upper() not in ("DISTINCT", "TOP", "ALL"):
+                columns.append(name)
         i += 1
     return columns
 
+def _parse_dml_columns(tokens, start_idx, dml_word):
+    """
+    Parses the columns for INSERT or UPDATE statements.
+    """
+    columns = []
+    if dml_word.upper() == "INSERT":
+        i = start_idx
+        while i < len(tokens):
+            token = tokens[i]
+            if token.is_group and token.__class__.__name__ == "Parenthesis":
+                for sub in token.tokens:
+                    if isinstance(sub, sqlparse.sql.IdentifierList):
+                        for identifier in sub.get_identifiers():
+                            columns.append(identifier.get_name())
+                    elif isinstance(sub, sqlparse.sql.Identifier):
+                        columns.append(sub.get_name())
+                return columns
+            i += 1
+    elif dml_word.upper() == "UPDATE":
+        found_set = False
+        i = start_idx
+        while i < len(tokens):
+            token = tokens[i]
+            if token.ttype is sqlparse.tokens.Keyword and token.value.upper() == "SET":
+                found_set = True
+                i += 1
+                columns.extend(_parse_update_set_list(tokens, i))
+                break
+            i += 1
+    return columns
+
+def _parse_update_set_list(tokens, start_idx):
+    """
+    Parses the list of columns in the SET clause of an UPDATE.
+    """
+    columns = []
+    i = start_idx
+    while i < len(tokens):
+        token = tokens[i]
+        if token.ttype is sqlparse.tokens.Keyword and token.value.upper() in ("WHERE", "FROM"):
+            break
+        if isinstance(token, sqlparse.sql.Identifier):
+            columns.append(token.get_name())
+        i += 1
+    return columns
+
+# ----------------------------
 # End of core.py
+if __name__ == '__main__':
+    # For testing purposes: run the SQL parser on sample SQL
+    sample_sql = """
+    WITH cte AS (
+        SELECT id, name FROM dbo.Customers WHERE active=1
+    )
+    SELECT a.id, a.value, b.description
+    FROM dbo.TableA a
+    INNER JOIN dbo.TableB b ON a.id = b.aid
+    LEFT JOIN cte ON a.cid = cte.id
+    """
+    parsed = parse_sql_dependencies(sample_sql)
+    print("Parsed SQL Dependencies:")
+    print(json.dumps(parsed, indent=2))
