@@ -1,0 +1,325 @@
+# metrics_and_control.py
+import sys
+import math
+import json
+import logging
+import traceback
+from datetime import datetime
+
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTableWidget,
+    QTableWidgetItem, QAbstractItemView, QComboBox, QInputDialog, QMessageBox,
+    QFileDialog, QApplication
+)
+import pyqtgraph as pg
+
+# Set up module-level logger
+logger = logging.getLogger("MetricsAndControl")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    fmt = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s')
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+# =============================================================================
+# SimulationLogger: Captures simulation run logs and emits signals with results.
+# =============================================================================
+class SimulationLogger(QThread):
+    simulationFinished = pyqtSignal(dict)  # Emit a dict with details
+
+    def __init__(self, connection, simulation_query, dry_run=True, parent=None):
+        """
+        simulation_query: SQL text to run for simulation.
+        dry_run: if True, always rollback.
+        """
+        super().__init__(parent)
+        self.connection = connection
+        self.simulation_query = simulation_query
+        self.dry_run = dry_run
+
+    def run(self):
+        result = {"success": False, "message": "", "record_count": 0, "timestamp": str(datetime.now())}
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("BEGIN TRANSACTION")
+            cursor.execute(self.simulation_query)
+            rows = cursor.fetchall()
+            record_count = len(rows)
+            if rows:
+                try:
+                    val = rows[0][0]
+                    success = (val == 1)
+                    msg = f"Returned: {val}"
+                except Exception as ex:
+                    success = False
+                    msg = f"Error parsing result: {ex}"
+            else:
+                success = True
+                msg = "No rows returned; assumed PASS"
+            result["success"] = success
+            result["message"] = msg
+            result["record_count"] = record_count
+
+            if self.dry_run or (not success):
+                cursor.execute("ROLLBACK")
+            else:
+                cursor.execute("COMMIT")
+        except Exception as ex:
+            try:
+                cursor.execute("ROLLBACK")
+            except:
+                pass
+            result["success"] = False
+            result["message"] = f"Exception: {ex}\n{traceback.format_exc()}"
+        logger.info("Simulation run completed: %s", json.dumps(result))
+        self.simulationFinished.emit(result)
+
+
+# =============================================================================
+# MetricsDashboardTab: Displays rule counts by status and performance trends.
+# =============================================================================
+class MetricsDashboardTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout(self)
+
+        # Create two side-by-side charts using pyqtgraph
+        charts_layout = QHBoxLayout()
+        self.statusChart = pg.PlotWidget(title="Rule Counts by Status")
+        self.statusChart.setBackground('w')
+        charts_layout.addWidget(self.statusChart)
+
+        self.performanceChart = pg.PlotWidget(title="Performance Trend (Avg Exec Time in ms)")
+        self.performanceChart.setBackground('w')
+        charts_layout.addWidget(self.performanceChart)
+
+        layout.addLayout(charts_layout)
+
+        refreshBtn = QPushButton("Refresh Metrics")
+        refreshBtn.clicked.connect(self.loadMetrics)
+        layout.addWidget(refreshBtn)
+        self.setLayout(layout)
+        self.loadMetrics()
+
+    def loadMetrics(self):
+        try:
+            c = self.connection.cursor()
+            # Retrieve rule counts by status
+            c.execute("SELECT STATUS, COUNT(*) FROM BRM_RULES GROUP BY STATUS")
+            rows = c.fetchall()
+            statuses = [r[0] for r in rows]
+            counts = [r[1] for r in rows]
+
+            self.statusChart.clear()
+            if statuses:
+                xvals = list(range(len(statuses)))
+                barItem = pg.BarGraphItem(x=xvals, height=counts, width=0.6, brush='skyblue')
+                self.statusChart.addItem(barItem)
+                self.statusChart.getAxis("bottom").setTicks([list(zip(xvals, statuses))])
+                self.statusChart.setLabel("left", "Count")
+                self.statusChart.setLabel("bottom", "Status")
+                self.statusChart.showGrid(x=True, y=True)
+
+            # Retrieve performance trend from RULE_PERF_STATS (assumed to exist)
+            c.execute("""
+                SELECT TOP 30 CONVERT(VARCHAR(10), CREATED_TS, 120) AS DateKey,
+                       AVG(EXECUTION_TIME_MS) AS AvgExecTime
+                FROM RULE_PERF_STATS
+                GROUP BY CONVERT(VARCHAR(10), CREATED_TS, 120)
+                ORDER BY DateKey ASC
+            """)
+            perf_rows = c.fetchall()
+            if perf_rows:
+                dates = [r[0] for r in perf_rows]
+                avg_times = [r[1] for r in perf_rows]
+                xvals = list(range(len(dates)))
+                self.performanceChart.clear()
+                self.performanceChart.plot(xvals, avg_times, pen=pg.mkPen('r', width=2), symbol='o')
+                self.performanceChart.getAxis("bottom").setTicks([list(zip(xvals, dates))])
+                self.performanceChart.setLabel("left", "Avg Exec Time (ms)")
+                self.performanceChart.setLabel("bottom", "Date")
+                self.performanceChart.showGrid(x=True, y=True)
+            logger.info("Metrics loaded successfully.")
+        except Exception as ex:
+            logger.exception("Error loading metrics: %s", ex)
+            QMessageBox.critical(self, "Error", f"Error loading metrics:\n{ex}")
+
+
+# =============================================================================
+# CtrlTablesTab: A robust control tables viewer
+# =============================================================================
+class CtrlTablesTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout(self)
+        self.tableList = [
+            "USERS", "BUSINESS_GROUPS", "GROUP_PERMISSIONS", "BRM_RULE_TYPES",
+            "BRM_RULE_GROUPS", "BRM_RULES", "BRM_RULE_TABLE_DEPENDENCIES", "BRM_AUDIT_LOG",
+            "BRM_RULE_LINEAGE", "BRM_GROUP_BACKUPS", "BRM_COLUMN_MAPPING", "BRM_CUSTOM_RULE_GROUPS",
+            "BRM_CUSTOM_GROUP_MEMBERS", "BUSINESS_GROUP_APPROVERS", "BRM_RULE_APPROVALS",
+            "BRM_CUSTOM_GROUP_BACKUPS", "BRM_GLOBAL_CRITICAL_LINKS", "RULE_SCHEDULES",
+            "BRM_RULE_COMMENTS", "DECISION_TABLES", "RULE_CONFLICTS", "COMPOSITE_RULES",
+            "RULE_SNAPSHOTS", "RULE_TAGS", "DATA_VALIDATIONS", "RULE_EXECUTION_LOGS",
+            "RULE_PERF_STATS"
+        ]
+        self.comboBox = QComboBox()
+        for table in self.tableList:
+            self.comboBox.addItem(table)
+        layout.addWidget(QLabel("Select Control Table:"))
+        layout.addWidget(self.comboBox)
+
+        loadBtn = QPushButton("Load Data")
+        loadBtn.clicked.connect(self.loadData)
+        layout.addWidget(loadBtn)
+
+        self.dataTable = QTableWidget()
+        self.dataTable.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.dataTable.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.dataTable)
+        self.setLayout(layout)
+
+    def loadData(self):
+        tableName = self.comboBox.currentText()
+        try:
+            c = self.connection.cursor()
+            # Get column names
+            c.execute(f"SELECT TOP 1 * FROM {tableName}")
+            cols = [desc[0] for desc in c.description]
+            # Get rows
+            c.execute(f"SELECT TOP 1000 * FROM {tableName}")
+            rows = c.fetchall()
+        except Exception as ex:
+            logger.exception("Error loading table %s: %s", tableName, ex)
+            QMessageBox.critical(self, "Error", f"Error loading {tableName}:\n{ex}")
+            return
+
+        self.dataTable.setColumnCount(len(cols))
+        self.dataTable.setHorizontalHeaderLabels(cols)
+        self.dataTable.setRowCount(0)
+        for row in rows:
+            r = self.dataTable.rowCount()
+            self.dataTable.insertRow(r)
+            for colIndex, val in enumerate(row):
+                item = QTableWidgetItem(str(val) if val is not None else "")
+                self.dataTable.setItem(r, colIndex, item)
+        self.dataTable.resizeColumnsToContents()
+        logger.info("Control table %s loaded with %d rows.", tableName, len(rows))
+
+
+# =============================================================================
+# Asynchronous Simulation Execution Functionality
+# =============================================================================
+class SimulationTask(QThread):
+    simulationCompleted = pyqtSignal(dict)  # Signal to notify task completion with results
+
+    def __init__(self, connection, rule_id, dry_run=True, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.rule_id = rule_id
+        self.dry_run = dry_run
+
+    def run(self):
+        result = {"rule_id": self.rule_id, "success": False, "message": "", "record_count": 0, "timestamp": str(datetime.now())}
+        try:
+            cursor = self.connection.cursor()
+            # Retrieve the rule SQL and operation type
+            cursor.execute("SELECT RULE_SQL, OPERATION_TYPE FROM BRM_RULES WHERE RULE_ID=?", (self.rule_id,))
+            row = cursor.fetchone()
+            if not row:
+                result["message"] = f"Rule {self.rule_id} not found."
+            else:
+                sql_text, op_type = row
+                # For decision table type, assume pass (or implement deep integration)
+                if op_type == "DECISION_TABLE":
+                    result["success"] = True
+                    result["message"] = f"Decision table rule {self.rule_id} simulated as PASS."
+                    result["record_count"] = 1
+                else:
+                    # Run the SQL simulation dry-run
+                    cursor.execute("BEGIN TRANSACTION")
+                    cursor.execute(sql_text)
+                    rows = cursor.fetchall()
+                    count = len(rows)
+                    result["record_count"] = count
+                    if rows:
+                        try:
+                            val = rows[0][0]
+                            result["success"] = (val == 1)
+                            result["message"] = f"Returned: {val}"
+                        except Exception as ex:
+                            result["success"] = False
+                            result["message"] = f"Error processing result: {ex}"
+                    else:
+                        result["success"] = True
+                        result["message"] = "No rows returned; simulation PASS."
+                    cursor.execute("ROLLBACK")
+            self.simulationCompleted.emit(result)
+            logger.info("Simulation for rule %s completed: %s", self.rule_id, json.dumps(result))
+        except Exception as ex:
+            try:
+                cursor.execute("ROLLBACK")
+            except:
+                pass
+            result["success"] = False
+            result["message"] = f"Exception during simulation: {ex}"
+            self.simulationCompleted.emit(result)
+            logger.exception("Simulation error for rule %s: %s", self.rule_id, ex)
+
+
+# =============================================================================
+# Expose Module Classes
+# =============================================================================
+__all__ = [
+    "MetricsDashboardTab",
+    "CtrlTablesTab",
+    "SimulationLogger",
+    "SimulationTask"
+]
+
+if __name__ == "__main__":
+    # For standalone testing of this module
+    app = QApplication(sys.argv)
+    try:
+        import pyodbc
+        # Replace with an actual DSN or connection string.
+        connection = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as ex:
+        logger.error("DB connection error: %s", ex)
+        sys.exit(1)
+
+    mainWidget = QWidget()
+    layout = QVBoxLayout(mainWidget)
+
+    metricsWidget = MetricsDashboardTab(connection)
+    ctrlWidget = CtrlTablesTab(connection)
+
+    layout.addWidget(QLabel("Metrics Dashboard"))
+    layout.addWidget(metricsWidget)
+    layout.addWidget(QLabel("Control Tables Viewer"))
+    layout.addWidget(ctrlWidget)
+
+    # Button to run a sample simulation for rule ID 1 (for testing)
+    simBtn = QPushButton("Run Simulation for Rule 1 (Dry Run)")
+    def onSimulate():
+        simTask = SimulationTask(connection, rule_id=1, dry_run=True)
+        simTask.simulationCompleted.connect(lambda res: QMessageBox.information(mainWidget, "Simulation Result",
+                                           f"Rule 1 Simulation:\nSuccess: {res['success']}\nMessage: {res['message']}\nRecords: {res['record_count']}"))
+        simTask.start()
+    simBtn.clicked.connect(onSimulate)
+    layout.addWidget(simBtn)
+
+    mainWidget.setLayout(layout)
+    mainWidget.resize(800, 600)
+    mainWidget.setWindowTitle("Metrics and Control Module Test")
+    mainWidget.show()
+    sys.exit(app.exec_())
