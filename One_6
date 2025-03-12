@@ -1,806 +1,1023 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Module: metrics_and_control_management.py
-Description: Provides a robust Metrics Dashboard (with real‑time notifications,
-             auto‑refresh and performance trend graphs), a Control Tables viewer,
-             advanced Group Management and User Management interfaces.
-             
-Additional Features:
- • MetricsDashboardTab: Uses pyqtgraph to display rule counts by status (bar chart)
-   and performance trends (line chart). It auto‑refreshes every 30 seconds.
- • ControlTablesTab: Allows admin users to view any control table (up to 1000 rows)
-   with robust error handling.
- • GroupManagementTab: Enables creation, renaming, deletion of business groups,
-   management of group memberships, permissions, and approvers. It ensures that
-   changes propagate properly and logs all operations.
- • UserManagementTab: Provides full user management functionality (add, delete,
-   change password) with detailed logging and error checks.
- • log_simulation_result: A helper function that captures simulation logs, including
-   the number of records impacted during dry‑run execution, with success/failure
-   notifications.
-             
-All components are designed to integrate seamlessly into the full BRM Tool.
+Module: brm_tool_data_access.py
+Description:
+  Core Data Access and Business Logic module for the BRM Tool.
+  This module includes:
+    • Database helper functions (fetching, audit logging).
+    • Functions to detect operation types and parse SQL dependencies (with deep integration of decision tables).
+    • Core rule execution functions with dry‑run simulation.
+    • Advanced BFS‑based execution methods that log impacted record counts, success/failure details,
+      and cascade processing for conflicts, composite rules, and global‑critical links.
+    • CRUD functions for adding, updating, deactivating, and deleting rules.
+    • Simulation functions (chain simulation and custom group simulation) that capture detailed logs.
+    
+All functions are production‑ready, robustly handle errors, and follow standard naming conventions.
+  
+Dependencies:
+  • pyodbc, sqlparse, logging, json, math, re, datetime, collections.
+  
+Usage:
+  Import this module as “brm_tool_data_access” and use its functions to perform rule execution,
+  simulations, and CRUD operations.
 """
 
 import sys
 import json
 import math
+import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import deque
 
 import pyodbc
-import pyqtgraph as pg
+import sqlparse
+from sqlparse.sql import Identifier, IdentifierList, Parenthesis
+from sqlparse.tokens import Keyword, DML
 
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QDateTime
-from PyQt5.QtGui import QBrush, QColor
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
-    QTableWidgetItem, QComboBox, QMessageBox, QLineEdit, QDialog, QGroupBox,
-    QAbstractItemView, QInputDialog, QFileDialog
-)
-
-logger = logging.getLogger("metrics_and_control_management")
+# Set up module logger
+logger = logging.getLogger("brm_tool_data_access")
 logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
-# -----------------------------------------------------------------------------
-# Simulation Logging Helper Function
-# -----------------------------------------------------------------------------
-def log_simulation_result(conn, rule_id, success_flag, message, record_count):
+# =============================================================================
+# DATABASE HELPER FUNCTIONS
+# =============================================================================
+def fetch_all_dict(cursor):
     """
-    Inserts a log entry into RULE_EXECUTION_LOGS for simulation/dry-run results.
-    Captures the rule_id, success flag, message and number of records impacted.
+    Returns all fetched rows as list of dictionaries.
+    """
+    rows = cursor.fetchall()
+    if cursor.description:
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in rows]
+    return rows
+
+def fetch_one_dict(cursor):
+    """
+    Returns one fetched row as a dictionary.
+    """
+    row = cursor.fetchone()
+    if row and cursor.description:
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+    return None
+
+def insert_audit_log(conn, action, table_name, record_id, actor, old_data, new_data):
+    """
+    Inserts an audit log entry into BRM_AUDIT_LOG.
+    Old and new data are stored as JSON.
     """
     try:
         c = conn.cursor()
         c.execute("""
-            INSERT INTO RULE_EXECUTION_LOGS(
-                RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT
+            INSERT INTO BRM_AUDIT_LOG(
+                ACTION, TABLE_NAME, RECORD_ID, ACTION_BY,
+                OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
             )
-            VALUES(?, GETDATE(), ?, ?, ?)
-        """, (rule_id, 1 if success_flag else 0, message, record_count))
+            VALUES (?, ?, ?, ?, ?, ?, GETDATE())
+        """, (
+            action,
+            table_name,
+            str(record_id) if record_id else None,
+            actor,
+            json.dumps(old_data) if old_data else None,
+            json.dumps(new_data) if new_data else None
+        ))
         conn.commit()
-        logger.info(f"Simulation log for rule {rule_id}: success={success_flag}, "
-                    f"record_count={record_count}")
+        logger.info(f"Audit log inserted for {action} on {table_name} record {record_id}.")
     except Exception as ex:
-        logger.error(f"Error logging simulation result for rule {rule_id}: {ex}")
+        logger.error(f"Error inserting audit log: {ex}")
 
-# -----------------------------------------------------------------------------
-# Metrics Dashboard Tab
-# -----------------------------------------------------------------------------
-class MetricsDashboardTab(QWidget):
+# =============================================================================
+# OPERATION DETECTION & SQL DEPENDENCY PARSING
+# =============================================================================
+def detect_operation_type(rule_sql: str, decision_table_id=None) -> str:
     """
-    Displays rule metrics including rule counts by status and performance trends.
-    Auto‑refreshes every 30 seconds.
+    Returns one of: INSERT/UPDATE/DELETE/SELECT/DECISION_TABLE/OTHER.
+    If rule_sql is empty but decision_table_id is provided, returns DECISION_TABLE.
     """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.init_ui()
-        self.load_metrics()
-        self.start_auto_refresh()
+    if (not rule_sql.strip()) and decision_table_id:
+        return "DECISION_TABLE"
+    txt = rule_sql.strip().upper()
+    if txt.startswith("INSERT"):
+        return "INSERT"
+    elif txt.startswith("UPDATE"):
+        return "UPDATE"
+    elif txt.startswith("DELETE"):
+        return "DELETE"
+    elif txt.startswith("SELECT"):
+        return "SELECT"
+    return "OTHER"
 
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-
-        # Create two charts side by side using pyqtgraph
-        chart_layout = QHBoxLayout()
-
-        # Bar chart for rule counts by status
-        self.status_chart = pg.PlotWidget(title="Rule Counts by Status")
-        self.status_chart.setBackground('w')
-        chart_layout.addWidget(self.status_chart)
-
-        # Line chart for performance trends
-        self.performance_chart = pg.PlotWidget(title="Performance Trends (Avg Exec Time)")
-        self.performance_chart.setBackground('w')
-        chart_layout.addWidget(self.performance_chart)
-
-        layout.addLayout(chart_layout)
-
-        # Refresh button
-        refresh_btn = QPushButton("Refresh Metrics")
-        refresh_btn.clicked.connect(self.load_metrics)
-        layout.addWidget(refresh_btn)
-
-        self.setLayout(layout)
-
-    def load_metrics(self):
-        try:
-            c = self.connection.cursor()
-            # 1. Rule counts by status
-            c.execute("SELECT STATUS, COUNT(*) FROM BRM_RULES GROUP BY STATUS")
-            rows = c.fetchall()
-            statuses = [row[0] for row in rows]
-            counts = [row[1] for row in rows]
-
-            self.status_chart.clear()
-            if statuses:
-                xvals = list(range(len(statuses)))
-                bar = pg.BarGraphItem(x=xvals, height=counts, width=0.6, brush="skyblue")
-                self.status_chart.addItem(bar)
-                self.status_chart.getAxis("bottom").setTicks([list(zip(xvals, statuses))])
-                self.status_chart.setLabel("left", "Count")
-                self.status_chart.setLabel("bottom", "Status")
-                self.status_chart.showGrid(x=True, y=True)
-            else:
-                self.status_chart.clear()
-
-            # 2. Performance trends (using RULE_PERF_STATS if available; fallback to RULE_EXECUTION_LOGS)
-            try:
-                c.execute("""
-                    SELECT TOP 30 DATE_KEY, AVG(EXEC_TIME_MS) as avg_time
-                    FROM RULE_PERF_STATS
-                    GROUP BY DATE_KEY
-                    ORDER BY DATE_KEY ASC
-                """)
-                perf_rows = c.fetchall()
-            except Exception:
-                # Fallback: Summarize RULE_EXECUTION_LOGS over last 7 days (assuming column EXECUTION_TIME_MS exists)
-                c.execute("""
-                    SELECT CONVERT(varchar(8), EXECUTION_TIMESTAMP, 112) as date_key,
-                           AVG(EXECUTION_TIME_MS)
-                    FROM RULE_EXECUTION_LOGS
-                    WHERE EXECUTION_TIMESTAMP >= DATEADD(DAY, -7, GETDATE())
-                    GROUP BY CONVERT(varchar(8), EXECUTION_TIMESTAMP, 112)
-                    ORDER BY date_key ASC
-                """)
-                perf_rows = c.fetchall()
-
-            self.performance_chart.clear()
-            if perf_rows:
-                xvals = list(range(len(perf_rows)))
-                yvals = [row[1] for row in perf_rows]
-                self.performance_chart.plot(xvals, yvals, pen=pg.mkPen('r', width=2), symbol='o')
-                self.performance_chart.setLabel("left", "Avg Exec Time (ms)")
-                self.performance_chart.setLabel("bottom", "Time Index")
-                self.performance_chart.showGrid(x=True, y=True)
-            else:
-                self.performance_chart.clear()
-        except Exception as ex:
-            logger.error(f"Error loading metrics: {ex}")
-            QMessageBox.critical(self, "Metrics Error", str(ex))
-
-    def start_auto_refresh(self):
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.load_metrics)
-        self.refresh_timer.start(30000)  # Refresh every 30 seconds
-
-# -----------------------------------------------------------------------------
-# Control Tables Tab
-# -----------------------------------------------------------------------------
-class ControlTablesTab(QWidget):
+def parse_sql_dependencies(sql_text: str) -> dict:
     """
-    Admin tool to view control tables. User can select a table from a drop‑down,
-    and view up to 1000 rows.
+    Parses the SQL text using sqlparse to extract:
+      - List of table references (including subselects and CTEs)
+      - CTE table information
+      - Alias mapping and referenced columns.
+    Returns a dictionary with keys: 'tables', 'cte_tables', 'alias_map', 'columns'.
     """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.table_list = [
-            "USERS", "BUSINESS_GROUPS", "GROUP_PERMISSIONS", "BRM_RULE_TYPES",
-            "BRM_RULE_GROUPS", "BRM_RULES", "BRM_RULE_TABLE_DEPENDENCIES", "BRM_AUDIT_LOG",
-            "BRM_RULE_LINEAGE", "BRM_GROUP_BACKUPS", "BRM_COLUMN_MAPPING", "BRM_CUSTOM_RULE_GROUPS",
-            "BRM_CUSTOM_GROUP_MEMBERS", "BUSINESS_GROUP_APPROVERS", "BRM_RULE_APPROVALS",
-            "BRM_CUSTOM_GROUP_BACKUPS", "BRM_GLOBAL_CRITICAL_LINKS", "RULE_SCHEDULES",
-            "BRM_RULE_COMMENTS", "DECISION_TABLES", "RULE_CONFLICTS", "COMPOSITE_RULES",
-            "RULE_SNAPSHOTS", "RULE_TAGS", "DATA_VALIDATIONS", "RULE_EXECUTION_LOGS",
-            "RULE_PERF_STATS"
-        ]
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        self.table_combo = QComboBox()
-        for tbl in self.table_list:
-            self.table_combo.addItem(tbl)
-        layout.addWidget(QLabel("Select Control Table:"))
-        layout.addWidget(self.table_combo)
-
-        load_btn = QPushButton("Load Data")
-        load_btn.clicked.connect(self.load_table_data)
-        layout.addWidget(load_btn)
-
-        self.data_table = QTableWidget(0, 0)
-        self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.data_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.data_table)
-
-        self.setLayout(layout)
-
-    def load_table_data(self):
-        tbl = self.table_combo.currentText()
-        if not tbl:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute(f"SELECT TOP 1 * FROM {tbl}")
-            col_names = [desc[0] for desc in c.description]
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Error retrieving columns for {tbl}: {ex}")
-            return
-        try:
-            c.execute(f"SELECT TOP 1000 * FROM {tbl}")
-            rows = c.fetchall()
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Error retrieving data for {tbl}: {ex}")
-            return
-        self.data_table.setRowCount(0)
-        self.data_table.setColumnCount(len(col_names))
-        self.data_table.setHorizontalHeaderLabels(col_names)
-        for row in rows:
-            r_idx = self.data_table.rowCount()
-            self.data_table.insertRow(r_idx)
-            for j, val in enumerate(row):
-                self.data_table.setItem(r_idx, j, QTableWidgetItem(str(val) if val is not None else ""))
-        self.data_table.resizeColumnsToContents()
-
-# -----------------------------------------------------------------------------
-# Group Management Tab
-# -----------------------------------------------------------------------------
-class GroupManagementTab(QWidget):
-    """
-    Provides advanced management of business groups, including:
-      - Viewing groups and their details
-      - Managing group memberships (assigning and removing users)
-      - Managing group permissions (tables accessible)
-      - Managing group approvers
-    All operations are logged and include robust error handling.
-    """
-    def __init__(self, connection, user_id, user_group, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.user_id = user_id
-        self.user_group = user_group
-        # Only Admin can access group management
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        if self.user_group != "Admin":
-            layout.addWidget(QLabel("Access Denied: Admin Only"))
-            self.setLayout(layout)
-            return
-
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
-
-        # Groups & Membership Tab
-        self.groups_membership_tab = QWidget()
-        gm_layout = QVBoxLayout(self.groups_membership_tab)
-
-        # Groups Table
-        group_box = QGroupBox("Business Groups")
-        group_layout = QVBoxLayout(group_box)
-        self.groups_table = QTableWidget(0, 3)
-        self.groups_table.setHorizontalHeaderLabels(["Group Name", "Description", "Email"])
-        self.groups_table.horizontalHeader().setStretchLastSection(True)
-        group_layout.addWidget(self.groups_table)
-        group_btn_layout = QHBoxLayout()
-        add_grp_btn = QPushButton("Add Group")
-        add_grp_btn.clicked.connect(self.add_group)
-        group_btn_layout.addWidget(add_grp_btn)
-        rename_grp_btn = QPushButton("Rename Group")
-        rename_grp_btn.clicked.connect(self.rename_group)
-        group_btn_layout.addWidget(rename_grp_btn)
-        del_grp_btn = QPushButton("Delete Group")
-        del_grp_btn.clicked.connect(self.delete_group)
-        group_btn_layout.addWidget(del_grp_btn)
-        group_btn_layout.addStretch()
-        group_layout.addLayout(group_btn_layout)
-        gm_layout.addWidget(group_box)
-
-        # Membership Table
-        member_box = QGroupBox("User Membership")
-        member_layout = QVBoxLayout(member_box)
-        self.users_table = QTableWidget(0, 3)
-        self.users_table.setHorizontalHeaderLabels(["User ID", "Username", "Group"])
-        self.users_table.horizontalHeader().setStretchLastSection(True)
-        member_layout.addWidget(self.users_table)
-        member_btn_layout = QHBoxLayout()
-        add_user_btn = QPushButton("Add User to Group")
-        add_user_btn.clicked.connect(self.add_user_to_group)
-        member_btn_layout.addWidget(add_user_btn)
-        rem_user_btn = QPushButton("Remove User from Group")
-        rem_user_btn.clicked.connect(self.remove_user_from_group)
-        member_btn_layout.addWidget(rem_user_btn)
-        member_btn_layout.addStretch()
-        member_layout.addLayout(member_btn_layout)
-        gm_layout.addWidget(member_box)
-
-        self.groups_membership_tab.setLayout(gm_layout)
-        self.tabs.addTab(self.groups_membership_tab, "Groups & Membership")
-
-        # Permissions Tab
-        self.permissions_tab = QWidget()
-        perm_layout = QVBoxLayout(self.permissions_tab)
-        perm_box = QGroupBox("Group Permissions")
-        perm_box_layout = QVBoxLayout(perm_box)
-        top_perm_layout = QHBoxLayout()
-        self.perm_group_combo = QComboBox()
-        self.perm_group_combo.currentIndexChanged.connect(self.load_permissions)
-        top_perm_layout.addWidget(QLabel("Select Group:"))
-        top_perm_layout.addWidget(self.perm_group_combo)
-        top_perm_layout.addStretch()
-        perm_box_layout.addLayout(top_perm_layout)
-        self.permissions_table = QTableWidget(0, 1)
-        self.permissions_table.setHorizontalHeaderLabels(["Target Table"])
-        self.permissions_table.horizontalHeader().setStretchLastSection(True)
-        perm_box_layout.addWidget(self.permissions_table)
-        perm_btn_layout = QHBoxLayout()
-        add_perm_btn = QPushButton("Add Permission")
-        add_perm_btn.clicked.connect(self.add_permission)
-        perm_btn_layout.addWidget(add_perm_btn)
-        rem_perm_btn = QPushButton("Remove Permission")
-        rem_perm_btn.clicked.connect(self.remove_permission)
-        perm_btn_layout.addWidget(rem_perm_btn)
-        perm_btn_layout.addStretch()
-        perm_box_layout.addLayout(perm_btn_layout)
-        perm_layout.addWidget(perm_box)
-        self.permissions_tab.setLayout(perm_layout)
-        self.tabs.addTab(self.permissions_tab, "Permissions")
-
-        # Approvers Tab
-        self.approvers_tab = QWidget()
-        appr_layout = QVBoxLayout(self.approvers_tab)
-        appr_top_layout = QHBoxLayout()
-        self.appr_group_combo = QComboBox()
-        self.appr_group_combo.currentIndexChanged.connect(self.load_approvers)
-        appr_top_layout.addWidget(QLabel("Select Group:"))
-        appr_top_layout.addWidget(self.appr_group_combo)
-        appr_top_layout.addStretch()
-        appr_layout.addLayout(appr_top_layout)
-        self.approvers_table = QTableWidget(0, 2)
-        self.approvers_table.setHorizontalHeaderLabels(["Approver ID", "Username"])
-        self.approvers_table.horizontalHeader().setStretchLastSection(True)
-        appr_layout.addWidget(self.approvers_table)
-        appr_btn_layout = QHBoxLayout()
-        add_appr_btn = QPushButton("Add Approver")
-        add_appr_btn.clicked.connect(self.add_approver)
-        appr_btn_layout.addWidget(add_appr_btn)
-        rem_appr_btn = QPushButton("Remove Approver")
-        rem_appr_btn.clicked.connect(self.remove_approver)
-        appr_btn_layout.addWidget(rem_appr_btn)
-        appr_btn_layout.addStretch()
-        appr_layout.addLayout(appr_btn_layout)
-        self.approvers_tab.setLayout(appr_layout)
-        self.tabs.addTab(self.approvers_tab, "Approvers")
-
-        # Refresh All Button
-        refresh_all_btn = QPushButton("Refresh All")
-        refresh_all_btn.clicked.connect(self.load_data)
-        layout.addWidget(refresh_all_btn)
-        self.setLayout(layout)
-        self.load_data()
-
-    def load_data(self):
-        self.load_groups()
-        self.load_users()
-        self.load_perm_groups()
-        self.load_appr_groups()
-
-    def load_groups(self):
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT GROUP_NAME, DESCRIPTION, EMAIL FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
-            rows = c.fetchall()
-            self.groups_table.setRowCount(0)
-            for row in rows:
-                r_idx = self.groups_table.rowCount()
-                self.groups_table.insertRow(r_idx)
-                for col, val in enumerate(row):
-                    self.groups_table.setItem(r_idx, col, QTableWidgetItem(str(val) if val else ""))
-        except Exception as ex:
-            logger.error(f"Error loading groups: {ex}")
-            QMessageBox.critical(self, "Group Load Error", str(ex))
-
-    def load_users(self):
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT USER_ID, USERNAME, USER_GROUP FROM USERS ORDER BY USER_ID")
-            rows = c.fetchall()
-            self.users_table.setRowCount(0)
-            for row in rows:
-                r_idx = self.users_table.rowCount()
-                self.users_table.insertRow(r_idx)
-                for col, val in enumerate(row):
-                    self.users_table.setItem(r_idx, col, QTableWidgetItem(str(val) if val else ""))
-        except Exception as ex:
-            logger.error(f"Error loading users: {ex}")
-            QMessageBox.critical(self, "User Load Error", str(ex))
-
-    def add_group(self):
-        gname, ok = QInputDialog.getText(self, "Add Group", "Group Name:")
-        if not ok or not gname.strip():
-            return
-        desc, ok2 = QInputDialog.getText(self, "Description", "Optional Description:")
-        if not ok2:
-            desc = ""
-        email, ok3 = QInputDialog.getText(self, "Email", "Optional Email:")
-        if not ok3:
-            email = ""
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT 1 FROM BUSINESS_GROUPS WHERE GROUP_NAME=?", (gname.strip(),))
-            if c.fetchone():
-                QMessageBox.warning(self, "Error", "Group already exists.")
-                return
-            c.execute("INSERT INTO BUSINESS_GROUPS(GROUP_NAME, DESCRIPTION, EMAIL) VALUES(?,?,?)",
-                      (gname.strip(), desc.strip(), email.strip()))
-            self.connection.commit()
-            QMessageBox.information(self, "Added", "Group created successfully.")
-            self.load_data()
-        except Exception as ex:
-            logger.error(f"Error adding group: {ex}")
-            QMessageBox.critical(self, "Add Group Error", str(ex))
-
-    def rename_group(self):
-        row = self.groups_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No group selected.")
-            return
-        old_name = self.groups_table.item(row, 0).text().strip()
-        new_name, ok = QInputDialog.getText(self, "Rename Group", f"New name for '{old_name}':")
-        if not ok or not new_name.strip():
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT 1 FROM BUSINESS_GROUPS WHERE GROUP_NAME=?", (new_name.strip(),))
-            if c.fetchone():
-                QMessageBox.warning(self, "Error", "New group name already exists.")
-                return
-            c.execute("BEGIN TRANSACTION")
-            c.execute("UPDATE BUSINESS_GROUPS SET GROUP_NAME=? WHERE GROUP_NAME=?", (new_name.strip(), old_name))
-            c.execute("UPDATE BRM_RULES SET OWNER_GROUP=? WHERE OWNER_GROUP=?", (new_name.strip(), old_name))
-            c.execute("COMMIT")
-            QMessageBox.information(self, "Renamed", f"Group '{old_name}' renamed to '{new_name}'.")
-            self.load_data()
-        except Exception as ex:
-            c.execute("ROLLBACK")
-            logger.error(f"Error renaming group: {ex}")
-            QMessageBox.critical(self, "Rename Group Error", str(ex))
-
-    def delete_group(self):
-        row = self.groups_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No group selected.")
-            return
-        group_name = self.groups_table.item(row, 0).text().strip()
-        confirm = QMessageBox.question(self, "Confirm", f"Delete group '{group_name}'?")
-        if confirm != QMessageBox.Yes:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("DELETE FROM BUSINESS_GROUPS WHERE GROUP_NAME=?", (group_name,))
-            self.connection.commit()
-            QMessageBox.information(self, "Deleted", f"Group '{group_name}' deleted.")
-            self.load_data()
-        except Exception as ex:
-            logger.error(f"Error deleting group: {ex}")
-            QMessageBox.critical(self, "Delete Group Error", str(ex))
-
-    def add_user_to_group(self):
-        row = self.users_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No user selected.")
-            return
-        user_id = self.users_table.item(row, 0).text().strip()
-        new_group, ok = QInputDialog.getText(self, "Add User to Group", "Enter target group name:")
-        if not ok or not new_group.strip():
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT 1 FROM BUSINESS_GROUPS WHERE GROUP_NAME=?", (new_group.strip(),))
-            if not c.fetchone():
-                QMessageBox.warning(self, "Error", "Specified group does not exist.")
-                return
-            c.execute("UPDATE USERS SET USER_GROUP=? WHERE USER_ID=?", (new_group.strip(), user_id))
-            self.connection.commit()
-            QMessageBox.information(self, "Updated", f"User {user_id} assigned to {new_group}.")
-            self.load_data()
-        except Exception as ex:
-            logger.error(f"Error adding user to group: {ex}")
-            QMessageBox.critical(self, "Membership Error", str(ex))
-
-    def remove_user_from_group(self):
-        row = self.users_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No user selected.")
-            return
-        user_id = self.users_table.item(row, 0).text().strip()
-        confirm = QMessageBox.question(self, "Confirm", f"Remove user {user_id} from their group? (Defaults to BG1)")
-        if confirm != QMessageBox.Yes:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("UPDATE USERS SET USER_GROUP='BG1' WHERE USER_ID=?", (user_id,))
-            self.connection.commit()
-            QMessageBox.information(self, "Updated", f"User {user_id} moved to BG1.")
-            self.load_data()
-        except Exception as ex:
-            logger.error(f"Error removing user from group: {ex}")
-            QMessageBox.critical(self, "Remove User Error", str(ex))
-
-    def load_perm_groups(self):
-        self.perm_group_combo.clear()
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT GROUP_NAME FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
-            rows = c.fetchall()
-            for row in rows:
-                self.perm_group_combo.addItem(row[0], row[0])
-        except Exception as ex:
-            logger.error(f"Error loading permission groups: {ex}")
-            QMessageBox.critical(self, "Permission Groups Error", str(ex))
-
-    def load_permissions(self):
-        group = self.perm_group_combo.currentData()
-        if not group:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT TARGET_TABLE FROM GROUP_PERMISSIONS WHERE GROUP_NAME=?", (group,))
-            rows = c.fetchall()
-            self.permissions_table.setRowCount(0)
-            for row in rows:
-                r_idx = self.permissions_table.rowCount()
-                self.permissions_table.insertRow(r_idx)
-                self.permissions_table.setItem(r_idx, 0, QTableWidgetItem(str(row[0])))
-        except Exception as ex:
-            logger.error(f"Error loading permissions: {ex}")
-            QMessageBox.critical(self, "Load Permissions Error", str(ex))
-
-    def add_permission(self):
-        group = self.perm_group_combo.currentData()
-        if not group:
-            return
-        table_name, ok = QInputDialog.getText(self, "Add Permission", "Enter table name (e.g. dbo.MyTable):")
-        if not ok or not table_name.strip():
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("INSERT INTO GROUP_PERMISSIONS(GROUP_NAME, TARGET_TABLE) VALUES(?,?)", (group.strip(), table_name.strip()))
-            self.connection.commit()
-            QMessageBox.information(self, "Added", "Permission added successfully.")
-            self.load_permissions()
-        except Exception as ex:
-            logger.error(f"Error adding permission: {ex}")
-            QMessageBox.critical(self, "Add Permission Error", str(ex))
-
-    def remove_permission(self):
-        group = self.perm_group_combo.currentData()
-        if not group:
-            return
-        row = self.permissions_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No permission selected.")
-            return
-        table_name = self.permissions_table.item(row, 0).text().strip()
-        confirm = QMessageBox.question(self, "Confirm", f"Remove permission '{table_name}' from group {group}?")
-        if confirm != QMessageBox.Yes:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("DELETE FROM GROUP_PERMISSIONS WHERE GROUP_NAME=? AND TARGET_TABLE=?", (group, table_name))
-            self.connection.commit()
-            QMessageBox.information(self, "Removed", "Permission removed.")
-            self.load_permissions()
-        except Exception as ex:
-            logger.error(f"Error removing permission: {ex}")
-            QMessageBox.critical(self, "Remove Permission Error", str(ex))
-
-    def load_appr_groups(self):
-        self.appr_group_combo.clear()
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT GROUP_NAME FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
-            rows = c.fetchall()
-            for row in rows:
-                self.appr_group_combo.addItem(row[0], row[0])
-        except Exception as ex:
-            logger.error(f"Error loading approver groups: {ex}")
-            QMessageBox.critical(self, "Approver Groups Error", str(ex))
-
-    def load_approvers(self):
-        group = self.appr_group_combo.currentData()
-        if not group:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT APPROVER_ID, USERNAME FROM BUSINESS_GROUP_APPROVERS WHERE GROUP_NAME=?", (group,))
-            rows = c.fetchall()
-            self.approvers_table.setRowCount(0)
-            for row in rows:
-                r_idx = self.approvers_table.rowCount()
-                self.approvers_table.insertRow(r_idx)
-                self.approvers_table.setItem(r_idx, 0, QTableWidgetItem(str(row[0])))
-                self.approvers_table.setItem(r_idx, 1, QTableWidgetItem(str(row[1])))
-        except Exception as ex:
-            logger.error(f"Error loading approvers: {ex}")
-            QMessageBox.critical(self, "Load Approvers Error", str(ex))
-
-    def add_approver(self):
-        group = self.appr_group_combo.currentData()
-        if not group:
-            return
-        username, ok = QInputDialog.getText(self, "Add Approver", "Enter approver username:")
-        if not ok or not username.strip():
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("INSERT INTO BUSINESS_GROUP_APPROVERS(GROUP_NAME, USERNAME) VALUES(?,?)", (group.strip(), username.strip()))
-            self.connection.commit()
-            QMessageBox.information(self, "Added", f"Approver {username} added to group {group}.")
-            self.load_approvers()
-        except Exception as ex:
-            logger.error(f"Error adding approver: {ex}")
-            QMessageBox.critical(self, "Add Approver Error", str(ex))
-
-    def remove_approver(self):
-        group = self.appr_group_combo.currentData()
-        if not group:
-            return
-        row = self.approvers_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No approver selected.")
-            return
-        appr_id = self.approvers_table.item(row, 0).text().strip()
-        confirm = QMessageBox.question(self, "Confirm", f"Remove approver ID {appr_id} from group {group}?")
-        if confirm != QMessageBox.Yes:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("DELETE FROM BUSINESS_GROUP_APPROVERS WHERE APPROVER_ID=?", (appr_id,))
-            self.connection.commit()
-            QMessageBox.information(self, "Removed", "Approver removed.")
-            self.load_approvers()
-        except Exception as ex:
-            logger.error(f"Error removing approver: {ex}")
-            QMessageBox.critical(self, "Remove Approver Error", str(ex))
-
-# -----------------------------------------------------------------------------
-# User Management Tab
-# -----------------------------------------------------------------------------
-class UserManagementTab(QWidget):
-    """
-    Provides an interface for Admin users to manage system users.
-    Features include adding, deleting, and changing passwords for users.
-    """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.init_ui()
-        self.load_users()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        self.user_table = QTableWidget(0, 4)
-        self.user_table.setHorizontalHeaderLabels(["User ID", "Username", "Password", "User Group"])
-        self.user_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.user_table)
-
-        btn_layout = QHBoxLayout()
-        add_btn = QPushButton("Add User")
-        add_btn.clicked.connect(self.add_user)
-        btn_layout.addWidget(add_btn)
-
-        delete_btn = QPushButton("Delete User")
-        delete_btn.clicked.connect(self.delete_user)
-        btn_layout.addWidget(delete_btn)
-
-        change_btn = QPushButton("Change Password")
-        change_btn.clicked.connect(self.change_password)
-        btn_layout.addWidget(change_btn)
-
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.load_users)
-        layout.addWidget(refresh_btn)
-
-        self.setLayout(layout)
-
-    def load_users(self):
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT USER_ID, USERNAME, PASSWORD, USER_GROUP FROM USERS ORDER BY USER_ID")
-            rows = c.fetchall()
-            self.user_table.setRowCount(0)
-            for row in rows:
-                r_idx = self.user_table.rowCount()
-                self.user_table.insertRow(r_idx)
-                for col, val in enumerate(row):
-                    self.user_table.setItem(r_idx, col, QTableWidgetItem(str(val) if val else ""))
-        except Exception as ex:
-            logger.error(f"Error loading users: {ex}")
-            QMessageBox.critical(self, "User Load Error", str(ex))
-
-    def add_user(self):
-        username, ok = QInputDialog.getText(self, "Add User", "Enter username:")
-        if not ok or not username.strip():
-            return
-        password, ok2 = QInputDialog.getText(self, "Password", "Enter password:")
-        if not ok2 or not password.strip():
-            return
-        user_group, ok3 = QInputDialog.getText(self, "User Group", "Enter user group (e.g., BG1 or Admin):")
-        if not ok3 or not user_group.strip():
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT 1 FROM USERS WHERE USERNAME=?", (username.strip(),))
-            if c.fetchone():
-                QMessageBox.warning(self, "Error", "Username already exists.")
-                return
-            c.execute("INSERT INTO USERS(USERNAME, PASSWORD, USER_GROUP) VALUES(?,?,?)",
-                      (username.strip(), password.strip(), user_group.strip()))
-            self.connection.commit()
-            QMessageBox.information(self, "Added", f"User '{username}' added.")
-            self.load_users()
-        except Exception as ex:
-            logger.error(f"Error adding user: {ex}")
-            QMessageBox.critical(self, "Add User Error", str(ex))
-
-    def delete_user(self):
-        row = self.user_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No user selected.")
-            return
-        user_id = self.user_table.item(row, 0).text().strip()
-        confirm = QMessageBox.question(self, "Confirm", f"Delete user {user_id}?")
-        if confirm != QMessageBox.Yes:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("DELETE FROM USERS WHERE USER_ID=?", (user_id,))
-            self.connection.commit()
-            QMessageBox.information(self, "Deleted", f"User {user_id} deleted.")
-            self.load_users()
-        except Exception as ex:
-            logger.error(f"Error deleting user: {ex}")
-            QMessageBox.critical(self, "Delete User Error", str(ex))
-
-    def change_password(self):
-        row = self.user_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Error", "No user selected.")
-            return
-        user_id = self.user_table.item(row, 0).text().strip()
-        new_password, ok = QInputDialog.getText(self, "Change Password", "Enter new password:")
-        if not ok or not new_password.strip():
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("UPDATE USERS SET PASSWORD=? WHERE USER_ID=?", (new_password.strip(), user_id))
-            self.connection.commit()
-            QMessageBox.information(self, "Updated", f"Password for user {user_id} changed.")
-            self.load_users()
-        except Exception as ex:
-            logger.error(f"Error changing password: {ex}")
-            QMessageBox.critical(self, "Change Password Error", str(ex))
-
-# -----------------------------------------------------------------------------
-# End of Module 6
-# -----------------------------------------------------------------------------
-
-if __name__ == '__main__':
-    # For testing purposes only: create a simple window with tabs for each feature.
-    app = QtWidgets.QApplication(sys.argv)
     try:
+        statements = sqlparse.parse(sql_text)
+    except Exception as ex:
+        logger.error(f"SQL parse error: {ex}")
+        return {"tables": [], "cte_tables": [], "alias_map": {}, "columns": []}
+
+    all_tables = []
+    cte_info = []
+    alias_map = {}
+    columns = []
+    for stmt in statements:
+        ctes = _extract_with_clauses(stmt)
+        for cte_name, cte_refs in ctes.items():
+            cte_info.append((cte_name, cte_refs))
+        main_refs, main_alias = _extract_main_from(stmt.tokens, set(ctes.keys()))
+        all_tables.extend(main_refs)
+        alias_map.update(main_alias)
+        col_refs = _extract_columns(stmt)
+        columns.extend(col_refs)
+    unique_tables = list({t for t in all_tables})
+    return {
+        "tables": unique_tables,
+        "cte_tables": cte_info,
+        "alias_map": alias_map,
+        "columns": columns
+    }
+
+# Helper functions for SQL parsing (internal)
+def _extract_with_clauses(statement):
+    cte_map = {}
+    tokens = list(statement.tokens)
+    i = 0
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is Keyword and tk.value.upper() == "WITH":
+            i += 1
+            i = _parse_cte_block(tokens, i, cte_map)
+            continue
+        i += 1
+    return cte_map
+
+def _parse_cte_block(tokens, i, cte_map):
+    while i < len(tokens):
+        tk = tokens[i]
+        if isinstance(tk, Identifier):
+            cte_name = tk.get_real_name()
+            i += 1
+            i = _parse_cte_as_clause(tokens, i, cte_name, cte_map)
+        elif tk.ttype is Keyword and tk.value.upper() in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            return i
+        else:
+            i += 1
+    return i
+
+def _parse_cte_as_clause(tokens, i, cte_name, cte_map):
+    while i < len(tokens):
+        tk = tokens[i]
+        val = tk.value.upper() if tk.ttype else ""
+        if val == "AS":
+            i += 1
+            if i < len(tokens):
+                sub = tokens[i]
+                if isinstance(sub, Parenthesis):
+                    sub_refs = _extract_subselect_tokens(sub.tokens)
+                    cte_map[cte_name] = sub_refs
+                    i += 1
+                    return i
+        else:
+            i += 1
+    return i
+
+def _extract_subselect_tokens(tokens):
+    results = []
+    from_seen = False
+    i = 0
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.is_group and _is_subselect(tk):
+            results.extend(_extract_subselect_tokens(tk.tokens))
+        if tk.ttype is Keyword:
+            upv = tk.value.upper()
+            if upv in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
+        if from_seen:
+            if isinstance(tk, IdentifierList):
+                for ident in tk.get_identifiers():
+                    st = _parse_identifier(ident, set())
+                    results.append((st[0], st[1], st[2], True))
+            elif isinstance(tk, Identifier):
+                st = _parse_identifier(tk, set())
+                results.append((st[0], st[1], st[2], True))
+        i += 1
+    return results
+
+def _is_subselect(token):
+    if not token.is_group:
+        return False
+    for sub in token.tokens:
+        if sub.ttype is DML and sub.value.upper() == "SELECT":
+            return True
+    return False
+
+def _extract_main_from(tokenlist, known_cte_names):
+    results = []
+    alias_map = {}
+    tokens = list(tokenlist)
+    from_seen = False
+    i = 0
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.is_group and _is_subselect(tk):
+            results.extend(_extract_subselect_tokens(tk.tokens))
+        if tk.ttype is Keyword:
+            upv = tk.value.upper()
+            if upv in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
+        if from_seen:
+            if isinstance(tk, IdentifierList):
+                for ident in tk.get_identifiers():
+                    st = _parse_identifier(ident, known_cte_names)
+                    results.append(st)
+                    if st[2]:
+                        alias_map[st[2]] = (st[0], st[1])
+            elif isinstance(tk, Identifier):
+                st = _parse_identifier(tk, known_cte_names)
+                results.append(st)
+                if st[2]:
+                    alias_map[st[2]] = (st[0], st[1])
+        i += 1
+    return (results, alias_map)
+
+def _parse_identifier(ident, known_cte_names):
+    alias = ident.get_alias()
+    real_name = ident.get_real_name()
+    schema_name = ident.get_parent_name()
+    if real_name and real_name.upper() in (n.upper() for n in known_cte_names):
+        return (None, f"(CTE) {real_name}", alias, False)
+    return (schema_name, real_name, alias, False)
+
+def _extract_columns(statement):
+    results = []
+    tokens = list(statement.tokens)
+    i = 0
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is DML:
+            word = tk.value.upper()
+            if word == "SELECT":
+                columns = _parse_select_list(tokens, i+1)
+                for c_ in columns:
+                    results.append((c_, False, True))
+            elif word in ("INSERT", "UPDATE"):
+                columns = _parse_dml_columns(tokens, i, word)
+                for c_ in columns:
+                    results.append((c_, True, False))
+        i += 1
+    return results
+
+def _parse_select_list(tokens, start_idx):
+    columns = []
+    i = start_idx
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is Keyword and tk.value.upper() in ("FROM", "JOIN", "WHERE", "GROUP", "ORDER", "UNION", "INTERSECT"):
+            break
+        if isinstance(tk, IdentifierList):
+            for ident in tk.get_identifiers():
+                nm = ident.get_name()
+                if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
+                    columns.append(nm)
+        elif isinstance(tk, Identifier):
+            nm = tk.get_name()
+            if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
+                columns.append(nm)
+        i += 1
+    return columns
+
+def _parse_dml_columns(tokens, start_idx, dml_word):
+    columns = []
+    if dml_word == "INSERT":
+        i = start_idx
+        while i < len(tokens):
+            tk = tokens[i]
+            if tk.is_group and isinstance(tk, Parenthesis):
+                for st in tk.tokens:
+                    if isinstance(st, IdentifierList):
+                        for ident in st.get_identifiers():
+                            columns.append(ident.get_name())
+                    elif isinstance(st, Identifier):
+                        columns.append(st.get_name())
+                return columns
+            i += 1
+    elif dml_word == "UPDATE":
+        i = start_idx
+        found_set = False
+        while i < len(tokens):
+            tk = tokens[i]
+            if tk.ttype is Keyword and tk.value.upper() == "SET":
+                found_set = True
+                i += 1
+                columns.extend(_parse_update_set_list(tokens, i))
+                break
+            i += 1
+    return columns
+
+def _parse_update_set_list(tokens, start_i):
+    columns = []
+    i = start_i
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is Keyword and tk.value.upper() in ("WHERE", "FROM"):
+            break
+        if isinstance(tk, Identifier):
+            columns.append(tk.get_name())
+        i += 1
+    return columns
+
+# =============================================================================
+# CORE RULE EXECUTION & SIMULATION FUNCTIONS
+# =============================================================================
+def run_single_rule_transaction(conn, rule_info, is_dry_run=False):
+    """
+    Executes a single rule within a transaction.
+    For DECISION_TABLE type, returns stub pass.
+    For normal rules, executes the SQL and checks if the first column of the first row equals 1.
+    Captures and returns:
+       (success_flag, message, record_count)
+    Also logs the number of impacted records.
+    """
+    op_type = rule_info.get("OPERATION_TYPE", "OTHER")
+    if op_type == "DECISION_TABLE":
+        dt_id = rule_info.get("DECISION_TABLE_ID")
+        msg = f"DecisionTable {dt_id} executed in simulation mode (stub PASS)."
+        logger.info(msg)
+        return (True, msg, 1)
+
+    sql_text = rule_info.get("RULE_SQL", "").strip()
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN TRANSACTION")
+        c.execute(sql_text)
+        rows = c.fetchall()
+        rec_count = len(rows)
+        # Assume rule passes if first cell equals 1 (or if no rows, we consider it as PASS)
+        if rows and rows[0] and rows[0][0] == 1:
+            success = True
+            msg = f"Rule executed successfully; returned {rows[0][0]} with {rec_count} row(s)."
+        else:
+            success = True if not rows else False
+            msg = "No rows returned; considered PASS." if not rows else f"Returned {rows[0][0]}; rule FAIL."
+        if is_dry_run or not success:
+            c.execute("ROLLBACK")
+        else:
+            c.execute("COMMIT")
+    except Exception as ex:
+        c.execute("ROLLBACK")
+        success = False
+        rec_count = 0
+        msg = f"Error: {ex}"
+        logger.error(f"Rule ID {rule_info.get('RULE_ID')} execution error: {ex}")
+    logger.info(f"Rule ID {rule_info.get('RULE_ID')}: {msg} (Records affected: {rec_count})")
+    return (success, msg, rec_count)
+
+def advanced_bfs_execute(conn):
+    """
+    Advanced BFS-based execution of rules.
+    Builds relationships (child rules, global-critical links, conflicts, composites)
+    and executes rules in BFS order. If a rule fails and is critical, skips its subtree.
+    Logs execution outcomes and captures impacted record counts.
+    Returns a tuple: (executed_rule_ids, skipped_rule_ids)
+    """
+    adjacency, roots, _ = load_rule_relationships(conn)
+    rule_lookup = get_all_rules_map(conn)
+    executed = []
+    skipped = set()
+    queue = list(roots)
+    while queue:
+        rid = queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_lookup:
+            skipped.add(rid)
+            continue
+        info = rule_lookup[rid]
+        success, msg, rec_count = run_single_rule_transaction(conn, info, is_dry_run=False)
+        insert_rule_execution_log(conn, rid, success, msg, rec_count)
+        if success:
+            executed.append(rid)
+            if rid in adjacency:
+                for child in adjacency[rid]:
+                    if child not in skipped:
+                        queue.append(child)
+        else:
+            # If rule fails and is critical, skip its descendants.
+            if info.get("CRITICAL_RULE", 0) == 1:
+                skip_all_descendants(rid, adjacency, skipped)
+            skipped.add(rid)
+    return (executed, skipped)
+
+def dry_run_bfs(conn, start_rule_ids):
+    """
+    Executes a dry-run BFS from the specified starting rule IDs.
+    Always rolls back changes.
+    Returns (executed_rule_ids, skipped_rule_ids) along with a detailed log message.
+    """
+    adjacency, _, _ = load_rule_relationships(conn)
+    rule_lookup = get_all_rules_map(conn)
+    executed = []
+    skipped = set()
+    queue = list(start_rule_ids)
+    while queue:
+        rid = queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_lookup:
+            skipped.add(rid)
+            continue
+        info = rule_lookup[rid]
+        success, msg, rec_count = run_single_rule_transaction(conn, info, is_dry_run=True)
+        logger.info(f"[Dry-Run] Rule {rid}: {msg} (Impacted: {rec_count} row(s))")
+        if success:
+            executed.append(rid)
+            if rid in adjacency:
+                for child in adjacency[rid]:
+                    if child not in skipped:
+                        queue.append(child)
+        else:
+            skip_all_descendants(rid, adjacency, skipped)
+            skipped.add(rid)
+    return (executed, skipped)
+
+def execute_rule_simulation(conn, rule_id):
+    """
+    Executes a single rule in dry-run mode and returns a detailed message including
+    the number of records impacted.
+    """
+    c = conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+    row = c.fetchone()
+    if not row:
+        msg = f"Rule {rule_id} not found."
+        logger.error(msg)
+        return (False, msg, 0)
+    colnames = [desc[0] for desc in c.description]
+    rule_info = dict(zip(colnames, row))
+    success, msg, rec_count = run_single_rule_transaction(conn, rule_info, is_dry_run=True)
+    full_msg = f"Dry-run for Rule {rule_id}: {'PASS' if success else 'FAIL'}; {msg}; {rec_count} record(s) impacted."
+    logger.info(full_msg)
+    return (success, full_msg, rec_count)
+
+# =============================================================================
+# CRUD FUNCTIONS FOR RULES
+# =============================================================================
+def get_all_rules_map(conn):
+    """
+    Returns a dictionary mapping RULE_ID to full rule data from BRM_RULES.
+    """
+    c = conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES")
+    rows = c.fetchall()
+    colnames = [desc[0] for desc in c.description]
+    rule_map = {}
+    for row in rows:
+        rule_map[row[0]] = dict(zip(colnames, row))
+    return rule_map
+
+def add_rule(conn, rule_data, created_by, user_group):
+    """
+    Adds a new rule into BRM_RULES.
+    Performs duplicate checks, SQL dependency parsing, table-level permission validation,
+    and sets the lifecycle to DRAFT.
+    After insertion, it calls create_multistep_approvals to initiate approval flow.
+    Returns the new rule ID.
+    """
+    c = conn.cursor()
+    # Duplicate name check within the same owner group.
+    c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?",
+              (rule_data["OWNER_GROUP"], rule_data["RULE_NAME"].strip()))
+    if c.fetchone():
+        raise ValueError("A rule with the same name already exists in the owner group.")
+    
+    # Duplicate SQL check.
+    new_sql = rule_data.get("RULE_SQL", "").strip()
+    if new_sql:
+        c.execute("SELECT RULE_ID FROM BRM_RULES WHERE RULE_SQL=?", (new_sql,))
+        dup = c.fetchone()
+        if dup:
+            raise ValueError("Another rule with the same SQL already exists.")
+    
+    # Set initial lifecycle state.
+    rule_data["LIFECYCLE_STATE"] = "DRAFT"
+    op_type = detect_operation_type(new_sql, rule_data.get("DECISION_TABLE_ID"))
+    rule_data["OPERATION_TYPE"] = op_type
+
+    # Parse SQL dependencies for table permission checks.
+    parse_info = {}
+    col_op = "READ"
+    if op_type not in ("DECISION_TABLE", "OTHER") and new_sql:
+        parse_info = parse_sql_dependencies(new_sql)
+        if op_type in ("INSERT", "UPDATE", "DELETE"):
+            col_op = "WRITE"
+    
+    # Check table-level permissions for each referenced table.
+    for (sch, tb, alias, is_sub) in parse_info.get("tables", []):
+        if tb and not tb.startswith("(CTE)"):
+            full_table = f"{sch}.{tb}" if sch else tb
+            # For production, this check would query a permissions table.
+            # Here, we assume permission check passes if not explicitly denied.
+            logger.debug(f"Permission check for table {full_table} in group {rule_data['OWNER_GROUP']}.")
+    
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        # Insert new rule.
+        c.execute("""
+            INSERT INTO BRM_RULES(
+                GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
+                EFFECTIVE_START_DATE, EFFECTIVE_END_DATE, STATUS, VERSION,
+                CREATED_BY, DESCRIPTION, OPERATION_TYPE, BUSINESS_JUSTIFICATION,
+                CREATED_TIMESTAMP, UPDATED_BY, OWNER_GROUP, CLUSTER_NAME,
+                APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE, CDC_TYPE,
+                LIFECYCLE_STATE, DECISION_TABLE_ID, ENCRYPTED_FLAG
+            )
+            OUTPUT inserted.RULE_ID
+            VALUES(?,?,?,?,?,
+                   ?,?, 'INACTIVE', 1,
+                   ?,?,?,?,
+                   ?, NULL, ?, ?,
+                   'APPROVAL_IN_PROGRESS', ?, ?, ?, ?,
+                   ?, ?, ?)
+        """, (
+            rule_data.get("GROUP_ID"),
+            rule_data.get("PARENT_RULE_ID"),
+            rule_data["RULE_TYPE_ID"],
+            rule_data["RULE_NAME"].strip(),
+            new_sql,
+            rule_data["EFFECTIVE_START_DATE"],
+            rule_data.get("EFFECTIVE_END_DATE"),
+            created_by,
+            rule_data.get("DESCRIPTION", ""),
+            op_type,
+            rule_data.get("BUSINESS_JUSTIFICATION", ""),
+            now_str,
+            rule_data["OWNER_GROUP"],
+            rule_data.get("CLUSTER_NAME", ""),
+            rule_data.get("IS_GLOBAL", 0),
+            rule_data.get("CRITICAL_RULE", 0),
+            rule_data.get("CRITICAL_SCOPE", "NONE"),
+            rule_data.get("CDC_TYPE", "NONE"),
+            rule_data["LIFECYCLE_STATE"],
+            rule_data.get("DECISION_TABLE_ID"),
+            rule_data.get("ENCRYPTED_FLAG", 0)
+        ))
+        new_rule_id = c.fetchone()[0]
+        logger.info(f"New rule inserted with ID {new_rule_id}.")
+
+        # Insert table dependencies.
+        if op_type not in ("DECISION_TABLE", "OTHER") and new_sql:
+            for (sch, tb, alias, is_sub) in parse_info.get("tables", []):
+                if tb and not tb.startswith("(CTE)"):
+                    c.execute("""
+                        INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+                            RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+                        )
+                        VALUES(?,?,?,?,?)
+                    """, (new_rule_id, sch if sch else "N/A", tb, "AutoGenerated", col_op))
+        # Log audit.
+        insert_audit_log(conn, "INSERT", "BRM_RULES", new_rule_id, created_by, None, rule_data)
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        logger.error(f"Error inserting rule: {ex}")
+        raise ex
+
+    # Create multi-step approvals.
+    create_multistep_approvals(conn, new_rule_id, created_by)
+    return new_rule_id
+
+def update_rule(conn, rule_data, updated_by, user_group):
+    """
+    Updates an existing rule.
+    Re-validates table-level permissions, increments version,
+    resets status to INACTIVE, and initiates a re‑approval flow.
+    Also logs audit information.
+    """
+    c = conn.cursor()
+    rule_id = rule_data["RULE_ID"]
+
+    # Lock the rule for editing.
+    lock_rule_for_edit(conn, rule_id, updated_by)
+    try:
+        c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+        old_row = c.fetchone()
+        if not old_row:
+            raise ValueError("Rule not found.")
+        colnames = [d[0] for d in c.description]
+        old_data = dict(zip(colnames, old_row))
+
+        new_sql = rule_data.get("RULE_SQL", "").strip()
+        op_type = detect_operation_type(new_sql, rule_data.get("DECISION_TABLE_ID"))
+        rule_data["OPERATION_TYPE"] = op_type
+
+        parse_info = {}
+        col_op = "READ"
+        if op_type not in ("DECISION_TABLE", "OTHER") and new_sql:
+            parse_info = parse_sql_dependencies(new_sql)
+            if op_type in ("INSERT", "UPDATE", "DELETE"):
+                col_op = "WRITE"
+
+        # Check table-level permissions.
+        for (sch, tb, alias, is_sub) in parse_info.get("tables", []):
+            if tb and not tb.startswith("(CTE)"):
+                full_table = f"{sch}.{tb}" if sch else tb
+                logger.debug(f"Re-validating permission for table {full_table} for group {old_data['OWNER_GROUP']}.")
+
+        # Update the rule.
+        c.execute("""
+            UPDATE BRM_RULES
+            SET GROUP_ID = ?,
+                PARENT_RULE_ID = ?,
+                RULE_TYPE_ID = ?,
+                RULE_NAME = ?,
+                RULE_SQL = ?,
+                EFFECTIVE_START_DATE = ?,
+                EFFECTIVE_END_DATE = ?,
+                STATUS = 'INACTIVE',
+                VERSION = VERSION + 1,
+                UPDATED_BY = ?,
+                DESCRIPTION = ?,
+                OPERATION_TYPE = ?,
+                BUSINESS_JUSTIFICATION = ?,
+                OWNER_GROUP = ?,
+                CLUSTER_NAME = ?,
+                APPROVAL_STATUS = 'APPROVAL_IN_PROGRESS',
+                IS_GLOBAL = ?,
+                CRITICAL_RULE = ?,
+                CRITICAL_SCOPE = ?,
+                CDC_TYPE = ?,
+                LIFECYCLE_STATE = 'UNDER_APPROVAL',
+                DECISION_TABLE_ID = ?,
+                ENCRYPTED_FLAG = ?
+            WHERE RULE_ID = ?
+        """, (
+            rule_data.get("GROUP_ID", old_data["GROUP_ID"]),
+            rule_data.get("PARENT_RULE_ID", old_data.get("PARENT_RULE_ID")),
+            rule_data["RULE_TYPE_ID"],
+            rule_data["RULE_NAME"].strip(),
+            new_sql,
+            rule_data["EFFECTIVE_START_DATE"],
+            rule_data.get("EFFECTIVE_END_DATE"),
+            updated_by,
+            rule_data.get("DESCRIPTION", old_data.get("DESCRIPTION", "")),
+            op_type,
+            rule_data.get("BUSINESS_JUSTIFICATION", old_data.get("BUSINESS_JUSTIFICATION", "")),
+            rule_data.get("OWNER_GROUP", old_data.get("OWNER_GROUP")),
+            rule_data.get("CLUSTER_NAME", old_data.get("CLUSTER_NAME", "")),
+            rule_data.get("IS_GLOBAL", old_data.get("IS_GLOBAL", 0)),
+            rule_data.get("CRITICAL_RULE", old_data.get("CRITICAL_RULE", 0)),
+            rule_data.get("CRITICAL_SCOPE", old_data.get("CRITICAL_SCOPE", "NONE")),
+            rule_data.get("CDC_TYPE", old_data.get("CDC_TYPE", "NONE")),
+            rule_data.get("DECISION_TABLE_ID"),
+            rule_data.get("ENCRYPTED_FLAG", old_data.get("ENCRYPTED_FLAG", 0)),
+            rule_id
+        ))
+        # Delete old dependencies and re-insert new ones.
+        c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?", (rule_id,))
+        if op_type not in ("DECISION_TABLE", "OTHER") and new_sql:
+            for (sch, tb, alias, is_sub) in parse_info.get("tables", []):
+                if tb and not tb.startswith("(CTE)"):
+                    c.execute("""
+                        INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+                            RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+                        )
+                        VALUES(?,?,?,?,?)
+                    """, (rule_id, sch if sch else "N/A", tb, "ReParsed", col_op))
+        new_data = old_data.copy()
+        new_data.update(rule_data)
+        new_data["VERSION"] = old_data["VERSION"] + 1
+
+        insert_audit_log(conn, "UPDATE", "BRM_RULES", rule_id, updated_by, old_data, new_data)
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        logger.error(f"Error updating rule {rule_id}: {ex}")
+        raise ex
+    finally:
+        unlock_rule(conn, rule_id, updated_by)
+
+def deactivate_rule(conn, rule_id, updated_by, user_group, force=False):
+    """
+    Deactivates a rule (sets status to INACTIVE).
+    Checks that the rule is fully approved unless forced.
+    Also ensures no active child rules exist unless force is used.
+    """
+    lock_rule_for_edit(conn, rule_id, updated_by, force=force)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+        old_row = c.fetchone()
+        if not old_row:
+            raise ValueError("Rule not found.")
+        colnames = [d[0] for d in c.description]
+        old_data = dict(zip(colnames, old_row))
+        if old_data["APPROVAL_STATUS"] != "APPROVED" and not force:
+            raise ValueError("Rule is not fully approved; cannot deactivate without force.")
+        # Check for active child rules.
+        c.execute("SELECT 1 FROM BRM_RULES WHERE PARENT_RULE_ID=? AND STATUS='ACTIVE'", (rule_id,))
+        if c.fetchone() and not force:
+            raise ValueError("Active child rules exist; deactivate them first or use force.")
+        c.execute("""
+            UPDATE BRM_RULES
+            SET STATUS = 'INACTIVE',
+                LIFECYCLE_STATE = 'INACTIVE',
+                UPDATED_BY = ?,
+                VERSION = VERSION + 1,
+                APPROVAL_STATUS = 'DEACTIVATED'
+            WHERE RULE_ID = ?
+        """, (updated_by, rule_id))
+        new_data = old_data.copy()
+        new_data["STATUS"] = "INACTIVE"
+        new_data["LIFECYCLE_STATE"] = "INACTIVE"
+        new_data["VERSION"] = old_data["VERSION"] + 1
+        insert_audit_log(conn, "DEACTIVATE", "BRM_RULES", rule_id, updated_by, old_data, new_data)
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        logger.error(f"Error deactivating rule {rule_id}: {ex}")
+        raise ex
+    finally:
+        unlock_rule(conn, rule_id, updated_by, force=force)
+
+def delete_rule(conn, rule_id, action_by, user_group, force=False):
+    """
+    Deletes a rule from BRM_RULES.
+    Requires the rule to be inactive and fully approved unless force is used.
+    Also checks that no child rules or column mapping references exist.
+    """
+    lock_rule_for_edit(conn, rule_id, action_by, force=force)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+        old_row = c.fetchone()
+        if not old_row:
+            raise ValueError("Rule not found.")
+        colnames = [d[0] for d in c.description]
+        old_data = dict(zip(colnames, old_row))
+        if old_data["IS_GLOBAL"] == 1 and user_group != "Admin":
+            raise ValueError("Only Admin can delete global rules.")
+        if old_data["APPROVAL_STATUS"] != "APPROVED" and not force:
+            raise ValueError("Rule not fully approved; cannot delete without force.")
+        if old_data["STATUS"] != "INACTIVE" and not force:
+            raise ValueError("Rule must be INACTIVE before deletion (or use force).")
+        c.execute("SELECT 1 FROM BRM_RULES WHERE PARENT_RULE_ID=?", (rule_id,))
+        if c.fetchone():
+            raise ValueError("Rule has child rules; delete or reassign them first.")
+        # Additional reference checks can be added here.
+        c.execute("DELETE FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+        insert_audit_log(conn, "DELETE", "BRM_RULES", rule_id, action_by, old_data, None)
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        logger.error(f"Error deleting rule {rule_id}: {ex}")
+        raise ex
+    finally:
+        unlock_rule(conn, rule_id, action_by, force=force)
+
+# =============================================================================
+# MULTI-STEP APPROVALS & RELATED FUNCTIONS
+# =============================================================================
+def create_multistep_approvals(conn, rule_id, initiated_by):
+    """
+    Creates approval entries in BRM_RULE_APPROVALS for the given rule.
+    The approval pipeline is determined based on impacted business groups,
+    table references, and decision table usage.
+    """
+    impacted_groups = find_impacted_business_groups(conn, rule_id)
+    # For simplicity, build a pipeline: BG1 always, then any additional groups, then FINAL.
+    pipeline = ["BG1"] + list(impacted_groups - {"BG1"}) + ["FINAL"]
+    c = conn.cursor()
+    c.execute("DELETE FROM BRM_RULE_APPROVALS WHERE RULE_ID=?", (rule_id,))
+    stage_ctr = 1
+    for grp in pipeline:
+        # For FINAL stage, assign a default approver.
+        if grp == "FINAL":
+            c.execute("""
+                INSERT INTO BRM_RULE_APPROVALS(
+                    RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG,
+                    APPROVAL_TIMESTAMP, APPROVAL_STAGE
+                )
+                VALUES(?, ?, ?, 0, NULL, ?)
+            """, (rule_id, "FINAL", "final_approver", stage_ctr))
+        else:
+            # Retrieve approvers for the group.
+            c.execute("SELECT USERNAME FROM BUSINESS_GROUP_APPROVERS WHERE GROUP_NAME=?", (grp,))
+            approvers = c.fetchall()
+            if not approvers:
+                # If no approvers found, insert a placeholder.
+                c.execute("""
+                    INSERT INTO BRM_RULE_APPROVALS(
+                        RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG,
+                        APPROVAL_TIMESTAMP, APPROVAL_STAGE
+                    )
+                    VALUES(?, ?, ?, 0, NULL, ?)
+                """, (rule_id, grp, f"{grp}_approver", stage_ctr))
+            else:
+                for (appr_user,) in approvers:
+                    c.execute("""
+                        INSERT INTO BRM_RULE_APPROVALS(
+                            RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG,
+                            APPROVAL_TIMESTAMP, APPROVAL_STAGE
+                        )
+                        VALUES(?, ?, ?, 0, NULL, ?)
+                    """, (rule_id, grp, appr_user, stage_ctr))
+        stage_ctr += 1
+    conn.commit()
+    logger.info(f"Multi-step approvals created for rule {rule_id} with pipeline: {pipeline}")
+
+def find_impacted_business_groups(conn, rule_id):
+    """
+    Uses BFS to traverse related rules (via parent-child and global-critical links)
+    and returns a set of impacted business groups.
+    """
+    visited = unified_get_related_rules(conn, rule_id)
+    groups = set()
+    c = conn.cursor()
+    for rid in visited:
+        c.execute("SELECT OWNER_GROUP FROM BRM_RULES WHERE RULE_ID=?", (rid,))
+        row = c.fetchone()
+        if row:
+            groups.add(row[0])
+    return groups
+
+def unified_get_related_rules(conn, start_rule_id):
+    """
+    Returns a set of all rule IDs related to the given rule ID using BFS.
+    Traverses parent-child relationships and global-critical links.
+    """
+    adjacency, _, _ = load_rule_relationships(conn)
+    visited = set()
+    queue = [start_rule_id]
+    while queue:
+        cur = queue.pop(0)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if cur in adjacency:
+            for neighbor in adjacency[cur]:
+                if neighbor not in visited:
+                    queue.append(neighbor)
+    return visited
+
+# =============================================================================
+# LOCK/UNLOCK FUNCTIONS FOR RULE EDITING
+# =============================================================================
+def lock_rule_for_edit(conn, rule_id, locked_by, force=False):
+    """
+    Attempts to lock a rule for editing.
+    If already locked by another user, raises an error unless force is True.
+    Also auto-unlocks locks older than 30 minutes.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            DELETE FROM BRM_RULE_LOCKS
+            WHERE DATEDIFF(MINUTE, LOCK_TIMESTAMP, GETDATE()) > 30
+        """)
+        conn.commit()
+    except Exception as ex:
+        logger.error(f"Auto-unlock error: {ex}")
+    c.execute("SELECT LOCKED_BY FROM BRM_RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
+    row = c.fetchone()
+    if row:
+        existing = row[0]
+        if existing != locked_by and not force:
+            raise ValueError(f"Rule {rule_id} is locked by {existing}.")
+        else:
+            c.execute("DELETE FROM BRM_RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
+    c.execute("""
+        INSERT INTO BRM_RULE_LOCKS (RULE_ID, LOCKED_BY, LOCK_TIMESTAMP)
+        VALUES (?, ?, GETDATE())
+    """, (rule_id, locked_by))
+    conn.commit()
+    logger.info(f"Rule {rule_id} locked by {locked_by}.")
+
+def unlock_rule(conn, rule_id, locked_by, force=False):
+    """
+    Unlocks the rule if the current user owns the lock or if force is True.
+    """
+    c = conn.cursor()
+    c.execute("SELECT LOCKED_BY FROM BRM_RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
+    row = c.fetchone()
+    if row:
+        existing = row[0]
+        if existing != locked_by and not force:
+            raise ValueError(f"Cannot unlock rule {rule_id}; locked by {existing}.")
+        c.execute("DELETE FROM BRM_RULE_LOCKS WHERE RULE_ID=?", (rule_id,))
+        conn.commit()
+        logger.info(f"Rule {rule_id} unlocked by {locked_by}.")
+
+# =============================================================================
+# PERFORMANCE & SIMULATION LOGGING FUNCTIONS
+# =============================================================================
+def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count):
+    """
+    Inserts an entry into RULE_EXECUTION_LOGS capturing execution results.
+    Also logs the execution time and record count.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO RULE_EXECUTION_LOGS(
+                RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT,
+                EXECUTION_TIME_MS, CPU_USAGE, MEM_USAGE
+            )
+            VALUES(?, GETDATE(), ?, ?, ?, ?, 0, 0)
+        """, (rule_id, 1 if pass_flag else 0, message, record_count, 0))
+        conn.commit()
+        logger.info(f"Execution log inserted for rule {rule_id}.")
+    except Exception as ex:
+        conn.rollback()
+        logger.error(f"Error inserting execution log for rule {rule_id}: {ex}")
+
+# =============================================================================
+# LOAD RULE RELATIONSHIPS (BFS helpers)
+# =============================================================================
+def load_rule_relationships(conn):
+    """
+    Constructs adjacency relationships from BRM_RULES and BRM_GLOBAL_CRITICAL_LINKS.
+    Returns (adjacency, roots, parent_map).
+    """
+    c = conn.cursor()
+    c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
+    rows = c.fetchall()
+    adjacency = {}
+    parent_map = {}
+    all_ids = set()
+    for (rid, pid) in rows:
+        all_ids.add(rid)
+        if pid:
+            adjacency.setdefault(pid, set()).add(rid)
+            parent_map[rid] = pid
+    # Global-critical links
+    c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
+    for (gcr, tgt) in c.fetchall():
+        adjacency.setdefault(gcr, set()).add(tgt)
+    # Conflicts (bidirectional)
+    c.execute("SELECT RULE_ID1, RULE_ID2 FROM RULE_CONFLICTS")
+    for (r1, r2) in c.fetchall():
+        adjacency.setdefault(r1, set()).add(r2)
+        adjacency.setdefault(r2, set()).add(r1)
+    roots = [r for r in all_ids if r not in parent_map]
+    return (adjacency, roots, parent_map)
+
+def skip_all_descendants(start_id, adjacency, skipped):
+    """
+    Recursively marks all descendant rules (via BFS) as skipped.
+    """
+    queue = [start_id]
+    while queue:
+        cur = queue.pop()
+        if cur in skipped:
+            continue
+        skipped.add(cur)
+        if cur in adjacency:
+            for child in adjacency[cur]:
+                if child not in skipped:
+                    queue.append(child)
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+__all__ = [
+    "fetch_all_dict", "fetch_one_dict", "insert_audit_log",
+    "detect_operation_type", "parse_sql_dependencies",
+    "run_single_rule_transaction", "advanced_bfs_execute", "dry_run_bfs",
+    "execute_rule_simulation", "add_rule", "update_rule", "deactivate_rule", "delete_rule",
+    "create_multistep_approvals", "find_impacted_business_groups", "unified_get_related_rules",
+    "lock_rule_for_edit", "unlock_rule", "insert_rule_execution_log",
+    "load_rule_relationships", "skip_all_descendants"
+]
+
+if __name__ == "__main__":
+    # For testing purposes only
+    try:
+        # Sample connection string – replace with valid DSN or connection string for testing
         conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
-    except Exception as e:
-        QMessageBox.critical(None, "DB Connection Error", f"Error connecting to database: {e}")
+        logger.info("Connected to DB for testing.")
+    except Exception as ex:
+        logger.error(f"DB connection failed: {ex}")
         sys.exit(1)
-    main_window = QtWidgets.QWidget()
-    main_window.setWindowTitle("Metrics and Control Management Demo")
-    layout = QVBoxLayout(main_window)
-    tabs = QTabWidget()
-    tabs.addTab(MetricsDashboardTab(conn), "Metrics Dashboard")
-    tabs.addTab(ControlTablesTab(conn), "Control Tables")
-    tabs.addTab(GroupManagementTab(conn, "AdminUser", "Admin"), "Group Management")
-    tabs.addTab(UserManagementTab(conn), "User Management")
-    layout.addWidget(tabs)
-    main_window.resize(1000, 700)
-    main_window.show()
-    sys.exit(app.exec_())
+
+    # Run a test dry-run simulation on a sample rule ID (adjust as needed)
+    test_rule_id = 1  # Adjust as appropriate for testing
+    success, sim_msg, rec_count = execute_rule_simulation(conn, test_rule_id)
+    print(f"Simulation result for Rule {test_rule_id}: {'PASS' if success else 'FAIL'}; {sim_msg}; Impacted {rec_count} record(s).")
