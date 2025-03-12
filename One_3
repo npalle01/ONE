@@ -1,0 +1,174 @@
+# scheduling_manager.py
+import asyncio
+import time
+import logging
+from datetime import datetime, timedelta
+
+# Import database connection and common functions from core module.
+from core import (
+    send_email_notification,
+    insert_audit_log,
+    logger,
+    fetch_all_dict
+)
+# Import the execution manager to run rule simulations asynchronously.
+from execution_manager import AsyncExecutionManager, run_rule_transaction
+
+# For centralized logging, we assume logger is already configured in core.
+
+class SchedulingManager:
+    """
+    Advanced Scheduling Manager:
+      - Polls the RULE_SCHEDULES table for scheduled rules whose schedule time is due.
+      - For each due schedule, it runs a dry‑run simulation asynchronously,
+        capturing the number of records impacted, execution time, and success/failure status.
+      - Updates the schedule status accordingly (Executed or Failed).
+      - Sends real‑time email notifications (if configured) when a rule simulation fails.
+      - Supports asynchronous/parallel execution for heavy ETL tasks.
+      - Designed for production environments with auto‑refresh capability.
+    """
+    POLL_INTERVAL_SECONDS = 60  # check every 60 seconds
+    FAILURE_NOTIFICATION_RECIPIENTS = ["ops-team@example.com"]
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.async_exec_manager = AsyncExecutionManager(connection)
+        self.loop = asyncio.get_event_loop()
+        self.logger = logging.getLogger("SchedulingManager")
+
+    async def _poll_schedules(self):
+        """
+        Polls the RULE_SCHEDULES table periodically for tasks that are due.
+        Runs each due schedule using asynchronous execution.
+        """
+        while True:
+            try:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cursor = self.connection.cursor()
+                cursor.execute("""
+                    SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, RUN_DATA_VALIDATIONS
+                    FROM RULE_SCHEDULES
+                    WHERE STATUS = 'Scheduled' AND SCHEDULE_TIME <= ?
+                    """, (now,))
+                due_tasks = fetch_all_dict(cursor)
+                if due_tasks:
+                    self.logger.info(f"Found {len(due_tasks)} scheduled task(s) due at {now}.")
+                    # Prepare simulation tasks concurrently
+                    simulation_tasks = []
+                    for task in due_tasks:
+                        rule_info = self._get_rule_info(task["RULE_ID"])
+                        if rule_info is None:
+                            self.logger.error(f"Rule ID {task['RULE_ID']} not found. Marking schedule {task['SCHEDULE_ID']} as Failed.")
+                            self._update_schedule_status(task["SCHEDULE_ID"], "Failed")
+                            continue
+                        simulation_tasks.append(
+                            self.async_exec_manager.run_rule_dry_run(rule_info)
+                        )
+                    # Run all simulations concurrently
+                    results = await asyncio.gather(*simulation_tasks, return_exceptions=True)
+                    # Process each result and update schedule status accordingly.
+                    for idx, task in enumerate(due_tasks):
+                        result = results[idx]
+                        schedule_id = task["SCHEDULE_ID"]
+                        rule_id = task["RULE_ID"]
+                        if isinstance(result, Exception):
+                            self.logger.error(f"Simulation error for schedule {schedule_id}: {result}")
+                            self._update_schedule_status(schedule_id, "Failed")
+                            self._notify_failure(rule_id, str(result))
+                        else:
+                            # Log simulation outcome details
+                            success = result["success"]
+                            msg = result["message"]
+                            rec_count = result["record_count"]
+                            elapsed_ms = result["elapsed_ms"]
+                            self.logger.info(
+                                f"Schedule {schedule_id} for rule {rule_id}: success={success}, records={rec_count}, time={elapsed_ms:.2f} ms."
+                            )
+                            if success:
+                                self._update_schedule_status(schedule_id, "Executed")
+                            else:
+                                self._update_schedule_status(schedule_id, "Failed")
+                                self._notify_failure(rule_id, msg)
+                else:
+                    self.logger.debug("No scheduled tasks are due at this time.")
+            except Exception as ex:
+                self.logger.exception(f"Error during schedule polling: {ex}")
+            await asyncio.sleep(self.POLL_INTERVAL_SECONDS)
+
+    def _get_rule_info(self, rule_id):
+        """
+        Retrieves the full rule info dictionary from BRM_RULES.
+        Returns None if rule not found.
+        """
+        try:
+            c = self.connection.cursor()
+            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID = ?", (rule_id,))
+            row = c.fetchone()
+            if row and c.description:
+                cols = [desc[0] for desc in c.description]
+                return dict(zip(cols, row))
+        except Exception as ex:
+            self.logger.error(f"Error fetching rule info for {rule_id}: {ex}")
+        return None
+
+    def _update_schedule_status(self, schedule_id, new_status):
+        """
+        Updates the status of a schedule in RULE_SCHEDULES.
+        """
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                UPDATE RULE_SCHEDULES
+                SET STATUS = ?
+                WHERE SCHEDULE_ID = ?
+                """, (new_status, schedule_id))
+            self.connection.commit()
+            self.logger.info(f"Schedule {schedule_id} updated to status '{new_status}'.")
+        except Exception as ex:
+            self.logger.error(f"Failed to update schedule {schedule_id}: {ex}")
+
+    def _notify_failure(self, rule_id, message):
+        """
+        Sends an email notification if a rule simulation fails.
+        Also logs the failure.
+        """
+        subject = f"[BRM Alert] Rule {rule_id} Simulation Failure"
+        body = f"Rule {rule_id} simulation failed with message:\n{message}"
+        try:
+            send_email_notification(subject, body, self.FAILURE_NOTIFICATION_RECIPIENTS)
+            self.logger.info(f"Failure notification sent for rule {rule_id}.")
+        except Exception as ex:
+            self.logger.error(f"Failed to send notification for rule {rule_id}: {ex}")
+
+    def start(self):
+        """
+        Starts the asynchronous polling loop.
+        This method blocks the current thread by running the event loop.
+        In a real application, this would run in a dedicated thread or via an external scheduler.
+        """
+        try:
+            self.loop.run_until_complete(self._poll_schedules())
+        except KeyboardInterrupt:
+            self.logger.info("Schedule polling stopped by user.")
+
+# Synchronous wrapper to start polling in the background (if needed)
+def start_schedule_manager(connection):
+    manager = SchedulingManager(connection)
+    asyncio.ensure_future(manager._poll_schedules())
+    return manager
+
+# If run as a script for testing, start the scheduler (this section can be omitted in production deployments)
+if __name__ == "__main__":
+    import pyodbc
+    from core import DatabaseConnectionDialog  # Assuming core provides DB connection dialog
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication([])
+    db_dlg = DatabaseConnectionDialog()
+    if db_dlg.exec_() == DatabaseConnectionDialog.Accepted:
+        conn = db_dlg.get_connection()
+        sched_manager = SchedulingManager(conn)
+        # Run the scheduler polling loop (this will block)
+        sched_manager.start()
+    else:
+        print("No connection established. Exiting.")
