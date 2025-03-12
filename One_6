@@ -1,0 +1,403 @@
+# lineage_visualization.py
+import sys
+import math
+import random
+import logging
+import json
+from datetime import datetime
+from PyQt5.QtCore import Qt, QPointF, QTimer, QRectF
+from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QFont, QPolygonF, QPainterPath
+from PyQt5.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsEllipseItem,
+    QGraphicsTextItem, QGraphicsPathItem, QLineEdit, QVBoxLayout, QWidget,
+    QHBoxLayout, QPushButton, QApplication, QMessageBox
+)
+
+# Set up module-level logger
+logger = logging.getLogger("LineageVisualization")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+# =============================================================================
+# Node Item Class
+# =============================================================================
+class LineageNodeItem(QGraphicsEllipseItem):
+    """
+    Represents a node in the lineage graph.
+    Node types can be 'rule', 'table', or 'decision'.
+    Appearance (color, tooltip) is determined by its type and live status.
+    """
+    def __init__(self, node_id, label, node_type, status, extra_info=None, radius=50, *args, **kwargs):
+        """
+        Parameters:
+          node_id: Unique identifier (rule ID, or table identifier string).
+          label: Text label.
+          node_type: 'rule', 'table', or 'decision'
+          status: e.g. 'ACTIVE', 'INACTIVE', 'APPROVAL_IN_PROGRESS'
+          extra_info: dict with additional flags (e.g. {"global": True, "critical": True})
+          radius: Radius of the circular node.
+        """
+        super().__init__(-radius, -radius, 2 * radius, 2 * radius, *args, **kwargs)
+        self.node_id = node_id
+        self.label = label
+        self.node_type = node_type
+        self.status = status
+        self.extra_info = extra_info or {}
+        self.radius = radius
+
+        self.setFlags(QGraphicsItem.ItemIsSelectable | QGraphicsItem.ItemIsMovable)
+        self.setAcceptHoverEvents(True)
+        self.text_item = QGraphicsTextItem(label, self)
+        self.text_item.setDefaultTextColor(Qt.black)
+        self.text_item.setFont(QFont("Arial", 10))
+        # Center the text
+        text_rect = self.text_item.boundingRect()
+        self.text_item.setPos(-text_rect.width() / 2, -text_rect.height() / 2)
+        self.updateAppearance()
+    
+    def updateAppearance(self):
+        """
+        Sets the fill color and pen based on node type, status, and extra info.
+        """
+        # Base colors by node type and status:
+        if self.node_type == 'rule':
+            if self.status.upper() == 'ACTIVE':
+                color = QColor(144, 238, 144)  # light green
+            elif self.status.upper() == 'INACTIVE':
+                color = QColor(255, 182, 193)  # light red
+            elif self.status.upper() == 'APPROVAL_IN_PROGRESS':
+                color = QColor(255, 223, 186)  # light orange
+            else:
+                color = QColor(211, 211, 211)  # light gray
+        elif self.node_type == 'table':
+            color = QColor(173, 216, 230)  # light blue
+        elif self.node_type == 'decision':
+            color = QColor(255, 255, 153)  # light yellow
+        else:
+            color = QColor(211, 211, 211)
+
+        # Adjust for critical/global flags
+        if self.extra_info.get("critical"):
+            color = QColor(255, 160, 122)  # light salmon
+        if self.extra_info.get("global"):
+            color = QColor(135, 206, 250)  # light sky blue
+
+        self.setBrush(QBrush(color))
+        self.setPen(QPen(Qt.black, 2))
+        self.setToolTip(f"{self.node_type.capitalize()} {self.node_id}:\n{self.label}\nStatus: {self.status}\nExtra: {json.dumps(self.extra_info)}")
+    
+    def hoverEnterEvent(self, event):
+        self.updateAppearance()
+        super().hoverEnterEvent(event)
+
+# =============================================================================
+# Edge Item Class
+# =============================================================================
+class LineageEdgeItem(QGraphicsPathItem):
+    """
+    Represents a directional edge with an arrowhead connecting two nodes.
+    """
+    def __init__(self, source_item, dest_item, color=Qt.black, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.source_item = source_item
+        self.dest_item = dest_item
+        self.color = color
+        self.arrow_size = 10
+        self.setPen(QPen(self.color, 2))
+        self.updatePosition()
+    
+    def updatePosition(self):
+        """
+        Recalculate the path from source to destination, offsetting the endpoints
+        by the node radii.
+        """
+        source_center = self.source_item.scenePos()
+        dest_center = self.dest_item.scenePos()
+        line = dest_center - source_center
+        length = math.hypot(line.x(), line.y())
+        if length == 0:
+            return
+        start_point = source_center + line * (self.source_item.radius / length)
+        end_point = dest_center - line * (self.dest_item.radius / length)
+        path = QPainterPath()
+        path.moveTo(start_point)
+        path.lineTo(end_point)
+        self.setPath(path)
+        self.arrow_head = self._createArrowHead(start_point, end_point)
+    
+    def _createArrowHead(self, start_point, end_point):
+        """
+        Creates a QPolygonF for the arrow head at the end point.
+        """
+        line = end_point - start_point
+        angle = math.atan2(-line.y(), line.x())
+        p1 = end_point + QPointF(math.sin(angle - math.pi / 3) * self.arrow_size,
+                                 math.cos(angle - math.pi / 3) * self.arrow_size)
+        p2 = end_point + QPointF(math.sin(angle - math.pi + math.pi / 3) * self.arrow_size,
+                                 math.cos(angle - math.pi + math.pi / 3) * self.arrow_size)
+        arrow_head = QPolygonF([end_point, p1, p2])
+        return arrow_head
+    
+    def paint(self, painter, option, widget):
+        super().paint(painter, option, widget)
+        if hasattr(self, 'arrow_head'):
+            painter.setBrush(self.pen().color())
+            painter.drawPolygon(self.arrow_head)
+
+# =============================================================================
+# Main Graph Widget
+# =============================================================================
+class LineageGraphWidget(QGraphicsView):
+    """
+    An advanced lineage graph widget that renders an ER‑style diagram with nodes and
+    directional arrows. It automatically populates its scene by querying the database
+    for rules, table dependencies, and decision tables.
+    
+    Features:
+      • Auto‑refresh via QTimer.
+      • Search function (via search_lineage) to highlight matching nodes.
+      • Uses a basic random layout (production systems should use a proper layout algorithm).
+    """
+    def __init__(self, connection, refresh_interval=60000, parent=None):
+        """
+        Parameters:
+          connection: Active database connection.
+          refresh_interval: Auto‑refresh interval in milliseconds.
+        """
+        super().__init__(parent)
+        self.connection = connection
+        self.refresh_interval = refresh_interval
+        self.setRenderHint(QPainter.Antialiasing)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+        
+        # Dictionaries to map node keys to items
+        self.node_items = {}
+        self.edge_items = []
+        
+        # Timer for auto‑refresh
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.populate_graph)
+        self.refresh_timer.start(self.refresh_interval)
+        
+        # Initial population
+        self.populate_graph()
+    
+    def clear_graph(self):
+        self.scene.clear()
+        self.node_items.clear()
+        self.edge_items.clear()
+    
+    def populate_graph(self):
+        """
+        Queries the database for:
+         – Rules from BRM_RULES
+         – Table dependencies from BRM_RULE_TABLE_DEPENDENCIES
+         – Decision tables from DECISION_TABLES
+        and constructs an ER‑style graph.
+        """
+        try:
+            self.clear_graph()
+            cursor = self.connection.cursor()
+            # Retrieve rules
+            cursor.execute("""
+            SELECT RULE_ID, RULE_NAME, STATUS, IS_GLOBAL, CRITICAL_RULE, APPROVAL_STATUS
+            FROM BRM_RULES
+            """)
+            rules = cursor.fetchall()
+            for row in rules:
+                rule_id = row[0]
+                rule_name = row[1]
+                status = row[2]
+                is_global = bool(row[3])
+                critical = bool(row[4])
+                approval_status = row[5]
+                extra = {"global": is_global, "critical": critical, "approval_status": approval_status}
+                node = LineageNodeItem(rule_id, rule_name, "rule", status, extra_info=extra, radius=50)
+                node.setPos(self._random_position(max_offset=200))
+                self.scene.addItem(node)
+                self.node_items[f"rule_{rule_id}"] = node
+            
+            # Retrieve table dependencies
+            cursor.execute("""
+            SELECT RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+            FROM BRM_RULE_TABLE_DEPENDENCIES
+            """)
+            deps = cursor.fetchall()
+            table_nodes = {}
+            for row in deps:
+                rule_id, db_name, table_name, col_name, col_op = row
+                key = f"{db_name}.{table_name}".lower()
+                if key not in table_nodes:
+                    label = f"{db_name}.{table_name}"
+                    node = LineageNodeItem(label, label, "table", "ACTIVE", radius=40)
+                    node.setPos(self._random_position(max_offset=300))
+                    self.scene.addItem(node)
+                    table_nodes[key] = node
+                    self.node_items[f"table_{key}"] = node
+                # Create an edge from rule node to table node
+                rule_node = self.node_items.get(f"rule_{rule_id}")
+                table_node = table_nodes.get(key)
+                if rule_node and table_node:
+                    edge = LineageEdgeItem(rule_node, table_node, color=QColor("darkblue"))
+                    self.scene.addItem(edge)
+                    self.edge_items.append(edge)
+            
+            # Retrieve decision tables
+            cursor.execute("""
+            SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION
+            FROM DECISION_TABLES
+            """)
+            dt_rows = cursor.fetchall()
+            for row in dt_rows:
+                dt_id, tbl_name, desc = row
+                label = f"DT {dt_id}: {tbl_name}"
+                node = LineageNodeItem(dt_id, label, "decision", "ACTIVE", radius=45)
+                node.setPos(self._random_position(max_offset=400))
+                self.scene.addItem(node)
+                self.node_items[f"decision_{dt_id}"] = node
+                # Optionally, link decision tables to corresponding rules if metadata is available.
+            
+            # Retrieve parent-child relationships and add edges (for rule lineage)
+            cursor.execute("""
+            SELECT RULE_ID, PARENT_RULE_ID
+            FROM BRM_RULES
+            WHERE PARENT_RULE_ID IS NOT NULL
+            """)
+            pc_rows = cursor.fetchall()
+            for row in pc_rows:
+                child_id, parent_id = row
+                parent_node = self.node_items.get(f"rule_{parent_id}")
+                child_node = self.node_items.get(f"rule_{child_id}")
+                if parent_node and child_node:
+                    edge = LineageEdgeItem(parent_node, child_node, color=QColor("green"))
+                    self.scene.addItem(edge)
+                    self.edge_items.append(edge)
+            
+            self.auto_scale_view()
+            logger.info("Lineage graph populated successfully with %d nodes and %d edges.", len(self.node_items), len(self.edge_items))
+        except Exception as ex:
+            logger.exception("Error populating lineage graph: %s", ex)
+    
+    def _random_position(self, max_offset=200):
+        """
+        Returns a random QPointF within a square of side 'max_offset'.
+        In production, a proper layout algorithm (e.g. force-directed layout) should be used.
+        """
+        x = random.randint(0, max_offset)
+        y = random.randint(0, max_offset)
+        return QPointF(x, y)
+    
+    def auto_scale_view(self):
+        """
+        Adjusts the view to fit the scene.
+        """
+        self.setSceneRect(self.scene.itemsBoundingRect())
+        self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+    
+    def search_lineage(self, search_text):
+        """
+        Highlights nodes whose label contains the search text (case-insensitive)
+        and dims all other nodes.
+        """
+        search_text = search_text.lower().strip()
+        for node in self.node_items.values():
+            if search_text in node.label.lower():
+                node.setOpacity(1.0)
+                node.setScale(1.2)
+            else:
+                node.setOpacity(0.3)
+                node.setScale(1.0)
+    
+    def reset_search(self):
+        """
+        Resets all nodes to normal opacity and scale.
+        """
+        for node in self.node_items.values():
+            node.setOpacity(1.0)
+            node.setScale(1.0)
+    
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.auto_scale_view()
+
+# =============================================================================
+# Manager for Data Retrieval (for plugin architecture)
+# =============================================================================
+class LineageManager:
+    """
+    Provides methods to retrieve raw lineage data from the database.
+    This class can be used as a plugin interface for scaling and micro‑frontend architectures.
+    """
+    def __init__(self, connection):
+        self.connection = connection
+        self.logger = logger
+    
+    def fetch_rules(self):
+        c = self.connection.cursor()
+        c.execute("""
+        SELECT RULE_ID, RULE_NAME, STATUS, IS_GLOBAL, CRITICAL_RULE, APPROVAL_STATUS
+        FROM BRM_RULES
+        """)
+        return c.fetchall()
+    
+    def fetch_table_dependencies(self):
+        c = self.connection.cursor()
+        c.execute("""
+        SELECT RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+        FROM BRM_RULE_TABLE_DEPENDENCIES
+        """)
+        return c.fetchall()
+    
+    def fetch_decision_tables(self):
+        c = self.connection.cursor()
+        c.execute("""
+        SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION
+        FROM DECISION_TABLES
+        """)
+        return c.fetchall()
+
+# =============================================================================
+# For standalone testing (remove when integrating in production)
+# =============================================================================
+if __name__ == "__main__":
+    # For testing, create a QApplication and a simple window with a search bar.
+    from PyQt5.QtWidgets import QVBoxLayout, QLineEdit, QWidget
+
+    app = QApplication(sys.argv)
+    try:
+        import pyodbc
+        # Replace with your actual DSN or connection string.
+        connection = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as ex:
+        logger.error("Database connection error: %s", ex)
+        sys.exit(1)
+
+    widget = LineageGraphWidget(connection, refresh_interval=30000)
+    main_window = QWidget()
+    main_layout = QVBoxLayout(main_window)
+    search_bar = QLineEdit()
+    search_bar.setPlaceholderText("Search lineage (e.g. table name, column)...")
+    main_layout.addWidget(search_bar)
+    main_layout.addWidget(widget)
+
+    # Connect search functionality
+    def on_search(text):
+        if text:
+            widget.search_lineage(text)
+        else:
+            widget.reset_search()
+    search_bar.textChanged.connect(on_search)
+
+    main_window.resize(900, 700)
+    main_window.setWindowTitle("Advanced Lineage Visualization")
+    main_window.show()
+    sys.exit(app.exec_())
