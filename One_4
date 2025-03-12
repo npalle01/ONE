@@ -1,0 +1,122 @@
+# execution_manager.py
+import asyncio
+import time
+import logging
+from datetime import datetime
+
+# Import core functions and logger from our core module (assumed to be production ready)
+from core import insert_audit_log, logger
+
+def run_rule_transaction(connection, rule_info, is_dry_run=True):
+    """
+    Executes the SQL for a given rule inside a database transaction.
+    If is_dry_run is True, the transaction is always rolled back.
+    Returns a tuple:
+       (success: bool, message: str, record_count: int, elapsed_ms: float)
+    This function is synchronous and intended to be run in a separate thread.
+    """
+    cursor = connection.cursor()
+    start_time = datetime.now()
+    try:
+        cursor.execute("BEGIN TRANSACTION")
+        # Execute the rule SQL; we assume the rule_info dict has the key "RULE_SQL"
+        cursor.execute(rule_info.get("RULE_SQL", ""))
+        rows = cursor.fetchall()
+        record_count = len(rows) if rows else 0
+        if rows:
+            first_val = rows[0][0]
+            success = (first_val == 1)
+            message = f"Returned: {first_val}"
+        else:
+            success = True
+            message = "No rows returned; PASS."
+    except Exception as ex:
+        success = False
+        message = str(ex)
+        record_count = 0
+    finally:
+        # For a dry run or if the rule failed, roll back; otherwise, commit.
+        if is_dry_run or not success:
+            cursor.execute("ROLLBACK")
+        else:
+            cursor.execute("COMMIT")
+        connection.commit()
+    elapsed_ms = (datetime.now() - start_time).total_seconds() * 1000.0
+    return success, message, record_count, elapsed_ms
+
+class AsyncExecutionManager:
+    """
+    Asynchronous Execution Manager for running rule simulations.
+    This class wraps blocking database operations using asyncio.to_thread,
+    enabling parallel execution of dry-run simulations.
+    """
+    def __init__(self, connection):
+        self.connection = connection
+        self.logger = logging.getLogger("AsyncExecutionManager")
+
+    async def run_rule_dry_run(self, rule_info):
+        """
+        Asynchronously executes a dry-run simulation for the provided rule.
+        Returns a dictionary with keys:
+          - success (bool)
+          - message (str)
+          - record_count (int)
+          - elapsed_ms (float)
+        """
+        try:
+            result = await asyncio.to_thread(run_rule_transaction, self.connection, rule_info, True)
+            success, message, record_count, elapsed_ms = result
+            self.logger.info(
+                f"Dry run for rule {rule_info.get('RULE_ID', 'unknown')}: "
+                f"success={success}, records={record_count}, time={elapsed_ms:.2f} ms."
+            )
+            return {
+                "success": success,
+                "message": message,
+                "record_count": record_count,
+                "elapsed_ms": elapsed_ms
+            }
+        except Exception as ex:
+            self.logger.exception(f"Exception during dry-run for rule {rule_info.get('RULE_ID', 'unknown')}: {ex}")
+            return {
+                "success": False,
+                "message": str(ex),
+                "record_count": 0,
+                "elapsed_ms": 0
+            }
+
+    async def run_rules_concurrently(self, rules_info_list):
+        """
+        Executes a list of rule simulations concurrently.
+        Returns a list of dictionaries (one per rule simulation).
+        """
+        tasks = [self.run_rule_dry_run(rule_info) for rule_info in rules_info_list]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return results
+
+# For testing purposes only – this section is not required in production deployments.
+if __name__ == "__main__":
+    import pyodbc
+    from core import DatabaseConnectionDialog  # Assumes core provides a production-ready DB connection dialog
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication([])
+    db_dlg = DatabaseConnectionDialog()
+    if db_dlg.exec_() == DatabaseConnectionDialog.Accepted:
+        conn = db_dlg.get_connection()
+        async_manager = AsyncExecutionManager(conn)
+        # For testing, fetch one rule from BRM_RULES:
+        cursor = conn.cursor()
+        cursor.execute("SELECT TOP 1 * FROM BRM_RULES ORDER BY RULE_ID")
+        row = cursor.fetchone()
+        if row:
+            cols = [desc[0] for desc in cursor.description]
+            rule_info = dict(zip(cols, row))
+            # Run the simulation asynchronously:
+            loop = asyncio.get_event_loop()
+            result = loop.run_until_complete(async_manager.run_rule_dry_run(rule_info))
+            print("Dry-run simulation result:", result)
+        else:
+            print("No rule found.")
+    else:
+        print("Database connection not established.")
