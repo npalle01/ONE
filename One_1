@@ -1,0 +1,160 @@
+# core.py
+import sys
+import os
+import json
+import math
+import smtplib
+import logging
+import pyodbc
+import csv
+import time
+import asyncio
+from datetime import datetime, timedelta
+from collections import deque
+from email.mime.text import MIMEText
+
+# For encryption (using cryptography for AES‑256)
+from cryptography.fernet import Fernet
+
+# -------------------------------
+# Logging Configuration
+# -------------------------------
+logging.basicConfig(
+    filename='brm_tool_production.log',
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# -------------------------------
+# Email Configuration & Sender
+# -------------------------------
+EMAIL_CONFIG = {
+    "smtp_server": "smtp.example.com",
+    "smtp_port": 587,
+    "smtp_username": "user@example.com",
+    "smtp_password": "password",
+    "sender_email": "noreply@example.com"
+}
+
+def send_email_notification(subject: str, body: str, recipients: list):
+    """
+    Sends an email using the SMTP configuration. Logs success or errors.
+    """
+    try:
+        msg = MIMEText(body, 'plain')
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_CONFIG['sender_email']
+        msg['To'] = ", ".join(recipients)
+        smtp = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+        smtp.starttls()
+        smtp.login(EMAIL_CONFIG['smtp_username'], EMAIL_CONFIG['smtp_password'])
+        smtp.sendmail(EMAIL_CONFIG['sender_email'], recipients, msg.as_string())
+        smtp.quit()
+        logger.info(f"Email sent to {recipients}")
+    except Exception as ex:
+        logger.error(f"Error sending email: {ex}")
+
+# -------------------------------
+# Database Connection Helper
+# -------------------------------
+class DatabaseConnector:
+    """
+    Establishes a database connection using either a DSN or a custom connection string.
+    """
+    def __init__(self, connection_string: str = None, dsn: str = None):
+        self.connection_string = connection_string
+        self.dsn = dsn
+        self.connection = None
+
+    def connect(self):
+        try:
+            if self.connection_string:
+                self.connection = pyodbc.connect(self.connection_string)
+            elif self.dsn:
+                conn_str = f"DSN={self.dsn};Trusted_Connection=yes;"
+                self.connection = pyodbc.connect(conn_str)
+            else:
+                raise ValueError("No connection string or DSN provided.")
+            logger.info("Database connection established.")
+            return self.connection
+        except Exception as ex:
+            logger.error(f"Database connection failed: {ex}")
+            raise
+
+# -------------------------------
+# Encryption Utilities
+# -------------------------------
+class EncryptionManager:
+    """
+    Provides methods to encrypt and decrypt sensitive data using Fernet (AES‑256).
+    In production, the encryption key should be securely stored and retrieved.
+    """
+    def __init__(self, key: bytes = None):
+        if key is None:
+            # In production, load the key from a secure location.
+            key = Fernet.generate_key()
+            logger.info("Generated new encryption key.")
+        self.key = key
+        self.cipher_suite = Fernet(self.key)
+
+    def encrypt(self, data: str) -> str:
+        try:
+            token = self.cipher_suite.encrypt(data.encode('utf-8'))
+            return token.decode('utf-8')
+        except Exception as ex:
+            logger.error(f"Encryption failed: {ex}")
+            raise
+
+    def decrypt(self, token: str) -> str:
+        try:
+            data = self.cipher_suite.decrypt(token.encode('utf-8'))
+            return data.decode('utf-8')
+        except Exception as ex:
+            logger.error(f"Decryption failed: {ex}")
+            raise
+
+# -------------------------------
+# Basic Database Helper Functions
+# -------------------------------
+def fetch_all_dict(cursor):
+    """
+    Returns all fetched rows as a list of dictionaries.
+    """
+    rows = cursor.fetchall()
+    if cursor.description:
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in rows]
+    return rows
+
+def fetch_one_dict(cursor):
+    """
+    Returns the first fetched row as a dictionary.
+    """
+    row = cursor.fetchone()
+    if row and cursor.description:
+        columns = [desc[0] for desc in cursor.description]
+        return dict(zip(columns, row))
+    return None
+
+def insert_audit_log(conn, action, table_name, record_id, actor, old_data, new_data):
+    """
+    Inserts a record into the BRM_AUDIT_LOG table to track changes.
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO BRM_AUDIT_LOG (ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, GETDATE())
+        """, (
+            action,
+            table_name,
+            str(record_id) if record_id else None,
+            actor,
+            json.dumps(old_data) if old_data else None,
+            json.dumps(new_data) if new_data else None
+        ))
+        conn.commit()
+        logger.info(f"Audit log inserted for record {record_id} in {table_name}.")
+    except Exception as ex:
+        logger.error(f"Failed to insert audit log: {ex}")
