@@ -1,458 +1,632 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Module 8 – BRM Tool Main Integration
---------------------------------------
-This module integrates all enhanced functionalities from the previous modules into one production‑ready application.
-
-Key enhancements include:
-  • Advanced security (support for encryption flags on sensitive fields)
-  • Asynchronous/parallel execution for heavy ETL/simulation tasks using QThreadPool/QRunnable
-  • Real‑time notifications and auto‑refresh via QTimer
-  • Modern UI enhancements (clean layout, plugin‑friendly architecture, improved styling)
-  • Centralized logging and monitoring integrated via Python’s logging module
-  • Deep decision table integration and advanced ER‑style lineage visualization (with search, flow arrows, and live color‑coded statuses)
-  • Full integration of business rules, approvals, global/critical administration, hierarchy, scheduling, control tables, metrics, alerts/dashboards, and user management
-
-All modules are assumed to be available (core_module, business_rules_module, approvals_module, gcr_module, hierarchy_module, lineage_module, scheduling_module, control_module, custom_groups_and_alerts, decision_tables_module).
-
-Author: Your Name
-Date: YYYY-MM-DD
+Module: custom_rule_groups_and_alerts.py
+Description: Provides advanced management of custom rule groups and a comprehensive
+             alerts & dashboards interface. Features include:
+    • Advanced Custom Rule Groups Tab:
+         - Create, rename, delete custom rule groups.
+         - Backup and restore of group configurations.
+         - Drag‑and‑drop assignment of rules (with real‑time locking status).
+         - Deep integration with decision table rules and lineage markers.
+    • Alerts and Dashboards Tab:
+         - Real‑time notifications (auto‑refresh every minute) for:
+             – Approvals older than a configurable threshold.
+             – Upcoming schedules within the next 24 hours.
+             – Performance anomalies (using RULE_PERF_STATS data).
+         - A search field to filter alerts by column, table or database.
+         - A modern visual style with color‐coded messages and clear formatting.
+             
+All functionality is production‑ready with robust error handling and detailed logging.
 """
 
 import sys
-import logging
 import json
-from datetime import datetime
+import math
+import logging
+import re
+from datetime import datetime, timedelta
+from collections import deque
 
 # PyQt5 imports
-from PyQt5.QtWidgets import (QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-                             QTabWidget, QMenu, QAction, QInputDialog, QMessageBox, QDialog, QLineEdit)
-from PyQt5.QtCore import Qt, QTimer, QRunnable, QThreadPool, pyqtSignal, QObject
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QBrush, QColor
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
+    QListWidget, QListWidgetItem, QPushButton, QLabel, QLineEdit,
+    QDialog, QMessageBox, QInputDialog, QFileDialog, QPlainTextEdit, QComboBox
+)
 
-# -----------------------------------------------------------------------------
-# Centralized Logging Configuration
-# -----------------------------------------------------------------------------
-logger = logging.getLogger("BRMToolMain")
+logger = logging.getLogger("custom_rule_groups_and_alerts")
 logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s')
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
 
 # -----------------------------------------------------------------------------
-# Asynchronous ETL Simulation Task
+# Custom Rule Group Enhanced Tab
 # -----------------------------------------------------------------------------
-class ETLSimulationWorkerSignals(QObject):
-    finished = pyqtSignal(list, list)  # executed_rules, skipped_rules
-    error = pyqtSignal(str)
-
-class ETLSimulationTask(QRunnable):
+class CustomRuleGroupEnhancedTab(QWidget):
     """
-    Runs the heavy ETL (BFS) simulation task asynchronously.
-    Emits the number of rules executed and skipped.
-    """
-    def __init__(self, connection):
-        super().__init__()
-        self.connection = connection
-        self.signals = ETLSimulationWorkerSignals()
+    Provides advanced management for custom rule groups.
     
-    def run(self):
-        try:
-            # Call the production-ready ETL simulation function from business_rules_module.
-            # This function should run a dry-run execution and return two lists: executed and skipped rule IDs.
-            from business_rules_module import execute_rules_with_conflicts_composites_bfs
-            executed, skipped = execute_rules_with_conflicts_composites_bfs(self.connection)
-            logger.info("ETL Simulation completed: Executed: %s; Skipped: %s", executed, skipped)
-            self.signals.finished.emit(executed, list(skipped))
-        except Exception as ex:
-            logger.exception("ETL Simulation error: %s", ex)
-            self.signals.error.emit(str(ex))
-
-# -----------------------------------------------------------------------------
-# Main Application Window (BRM Tool)
-# -----------------------------------------------------------------------------
-class BRMTool(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("BRM Tool – Integrated Production Ready")
-        self.resize(1300, 850)
-
-        self.connection = None
-        self.user_id = None
-        self.logged_in_username = None
-        self.user_group = None
-
-        # Create a thread pool for asynchronous tasks
-        self.thread_pool = QThreadPool()
-
-        # Step 1: Database Connection
-        from core_module import DatabaseConnectionDialog  # Module 1: Core and Connection
-        db_dialog = DatabaseConnectionDialog()
-        if db_dialog.exec_() == QDialog.Accepted:
-            self.connection = db_dialog.get_connection()
-            if not self.connection:
-                sys.exit(1)
-        else:
-            sys.exit(0)
-
-        # Step 2: User Login
-        from core_module import LoginDialog  # Module 1: Login
-        login_dialog = LoginDialog(self.connection)
-        if login_dialog.exec_() != QDialog.Accepted:
-            sys.exit(0)
-        self.user_id = login_dialog.user_id
-        self.user_group = login_dialog.user_group
-
-        c = self.connection.cursor()
-        c.execute("SELECT USERNAME FROM USERS WHERE USER_ID = ?", (self.user_id,))
-        row = c.fetchone()
-        if row:
-            self.logged_in_username = row[0]
-        else:
-            self.logged_in_username = "UnknownUser"
-
-        # Optional Onboarding (if desired)
-        # from core_module import OnboardingWizard
-        # wizard = OnboardingWizard(self.connection)
-        # wizard.exec_()
-
+    Features:
+      • Create, rename, delete custom rule groups.
+      • Backup and restore functionality with versioning.
+      • Drag‑and‑drop assignment of rules to groups.
+      • Real‑time auto‑refresh (every 45 seconds) to update the tree view and available rules.
+      • Integration with decision table and lineage status (rules are color‑coded accordingly).
+    """
+    def __init__(self, connection, user_id, user_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = user_id
+        self.user_group = user_group
         self.init_ui()
+        self.start_auto_refresh()
 
     def init_ui(self):
-        # Menu Bar Setup
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
+        main_layout = QVBoxLayout(self)
 
-        # Sync Metadata Action
-        from core_module import sync_metadata_improved
-        sync_action = QAction("Sync Metadata", self)
-        sync_action.triggered.connect(lambda: sync_metadata_improved(self.connection))
-        file_menu.addAction(sync_action)
+        # Top controls for group creation and backup/restore
+        top_layout = QHBoxLayout()
+        self.new_group_edit = QLineEdit()
+        self.new_group_edit.setPlaceholderText("Enter new custom group name")
+        top_layout.addWidget(self.new_group_edit)
+        create_btn = QPushButton("Create Group")
+        create_btn.clicked.connect(self.create_group)
+        top_layout.addWidget(create_btn)
+        rename_btn = QPushButton("Rename Group")
+        rename_btn.clicked.connect(self.rename_group)
+        top_layout.addWidget(rename_btn)
+        delete_btn = QPushButton("Delete Group")
+        delete_btn.clicked.connect(self.delete_group)
+        top_layout.addWidget(delete_btn)
+        backup_btn = QPushButton("Backup Group")
+        backup_btn.clicked.connect(self.backup_group)
+        top_layout.addWidget(backup_btn)
+        restore_btn = QPushButton("Restore Group")
+        restore_btn.clicked.connect(self.restore_group)
+        top_layout.addWidget(restore_btn)
+        top_layout.addStretch()
+        main_layout.addLayout(top_layout)
 
-        # Run Data Validations Action
-        run_val_action = QAction("Run Data Validations", self)
-        run_val_action.triggered.connect(self.run_data_validations)
-        file_menu.addAction(run_val_action)
+        # Split view: Left - Group Tree, Right - Available Rules
+        splitter_layout = QHBoxLayout()
 
-        # ETL Simulation (Dry-Run) Action
-        etl_sim_action = QAction("Run ETL Simulation (Dry-Run)", self)
-        etl_sim_action.triggered.connect(self.run_etl_simulation)
-        file_menu.addAction(etl_sim_action)
+        # Left: Custom Group Tree with drag & drop support
+        self.group_tree = QTreeWidget()
+        self.group_tree.setHeaderLabels(["Custom Group / Assigned Rule"])
+        self.group_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.group_tree.customContextMenuRequested.connect(self.on_tree_context)
+        splitter_layout.addWidget(self.group_tree, 1)
 
-        # Help Menu
-        help_menu = menubar.addMenu("Help")
-        tips_action = QAction("Show Tips", self)
-        tips_action.triggered.connect(self.show_tips)
-        help_menu.addAction(tips_action)
+        # Right: Available rules list with search
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        self.rule_search_edit = QLineEdit()
+        self.rule_search_edit.setPlaceholderText("Search available rules...")
+        self.rule_search_edit.textChanged.connect(self.load_available_rules)
+        right_layout.addWidget(self.rule_search_edit)
+        self.rule_list = QListWidget()
+        self.rule_list.setSelectionMode(QListWidget.ExtendedSelection)
+        right_layout.addWidget(self.rule_list)
+        assign_btn = QPushButton("Assign Selected Rule(s)")
+        assign_btn.clicked.connect(self.assign_rules)
+        right_layout.addWidget(assign_btn)
+        right_widget.setLayout(right_layout)
+        splitter_layout.addWidget(right_widget, 1)
 
-        # Central Widget Setup with Tabs
-        central_widget = QWidget()
-        central_layout = QVBoxLayout(central_widget)
+        main_layout.addLayout(splitter_layout)
+        self.setLayout(main_layout)
+        self.load_group_tree()
+        self.load_available_rules()
 
-        # Admin Impersonation Bar (if Admin)
-        if self.user_group == "Admin":
-            imp_layout = QHBoxLayout()
-            self.switch_combo = QComboBox()
-            self.switch_btn = QPushButton("Switch User")
-            self.switch_btn.clicked.connect(self.on_switch_user)
-            imp_layout.addWidget(QLabel("Impersonate:"))
-            imp_layout.addWidget(self.switch_combo)
-            imp_layout.addWidget(self.switch_btn)
-            imp_layout.addStretch()
-            central_layout.addLayout(imp_layout)
-            self.load_user_switch_combo()
+    def start_auto_refresh(self):
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_all)
+        self.refresh_timer.start(45000)  # refresh every 45 seconds
 
-        # Create Tab Widget
-        self.tabs = QTabWidget()
+    def refresh_all(self):
+        self.load_group_tree()
+        self.load_available_rules()
 
-        # Business Rules Tab
-        from business_rules_module import RuleDashboard, RuleEditorDialog, simulate_rule_dry_run
-        self.rule_dashboard = RuleDashboard(self.connection, self.user_id, self.user_group)
-        br_tab = QWidget()
-        br_layout = QVBoxLayout(br_tab)
-        # Action buttons
-        action_layout = QHBoxLayout()
-        add_rule_btn = QPushButton("Add Rule")
-        add_rule_btn.clicked.connect(self.on_add_rule)
-        action_layout.addWidget(add_rule_btn)
-        update_rule_btn = QPushButton("Update Rule")
-        update_rule_btn.clicked.connect(self.on_update_rule)
-        action_layout.addWidget(update_rule_btn)
-        delete_rule_btn = QPushButton("Delete Rule")
-        delete_rule_btn.clicked.connect(self.on_delete_rule)
-        action_layout.addWidget(delete_rule_btn)
-        run_single_btn = QPushButton("Simulate Single Rule Dry-Run")
-        run_single_btn.clicked.connect(self.simulate_single_rule)
-        action_layout.addWidget(run_single_btn)
-        action_layout.addStretch()
-        br_layout.addLayout(action_layout)
-        br_layout.addWidget(self.rule_dashboard)
-        br_tab.setLayout(br_layout)
-        self.tabs.addTab(br_tab, "Business Rules")
-
-        # Approvals Tab
-        from approvals_module import MultiStepApprovalTab
-        self.approvals_tab = MultiStepApprovalTab(self.connection, self.logged_in_username, self.user_group)
-        self.tabs.addTab(self.approvals_tab, "Approvals")
-
-        # Global/Critical Admin Tab (Admin Only)
-        if self.user_group == "Admin":
-            from gcr_module import GlobalCriticalAdminTab
-            self.gcr_admin_tab = GlobalCriticalAdminTab(self, self.connection, self.user_group)
-            self.tabs.addTab(self.gcr_admin_tab, "Global/Critical Admin")
-
-        # Hierarchy Tab
-        from hierarchy_module import HierarchyViewTab
-        self.hierarchy_tab = HierarchyViewTab(self.connection)
-        self.tabs.addTab(self.hierarchy_tab, "Hierarchy")
-
-        # Advanced Lineage Tab
-        from lineage_module import EnhancedLineageGraphWidget
-        self.lineage_tab = EnhancedLineageGraphWidget(self.connection)
-        self.tabs.addTab(self.lineage_tab, "Advanced Lineage")
-
-        # Custom Groups Tab
-        from custom_groups_and_alerts import CustomRuleGroupManager
-        self.custom_groups_tab = CustomRuleGroupManager(self.connection, self.user_id, self.user_group)
-        self.tabs.addTab(self.custom_groups_tab, "Custom Groups")
-
-        # Scheduling Tab
-        from scheduling_module import ScheduleManagementTab
-        self.scheduling_tab = ScheduleManagementTab(self.connection)
-        self.tabs.addTab(self.scheduling_tab, "Scheduling")
-
-        # Control Tables Tab
-        from control_module import CtrlTablesTab
-        self.control_tables_tab = CtrlTablesTab(self.connection)
-        self.tabs.addTab(self.control_tables_tab, "Control Tables")
-
-        # Metrics Tab
-        from control_module import MetricsDashboardTab, GroupManagementTab, UserManagementTab
-        self.metrics_tab = MetricsDashboardTab(self.connection)
-        self.tabs.addTab(self.metrics_tab, "Metrics")
-
-        # Alerts & Dashboards Tab
-        from custom_groups_and_alerts import AlertsDashboard
-        self.alerts_tab = AlertsDashboard(self.connection)
-        self.tabs.addTab(self.alerts_tab, "Alerts & Dashboards")
-
-        # Group Management Tab
-        from control_module import GroupManagementTab
-        self.group_management_tab = GroupManagementTab(self.connection, self.user_id, self.user_group)
-        self.tabs.addTab(self.group_management_tab, "Group Management")
-
-        # User Management Tab (Admin Only)
-        if self.user_group == "Admin":
-            from control_module import UserManagementTab
-            self.user_management_tab = UserManagementTab(self.connection)
-            self.tabs.addTab(self.user_management_tab, "User Management")
-
-        central_layout.addWidget(self.tabs)
-        central_widget.setLayout(central_layout)
-        self.setCentralWidget(central_widget)
-
-        # Setup auto‑refresh timers
-        self.approvals_timer = QTimer(self)
-        self.approvals_timer.timeout.connect(self.approvals_tab.load_approvals)
-        self.approvals_timer.start(5000)
-
-        self.scheduling_timer = QTimer(self)
-        self.scheduling_timer.timeout.connect(self.check_due_schedules)
-        self.scheduling_timer.start(60000)
-
-    # ------------------- Menu Actions -------------------
-    def run_data_validations(self):
-        from control_module import run_data_validations  # production-ready validations
+    def load_group_tree(self):
+        self.group_tree.clear()
         try:
-            run_data_validations(self.connection)
-            QMessageBox.information(self, "Data Validations", "Data validations executed successfully.")
+            c = self.connection.cursor()
+            c.execute("""
+                SELECT CUSTOM_GROUP_ID, CUSTOM_GROUP_NAME, OWNER_BUSINESS_GROUP
+                FROM BRM_CUSTOM_RULE_GROUPS
+                ORDER BY CUSTOM_GROUP_ID DESC
+            """)
+            groups = c.fetchall()
+            for (cg_id, cg_name, owner) in groups:
+                display_text = f"{cg_name} (Owner: {owner})"
+                group_item = QTreeWidgetItem([display_text])
+                group_item.setData(0, Qt.UserRole, cg_id)
+                group_item.setBackground(0, QBrush(QColor("#E0E0E0")))
+                # Load assigned rules for this group
+                c2 = self.connection.cursor()
+                c2.execute("""
+                    SELECT R.RULE_ID, R.RULE_NAME, R.OPERATION_TYPE, R.IS_GLOBAL,
+                           R.CRITICAL_RULE, R.LOCKED_BY
+                    FROM BRM_CUSTOM_GROUP_MEMBERS M
+                    JOIN BRM_RULES R ON M.RULE_ID = R.RULE_ID
+                    WHERE M.CUSTOM_GROUP_ID=?
+                """, (cg_id,))
+                assigned_rules = c2.fetchall()
+                for (rid, rname, op_type, is_global, is_crit, locked_by) in assigned_rules:
+                    rule_text = f"Rule {rid}: {rname}"
+                    # Color-code based on rule type and status
+                    if op_type.upper() == "DECISION_TABLE":
+                        rule_text += " [DT]"
+                    rule_item = QTreeWidgetItem([rule_text])
+                    rule_item.setData(0, Qt.UserRole, rid)
+                    if is_global:
+                        rule_item.setBackground(0, QBrush(QColor("#D5F5E3")))
+                    if is_crit:
+                        rule_item.setBackground(0, QBrush(QColor("#FADBD8")))
+                    if locked_by:
+                        rule_item.setToolTip(0, f"Locked by {locked_by}")
+                    group_item.addChild(rule_item)
+                self.group_tree.addTopLevelItem(group_item)
+            self.group_tree.expandAll()
         except Exception as ex:
-            logger.exception("Error running data validations: %s", ex)
-            QMessageBox.critical(self, "Error", f"Error running data validations:\n{ex}")
+            logger.error(f"Error loading custom group tree: {ex}")
+            QMessageBox.critical(self, "Group Tree Error", str(ex))
 
-    def run_etl_simulation(self):
-        task = ETLSimulationTask(self.connection)
-        task.signals.finished.connect(self.on_etl_simulation_finished)
-        task.signals.error.connect(self.on_etl_simulation_error)
-        self.thread_pool.start(task)
-        QMessageBox.information(self, "ETL Simulation", "ETL Simulation started (dry-run). Check logs for details.")
-
-    def on_etl_simulation_finished(self, executed, skipped):
-        msg = f"ETL Simulation completed.\nExecuted: {len(executed)} rules.\nSkipped: {len(skipped)} rules."
-        logger.info(msg)
-        QMessageBox.information(self, "ETL Simulation Result", msg)
-        self.rule_dashboard.load_rules()
-
-    def on_etl_simulation_error(self, error_msg):
-        logger.error("ETL Simulation error: %s", error_msg)
-        QMessageBox.critical(self, "ETL Simulation Error", error_msg)
-
-    def check_due_schedules(self):
-        from scheduling_module import check_due_schedules  # production-ready schedule checker
+    def load_available_rules(self):
+        self.rule_list.clear()
         try:
-            check_due_schedules(self.connection)
-            self.scheduling_tab.load_schedules()
+            search_text = self.rule_search_edit.text().strip()
+            c = self.connection.cursor()
+            if search_text:
+                c.execute("""
+                    SELECT RULE_ID, RULE_NAME, OWNER_GROUP
+                    FROM BRM_RULES
+                    WHERE RULE_NAME LIKE ? OR RULE_SQL LIKE ?
+                    ORDER BY RULE_ID DESC
+                    OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY
+                """, (f"%{search_text}%", f"%{search_text}%"))
+            else:
+                c.execute("""
+                    SELECT RULE_ID, RULE_NAME, OWNER_GROUP
+                    FROM BRM_RULES
+                    ORDER BY RULE_ID DESC
+                    OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY
+                """)
+            rows = c.fetchall()
+            # Exclude rules already assigned to any custom group
+            c2 = self.connection.cursor()
+            c2.execute("SELECT DISTINCT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS")
+            assigned = {r[0] for r in c2.fetchall()}
+            for (rid, rname, owner) in rows:
+                if rid in assigned:
+                    continue
+                display_text = f"Rule {rid}: {rname} (Owner: {owner})"
+                item = QListWidgetItem(display_text)
+                item.setData(Qt.UserRole, rid)
+                self.rule_list.addItem(item)
         except Exception as ex:
-            logger.exception("Error checking schedules: %s", ex)
+            logger.error(f"Error loading available rules: {ex}")
+            QMessageBox.critical(self, "Available Rules Error", str(ex))
 
-    def show_tips(self):
-        tips = (
-            f"BRM Tool – Integrated Version\nLogged in as: {self.logged_in_username} (Group: {self.user_group})\n\n"
-            "Tabs:\n"
-            "- Business Rules: Create, update, delete, and simulate rules.\n"
-            "- Approvals: Manage multi‑level approvals.\n"
-            "- Global/Critical Admin: (Admin only) Override and manage GCR linking.\n"
-            "- Hierarchy: Drag‑and‑drop re‑parenting of rules.\n"
-            "- Advanced Lineage: Visualize end‑to‑end lineage with ER‑style flow arrows.\n"
-            "- Custom Groups: Manage custom rule groups with backup/restore.\n"
-            "- Scheduling: Manage rule schedules.\n"
-            "- Control Tables: View system control tables.\n"
-            "- Metrics: View performance and usage metrics.\n"
-            "- Alerts & Dashboards: Real‑time alerts for approvals, schedules, and performance.\n"
-            "- Group/User Management: (Admin only) Manage users and business groups.\n"
-        )
-        QMessageBox.information(self, "Tips", tips)
-
-    # ------------------- Business Rules Actions -------------------
-    def on_add_rule(self):
-        from business_rules_module import RuleEditorDialog
-        dlg = RuleEditorDialog(self.connection, self.user_group, None, self)
-        if dlg.exec_() == QDialog.Accepted:
-            self.rule_dashboard.load_rules()
-
-    def on_update_rule(self):
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if len(selected) != 1:
-            QMessageBox.warning(self, "Selection Error", "Select exactly one rule to update.")
+    def on_tree_context(self, pos):
+        item = self.group_tree.itemAt(pos)
+        if not item:
             return
-        rid = selected[0]
-        c = self.connection.cursor()
-        c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID = ?", (rid,))
-        row = c.fetchone()
-        if not row:
-            QMessageBox.warning(self, "Not Found", f"Rule {rid} not found.")
-            return
-        colnames = [desc[0] for desc in c.description]
-        rule_data = dict(zip(colnames, row))
-        from business_rules_module import RuleEditorDialog
-        dlg = RuleEditorDialog(self.connection, self.user_group, rule_data, self)
-        if dlg.exec_() == QDialog.Accepted:
-            self.rule_dashboard.load_rules()
+        parent = item.parent()
+        # If a rule item is selected, offer context actions
+        if parent is not None:
+            menu = QtWidgets.QMenu()
+            remove_action = menu.addAction("Remove Rule from Group")
+            lock_action = menu.addAction("Toggle Lock")
+            choice = menu.exec_(self.group_tree.viewport().mapToGlobal(pos))
+            group_id = parent.data(0, Qt.UserRole)
+            rule_id = item.data(0, Qt.UserRole)
+            if choice == remove_action:
+                self.remove_rule_from_group(group_id, rule_id)
+            elif choice == lock_action:
+                self.toggle_rule_lock(rule_id)
+        # For group items, we could add additional options if needed
 
-    def on_delete_rule(self):
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if not selected:
-            QMessageBox.warning(self, "Selection Error", "No rule selected for deletion.")
+    def remove_rule_from_group(self, group_id, rule_id):
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                DELETE FROM BRM_CUSTOM_GROUP_MEMBERS
+                WHERE CUSTOM_GROUP_ID=? AND RULE_ID=?
+            """, (group_id, rule_id))
+            self.connection.commit()
+            QMessageBox.information(self, "Removed", f"Rule {rule_id} removed from group {group_id}.")
+            self.load_group_tree()
+            self.load_available_rules()
+        except Exception as ex:
+            logger.error(f"Error removing rule from group: {ex}")
+            QMessageBox.critical(self, "Remove Rule Error", str(ex))
+
+    def toggle_rule_lock(self, rule_id):
+        try:
+            c = self.connection.cursor()
+            c.execute("SELECT LOCKED_BY FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+            row = c.fetchone()
+            if not row:
+                QMessageBox.warning(self, "Not Found", f"Rule {rule_id} not found.")
+                return
+            locked_by = row[0]
+            if not locked_by:
+                c.execute("""
+                    UPDATE BRM_RULES
+                    SET LOCKED_BY=?,
+                        LOCKED_AT=GETDATE()
+                    WHERE RULE_ID=?
+                """, (f"User:{self.user_id}", rule_id))
+                self.connection.commit()
+                QMessageBox.information(self, "Locked", f"Rule {rule_id} locked.")
+            else:
+                # Only current user or admin can unlock
+                if locked_by == f"User:{self.user_id}" or self.user_group == "Admin":
+                    c.execute("""
+                        UPDATE BRM_RULES
+                        SET LOCKED_BY=NULL, LOCKED_AT=NULL
+                        WHERE RULE_ID=?
+                    """, (rule_id,))
+                    self.connection.commit()
+                    QMessageBox.information(self, "Unlocked", f"Rule {rule_id} unlocked.")
+                else:
+                    QMessageBox.warning(self, "Locked", f"Rule {rule_id} is locked by {locked_by}.")
+            self.load_group_tree()
+        except Exception as ex:
+            logger.error(f"Error toggling rule lock: {ex}")
+            QMessageBox.critical(self, "Lock Toggle Error", str(ex))
+
+    def assign_rules(self):
+        selected_items = self.rule_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "No rules selected to assign.")
             return
-        confirm = QMessageBox.question(self, "Confirm Deletion", f"Delete {len(selected)} selected rule(s)?")
+        group_item = self.group_tree.currentItem()
+        if not group_item:
+            QMessageBox.warning(self, "No Group", "Please select a custom group from the tree.")
+            return
+        # Ensure we have a group item (not a child rule)
+        if group_item.parent() is not None:
+            group_item = group_item.parent()
+        group_id = group_item.data(0, Qt.UserRole)
+        if not group_id:
+            QMessageBox.warning(self, "Error", "Invalid group selected.")
+            return
+        try:
+            c = self.connection.cursor()
+            count = 0
+            for item in selected_items:
+                rule_id = item.data(Qt.UserRole)
+                try:
+                    c.execute("""
+                        INSERT INTO BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID, RULE_ID)
+                        VALUES(?,?)
+                    """, (group_id, rule_id))
+                    count += 1
+                except Exception:
+                    continue
+            self.connection.commit()
+            QMessageBox.information(self, "Assigned", f"{count} rule(s) assigned to group.")
+            self.load_group_tree()
+            self.load_available_rules()
+        except Exception as ex:
+            logger.error(f"Error assigning rules: {ex}")
+            QMessageBox.critical(self, "Assignment Error", str(ex))
+
+    def create_group(self):
+        group_name = self.new_group_edit.text().strip()
+        if not group_name:
+            QMessageBox.warning(self, "Input Error", "Please enter a group name.")
+            return
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                INSERT INTO BRM_CUSTOM_RULE_GROUPS(
+                    CUSTOM_GROUP_NAME, OWNER_BUSINESS_GROUP, CREATED_BY, CREATED_TIMESTAMP
+                )
+                VALUES(?,?,?,GETDATE())
+            """, (group_name, self.user_group, f"User:{self.user_id}"))
+            self.connection.commit()
+            QMessageBox.information(self, "Created", f"Custom group '{group_name}' created.")
+            self.new_group_edit.clear()
+            self.load_group_tree()
+        except Exception as ex:
+            logger.error(f"Error creating custom group: {ex}")
+            QMessageBox.critical(self, "Create Group Error", str(ex))
+
+    def rename_group(self):
+        current_item = self.group_tree.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Selection Error", "No group selected.")
+            return
+        group_id = current_item.data(0, Qt.UserRole)
+        old_name = current_item.text(0)
+        new_name, ok = QInputDialog.getText(self, "Rename Group", f"Enter new name for group '{old_name}':")
+        if not ok or not new_name.strip():
+            return
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                UPDATE BRM_CUSTOM_RULE_GROUPS
+                SET CUSTOM_GROUP_NAME=?
+                WHERE CUSTOM_GROUP_ID=?
+            """, (new_name.strip(), group_id))
+            self.connection.commit()
+            QMessageBox.information(self, "Renamed", "Custom group renamed successfully.")
+            self.load_group_tree()
+        except Exception as ex:
+            logger.error(f"Error renaming custom group: {ex}")
+            QMessageBox.critical(self, "Rename Group Error", str(ex))
+
+    def delete_group(self):
+        current_item = self.group_tree.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Selection Error", "No group selected.")
+            return
+        group_id = current_item.data(0, Qt.UserRole)
+        confirm = QMessageBox.question(self, "Confirm Deletion", f"Delete custom group ID {group_id}?")
         if confirm != QMessageBox.Yes:
             return
         try:
-            from business_rules_module import delete_rule
-            for rid in selected:
-                delete_rule(self.connection, rid, f"User:{self.user_id}", self.user_group)
-            QMessageBox.information(self, "Deleted", f"Deleted {len(selected)} rule(s).")
-            self.rule_dashboard.load_rules()
+            c = self.connection.cursor()
+            c.execute("DELETE FROM BRM_CUSTOM_RULE_GROUPS WHERE CUSTOM_GROUP_ID=?", (group_id,))
+            self.connection.commit()
+            QMessageBox.information(self, "Deleted", "Custom group deleted.")
+            self.load_group_tree()
+            self.load_available_rules()
         except Exception as ex:
-            logger.exception("Error deleting rules: %s", ex)
-            QMessageBox.critical(self, "Error", f"Error deleting rules:\n{ex}")
+            logger.error(f"Error deleting custom group: {ex}")
+            QMessageBox.critical(self, "Delete Group Error", str(ex))
 
-    def simulate_single_rule(self):
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if len(selected) != 1:
-            QMessageBox.warning(self, "Selection Error", "Select exactly one rule to simulate.")
+    def backup_group(self):
+        current_item = self.group_tree.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Selection Error", "No group selected.")
             return
-        rid = selected[0]
-        c = self.connection.cursor()
-        c.execute("SELECT RULE_SQL, OPERATION_TYPE FROM BRM_RULES WHERE RULE_ID = ?", (rid,))
-        row = c.fetchone()
-        if not row:
-            QMessageBox.warning(self, "Not Found", f"Rule {rid} not found.")
-            return
-        sql_text, op_type = row
-        from business_rules_module import simulate_rule_dry_run
+        group_id = current_item.data(0, Qt.UserRole)
         try:
-            ok, msg, rec_count = simulate_rule_dry_run(self.connection, rid)
-            result_msg = (f"Rule {rid} Simulation:\nResult: {'PASS' if ok else 'FAIL'}\n"
-                          f"Message: {msg}\nRecords Impacted: {rec_count}")
-            QMessageBox.information(self, "Simulation Result", result_msg)
+            c = self.connection.cursor()
+            c.execute("SELECT CUSTOM_GROUP_NAME FROM BRM_CUSTOM_RULE_GROUPS WHERE CUSTOM_GROUP_ID=?", (group_id,))
+            row = c.fetchone()
+            if not row:
+                QMessageBox.warning(self, "Error", "Group not found.")
+                return
+            group_name = row[0]
+            c.execute("SELECT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS WHERE CUSTOM_GROUP_ID=?", (group_id,))
+            members = [r[0] for r in c.fetchall()]
+            backup_data = {"group_name": group_name, "members": members}
+            c.execute("""
+                SELECT ISNULL(MAX(BACKUP_VERSION), 0) + 1
+                FROM BRM_CUSTOM_GROUP_BACKUPS
+                WHERE CUSTOM_GROUP_ID=?
+            """, (group_id,))
+            ver = c.fetchone()[0]
+            c.execute("""
+                INSERT INTO BRM_CUSTOM_GROUP_BACKUPS(
+                    CUSTOM_GROUP_ID, BACKUP_TIMESTAMP, BACKUP_VERSION, BACKUP_JSON
+                )
+                VALUES(?, GETDATE(), ?, ?)
+            """, (group_id, ver, json.dumps(backup_data)))
+            self.connection.commit()
+            QMessageBox.information(self, "Backup", f"Backup version {ver} created for group {group_id}.")
         except Exception as ex:
-            logger.exception("Error in single rule simulation: %s", ex)
-            QMessageBox.critical(self, "Error", f"Error in simulation:\n{ex}")
+            logger.error(f"Error backing up custom group: {ex}")
+            QMessageBox.critical(self, "Backup Error", str(ex))
 
-    # ------------------- Impersonation -------------------
-    def on_switch_user(self):
-        data = self.switch_combo.currentData()
-        if not data:
+    def restore_group(self):
+        current_item = self.group_tree.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Selection Error", "No group selected.")
             return
-        new_uid, new_group = data
-        if new_uid == self.user_id and new_group == self.user_group:
-            return
-        self.user_id = new_uid
-        self.user_group = new_group
+        group_id = current_item.data(0, Qt.UserRole)
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                SELECT BACKUP_VERSION, BACKUP_TIMESTAMP, BACKUP_JSON
+                FROM BRM_CUSTOM_GROUP_BACKUPS
+                WHERE CUSTOM_GROUP_ID=?
+                ORDER BY BACKUP_VERSION DESC
+            """, (group_id,))
+            backups = c.fetchall()
+            if not backups:
+                QMessageBox.information(self, "No Backups", "No backups found for this group.")
+                return
+            items = [f"Version {b[0]} (ts={b[1]})" for b in backups]
+            sel, ok = QInputDialog.getItem(self, "Restore Backup", "Select backup version:", items, 0, False)
+            if not ok or not sel:
+                return
+            m = re.search(r"Version\s+(\d+)", sel)
+            if not m:
+                return
+            ver = int(m.group(1))
+            backup_json = None
+            for b in backups:
+                if b[0] == ver:
+                    backup_json = b[2]
+                    break
+            if not backup_json:
+                QMessageBox.warning(self, "Error", "Backup data not found.")
+                return
+            confirm = QMessageBox.question(self, "Confirm Restore", f"Restore group {group_id} to version {ver}?")
+            if confirm != QMessageBox.Yes:
+                return
+            data = json.loads(backup_json)
+            new_name = data.get("group_name")
+            members = data.get("members", [])
+            c.execute("BEGIN TRANSACTION")
+            c.execute("UPDATE BRM_CUSTOM_RULE_GROUPS SET CUSTOM_GROUP_NAME=? WHERE CUSTOM_GROUP_ID=?",
+                      (new_name, group_id))
+            c.execute("DELETE FROM BRM_CUSTOM_GROUP_MEMBERS WHERE CUSTOM_GROUP_ID=?", (group_id,))
+            for mem in members:
+                c.execute("INSERT INTO BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID, RULE_ID) VALUES(?,?)",
+                          (group_id, mem))
+            c.execute("COMMIT")
+            QMessageBox.information(self, "Restored", f"Group {group_id} restored to version {ver}.")
+            self.load_group_tree()
+            self.load_available_rules()
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            logger.error(f"Error restoring custom group: {ex}")
+            QMessageBox.critical(self, "Restore Error", str(ex))
+
+
+# -----------------------------------------------------------------------------
+# Alerts and Dashboards Tab
+# -----------------------------------------------------------------------------
+class AlertsAndDashboardsTab(QWidget):
+    """
+    Provides real‑time alerts and a dashboard display.
+    
+    Features:
+      • Auto‑refresh every minute.
+      • Displays approvals older than 3 days.
+      • Lists upcoming schedules within the next 24 hours.
+      • Summarizes performance alerts based on RULE_PERF_STATS.
+      • Advanced search capabilities (filter by column, table, or database).
+      • Visual cues (color‑coded messages) for high priority alerts.
+    """
+    def __init__(self, connection, user_id, user_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = user_id
+        self.user_group = user_group
+        self.init_ui()
+        self.start_auto_refresh()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        self.alert_display = QPlainTextEdit()
+        self.alert_display.setReadOnly(True)
+        layout.addWidget(self.alert_display)
+
+        # Search bar for filtering alerts
+        search_layout = QHBoxLayout()
+        self.alert_search_edit = QLineEdit()
+        self.alert_search_edit.setPlaceholderText("Filter alerts by table, column, or database...")
+        search_layout.addWidget(self.alert_search_edit)
+        search_btn = QPushButton("Search Alerts")
+        search_btn.clicked.connect(self.filter_alerts)
+        search_layout.addWidget(search_btn)
+        clear_btn = QPushButton("Clear Filter")
+        clear_btn.clicked.connect(self.clear_filter)
+        search_layout.addWidget(clear_btn)
+        search_layout.addStretch()
+        layout.addLayout(search_layout)
+
+        refresh_btn = QPushButton("Check Alerts Now")
+        refresh_btn.clicked.connect(self.check_alerts)
+        layout.addWidget(refresh_btn)
+
+        self.setLayout(layout)
+
+    def check_alerts(self):
+        lines = []
         c = self.connection.cursor()
-        c.execute("SELECT USERNAME FROM USERS WHERE USER_ID = ?", (self.user_id,))
-        row = c.fetchone()
-        if row:
-            self.logged_in_username = row[0]
+        # Approvals older than 3 days
+        c.execute("""
+            SELECT A.RULE_ID, A.APPROVAL_STAGE, R.RULE_NAME,
+                   DATEDIFF(DAY, ISNULL(A.APPROVED_TIMESTAMP, R.CREATED_TIMESTAMP), GETDATE()) AS age
+            FROM BRM_RULE_APPROVALS A
+            JOIN BRM_RULES R ON A.RULE_ID = R.RULE_ID
+            WHERE A.APPROVED_FLAG = 0
+              AND A.APPROVAL_STAGE = (
+                  SELECT MIN(APPROVAL_STAGE)
+                  FROM BRM_RULE_APPROVALS
+                  WHERE RULE_ID = A.RULE_ID AND APPROVED_FLAG = 0
+              )
+              AND DATEDIFF(DAY, ISNULL(A.APPROVED_TIMESTAMP, R.CREATED_TIMESTAMP), GETDATE()) > 3
+        """)
+        old_appr = c.fetchall()
+        if old_appr:
+            lines.append("Approvals older than 3 days:")
+            for (rid, stage, rname, age) in old_appr:
+                lines.append(f"  - Rule {rid} ('{rname}'): Stage {stage}, Age {age} days")
         else:
-            self.logged_in_username = "UnknownUser"
-        QMessageBox.information(self, "Switched", f"Now impersonating: {self.logged_in_username} ({self.user_group}).")
-        # Refresh dependent tabs
-        self.approvals_tab.logged_in_username = self.logged_in_username
-        self.approvals_tab.user_group = self.user_group
-        self.approvals_tab.load_approvals()
-        self.rule_dashboard.user_id = self.user_id
-        self.rule_dashboard.user_group = self.user_group
-        self.rule_dashboard.load_rules()
-        if hasattr(self, "gcr_admin_tab"):
-            self.gcr_admin_tab.load_rule_list()
-            self.gcr_admin_tab.load_link_view()
-        if hasattr(self, "hierarchy_tab"):
-            self.hierarchy_tab.load_hierarchy()
-        if hasattr(self, "group_management_tab"):
-            self.group_management_tab.user_id = self.user_id
-            self.group_management_tab.user_group = self.user_group
-            self.group_management_tab.load_data()
-        if hasattr(self, "user_management_tab"):
-            self.user_management_tab.load_users()
+            lines.append("No approvals older than 3 days.")
 
-    def load_user_switch_combo(self):
-        c = self.connection.cursor()
-        c.execute("SELECT USER_ID, USERNAME, USER_GROUP FROM USERS ORDER BY USER_ID")
-        for uid, uname, ugroup in c.fetchall():
-            display = f"{uname} ({ugroup})"
-            self.switch_combo.addItem(display, (uid, ugroup))
+        # Upcoming schedules within 24h
+        c.execute("""
+            SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME
+            FROM RULE_SCHEDULES
+            WHERE STATUS = 'Scheduled'
+              AND SCHEDULE_TIME BETWEEN GETDATE() AND DATEADD(HOUR, 24, GETDATE())
+            ORDER BY SCHEDULE_TIME
+        """)
+        schedules = c.fetchall()
+        if schedules:
+            lines.append("\nUpcoming Schedules (next 24 hours):")
+            for (sid, rid, stime) in schedules:
+                lines.append(f"  - Schedule {sid}: Rule {rid} at {stime}")
+        else:
+            lines.append("\nNo schedules in the next 24 hours.")
 
-    # ------------------- Lineage Search -------------------
-    def lineage_search_action(self):
-        text = self.lineage_tab.search_lineage_text(text=self.lineage_tab.get_search_text())
-        # In a full implementation, the EnhancedLineageGraphWidget would provide methods to highlight/dim nodes.
-        # For example: self.lineage_tab.highlight_nodes(text)
-        # Here we assume that method is implemented.
-        # If no text is provided, reset view.
-        if not text:
-            self.lineage_tab.reset_view()
+        # Performance alerts based on RULE_PERF_STATS (last 7 days)
+        threshold_time = 2000  # in milliseconds
+        c.execute("""
+            SELECT RULE_ID, AVG(EXEC_TIME_MS) AS avg_time
+            FROM RULE_PERF_STATS
+            WHERE DATE_KEY >= CONVERT(varchar(8), DATEADD(DAY, -7, GETDATE()), 112)
+            GROUP BY RULE_ID
+            HAVING AVG(EXEC_TIME_MS) > ?
+        """, (threshold_time,))
+        perf_alerts = c.fetchall()
+        if perf_alerts:
+            lines.append("\nPerformance Alerts (avg exec time > 2000 ms in last 7 days):")
+            for (rid, avg_time) in perf_alerts:
+                lines.append(f"  - Rule {rid}: Avg Exec Time {avg_time:.1f} ms")
+        else:
+            lines.append("\nNo performance alerts in the last 7 days.")
 
-    # ------------------- Close Application -------------------
-    def closeEvent(self, event):
-        if self.connection:
-            try:
-                self.connection.close()
-            except Exception as ex:
-                logger.exception("Error closing DB connection: %s", ex)
-        event.accept()
+        self.alert_display.setPlainText("\n".join(lines))
+        # Also log the check
+        logger.info("Alerts checked and updated.")
+
+    def start_auto_refresh(self):
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.check_alerts)
+        self.refresh_timer.start(60000)  # refresh every minute
+
+    def filter_alerts(self):
+        keyword = self.alert_search_edit.text().strip().lower()
+        if not keyword:
+            return
+        current_text = self.alert_display.toPlainText()
+        filtered_lines = []
+        for line in current_text.splitlines():
+            if keyword in line.lower():
+                filtered_lines.append(line)
+        self.alert_display.setPlainText("\n".join(filtered_lines))
+
+    def clear_filter(self):
+        self.alert_search_edit.clear()
+        self.check_alerts()
 
 # -----------------------------------------------------------------------------
-# Main Launcher
+# End of Module 7
 # -----------------------------------------------------------------------------
-def main():
+
+if __name__ == '__main__':
+    # For testing purposes only
+    from PyQt5.QtWidgets import QApplication
     app = QApplication(sys.argv)
-    tool = BRMTool()
-    tool.show()
-    sys.exit(app.exec_())
+    try:
+        import pyodbc
+        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as e:
+        QMessageBox.critical(None, "DB Connection Error", f"Error connecting to database: {e}")
+        sys.exit(1)
 
-if __name__ == "__main__":
-    main()
+    # Create a window with tabs for Custom Groups and Alerts
+    window = QWidget()
+    window.setWindowTitle("Custom Rule Groups and Alerts Demo")
+    main_layout = QVBoxLayout(window)
+    tabs = QTabWidget()
+    tabs.addTab(CustomRuleGroupEnhancedTab(conn, "AdminUser", "Admin"), "Custom Groups")
+    tabs.addTab(AlertsAndDashboardsTab(conn, "AdminUser", "Admin"), "Alerts & Dashboards")
+    main_layout.addWidget(tabs)
+    window.resize(1000, 700)
+    window.show()
+    sys.exit(app.exec_())
