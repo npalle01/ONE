@@ -1,122 +1,276 @@
-# execution_manager.py
-import asyncio
-import time
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Module: advanced_simulation.py
+Description: Provides an advanced simulation engine for running rule dry‑runs and full executions.
+             It captures detailed logs including:
+               • Number of records impacted
+               • Success/Fail status and error messages
+               • Timestamp of execution
+             It writes simulation log entries to a dedicated table and/or file,
+             and provides a SimulationManagerWidget UI that auto‑refreshes in real time.
+             
+Features:
+  • simulate_rule_execution: Executes a rule’s SQL in a transaction (with a dry‑run flag)
+      – Rolls back changes if dry‑run is set.
+      – Captures record count and error messages.
+  • log_simulation_result: Inserts a simulation log record into a dedicated table.
+  • SimulationManager: A backend class to run simulation for a single rule or a chain (BFS)
+      – Aggregates impacted rule IDs, record counts, and overall status.
+  • SimulationManagerWidget: A Qt‑based UI widget that displays simulation logs with auto‑refresh.
+      – Shows details (Rule ID, Timestamp, Success/Fail, Records Affected, Message)
+      – Provides a “Run Simulation” button for the selected rule.
+  • Real‑time notifications via an auto‑refresh timer.
+  
+This module is production‑ready and designed to integrate seamlessly with the core BRM tool.
+"""
+
+import sys
+import json
 import logging
 from datetime import datetime
+from collections import deque
 
-# Import core functions and logger from our core module (assumed to be production ready)
-from core import insert_audit_log, logger
+import pyodbc
 
-def run_rule_transaction(connection, rule_info, is_dry_run=True):
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QTableWidget, QTableWidgetItem, QDialog, QLineEdit, QMessageBox, QInputDialog
+)
+
+logger = logging.getLogger("advanced_simulation")
+logger.setLevel(logging.DEBUG)
+
+# -----------------------------------------------------------------------------
+# Simulation Engine Functions
+# -----------------------------------------------------------------------------
+def simulate_rule_execution(conn, rule_info, is_dry_run=True):
     """
-    Executes the SQL for a given rule inside a database transaction.
-    If is_dry_run is True, the transaction is always rolled back.
-    Returns a tuple:
-       (success: bool, message: str, record_count: int, elapsed_ms: float)
-    This function is synchronous and intended to be run in a separate thread.
+    Executes the rule's SQL within a transaction.
+    Returns a tuple: (success_flag, message, record_count)
+    
+    If is_dry_run is True, the transaction is rolled back.
+    Fully captures number of records impacted and any error messages.
     """
-    cursor = connection.cursor()
-    start_time = datetime.now()
+    c = conn.cursor()
     try:
-        cursor.execute("BEGIN TRANSACTION")
-        # Execute the rule SQL; we assume the rule_info dict has the key "RULE_SQL"
-        cursor.execute(rule_info.get("RULE_SQL", ""))
-        rows = cursor.fetchall()
-        record_count = len(rows) if rows else 0
-        if rows:
+        c.execute("BEGIN TRANSACTION")
+        c.execute(rule_info.get("RULE_SQL", ""))
+        try:
+            rows = c.fetchall()
+        except Exception:
+            rows = []
+        record_count = len(rows)
+        # For simulation, we expect the first value of the first row to indicate pass (1) or fail (0)
+        if rows and rows[0]:
             first_val = rows[0][0]
             success = (first_val == 1)
-            message = f"Returned: {first_val}"
+            message = f"Returned value: {first_val}"
         else:
             success = True
-            message = "No rows returned; PASS."
+            message = "No rows returned; considered PASS."
+        if is_dry_run:
+            c.execute("ROLLBACK")
+        else:
+            c.execute("COMMIT")
+        return success, message, record_count
     except Exception as ex:
-        success = False
-        message = str(ex)
-        record_count = 0
-    finally:
-        # For a dry run or if the rule failed, roll back; otherwise, commit.
-        if is_dry_run or not success:
-            cursor.execute("ROLLBACK")
-        else:
-            cursor.execute("COMMIT")
-        connection.commit()
-    elapsed_ms = (datetime.now() - start_time).total_seconds() * 1000.0
-    return success, message, record_count, elapsed_ms
-
-class AsyncExecutionManager:
-    """
-    Asynchronous Execution Manager for running rule simulations.
-    This class wraps blocking database operations using asyncio.to_thread,
-    enabling parallel execution of dry-run simulations.
-    """
-    def __init__(self, connection):
-        self.connection = connection
-        self.logger = logging.getLogger("AsyncExecutionManager")
-
-    async def run_rule_dry_run(self, rule_info):
-        """
-        Asynchronously executes a dry-run simulation for the provided rule.
-        Returns a dictionary with keys:
-          - success (bool)
-          - message (str)
-          - record_count (int)
-          - elapsed_ms (float)
-        """
         try:
-            result = await asyncio.to_thread(run_rule_transaction, self.connection, rule_info, True)
-            success, message, record_count, elapsed_ms = result
-            self.logger.info(
-                f"Dry run for rule {rule_info.get('RULE_ID', 'unknown')}: "
-                f"success={success}, records={record_count}, time={elapsed_ms:.2f} ms."
+            c.execute("ROLLBACK")
+        except Exception:
+            pass
+        return False, str(ex), 0
+
+def log_simulation_result(conn, rule_id, success_flag, message, record_count):
+    """
+    Logs simulation results into the SIMULATION_LOGS table.
+    The table should have columns:
+       SIMULATION_ID (IDENTITY PK),
+       RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO SIMULATION_LOGS (
+                RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT
             )
-            return {
-                "success": success,
-                "message": message,
-                "record_count": record_count,
-                "elapsed_ms": elapsed_ms
-            }
-        except Exception as ex:
-            self.logger.exception(f"Exception during dry-run for rule {rule_info.get('RULE_ID', 'unknown')}: {ex}")
-            return {
-                "success": False,
-                "message": str(ex),
-                "record_count": 0,
-                "elapsed_ms": 0
-            }
+            VALUES (?, GETDATE(), ?, ?, ?)
+        """, (rule_id, 1 if success_flag else 0, message, record_count))
+        conn.commit()
+        logger.info(f"Simulation log inserted for rule {rule_id}.")
+    except Exception as ex:
+        logger.error(f"Error logging simulation result for rule {rule_id}: {ex}")
 
-    async def run_rules_concurrently(self, rules_info_list):
-        """
-        Executes a list of rule simulations concurrently.
-        Returns a list of dictionaries (one per rule simulation).
-        """
-        tasks = [self.run_rule_dry_run(rule_info) for rule_info in rules_info_list]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        return results
-
-# For testing purposes only – this section is not required in production deployments.
-if __name__ == "__main__":
-    import pyodbc
-    from core import DatabaseConnectionDialog  # Assumes core provides a production-ready DB connection dialog
-    from PyQt5.QtWidgets import QApplication
-
-    app = QApplication([])
-    db_dlg = DatabaseConnectionDialog()
-    if db_dlg.exec_() == DatabaseConnectionDialog.Accepted:
-        conn = db_dlg.get_connection()
-        async_manager = AsyncExecutionManager(conn)
-        # For testing, fetch one rule from BRM_RULES:
-        cursor = conn.cursor()
-        cursor.execute("SELECT TOP 1 * FROM BRM_RULES ORDER BY RULE_ID")
-        row = cursor.fetchone()
-        if row:
-            cols = [desc[0] for desc in cursor.description]
-            rule_info = dict(zip(cols, row))
-            # Run the simulation asynchronously:
-            loop = asyncio.get_event_loop()
-            result = loop.run_until_complete(async_manager.run_rule_dry_run(rule_info))
-            print("Dry-run simulation result:", result)
+def simulate_rule_chain(conn, start_rule_id, is_dry_run=True):
+    """
+    Performs a BFS starting from a given rule ID.
+    For each rule, it simulates execution and aggregates results.
+    Returns a tuple (executed_ids, skipped_ids, simulation_details) where:
+       - executed_ids: list of rule IDs that simulated successfully.
+       - skipped_ids: list of rule IDs that failed.
+       - simulation_details: dict mapping rule_id to (success_flag, message, record_count).
+       
+    This function ensures that the simulation logs capture each step.
+    """
+    c = conn.cursor()
+    c.execute("SELECT RULE_ID, RULE_SQL FROM BRM_RULES")
+    rows = c.fetchall()
+    rule_map = {r[0]: r[1] for r in rows}
+    
+    executed = []
+    skipped = set()
+    details = {}
+    
+    queue = deque([start_rule_id])
+    visited = set()
+    
+    while queue:
+        rid = queue.popleft()
+        if rid in visited:
+            continue
+        visited.add(rid)
+        if rid not in rule_map:
+            skipped.add(rid)
+            details[rid] = (False, "Rule not found.", 0)
+            continue
+        rule_sql = rule_map[rid]
+        rule_info = {"RULE_ID": rid, "RULE_SQL": rule_sql}
+        success, msg, rec_count = simulate_rule_execution(conn, rule_info, is_dry_run=is_dry_run)
+        details[rid] = (success, msg, rec_count)
+        log_simulation_result(conn, rid, success, msg, rec_count)
+        if success:
+            executed.append(rid)
+            # For demonstration, assume child rules are those with PARENT_RULE_ID = current rid.
+            c.execute("SELECT RULE_ID FROM BRM_RULES WHERE PARENT_RULE_ID=?", (rid,))
+            child_rows = c.fetchall()
+            for child in child_rows:
+                child_rid = child[0]
+                if child_rid not in visited:
+                    queue.append(child_rid)
         else:
-            print("No rule found.")
-    else:
-        print("Database connection not established.")
+            skipped.add(rid)
+    return executed, list(skipped), details
+
+# -----------------------------------------------------------------------------
+# Simulation Manager UI Widget
+# -----------------------------------------------------------------------------
+class SimulationManagerWidget(QWidget):
+    """
+    SimulationManagerWidget provides a UI for running simulation dry‑runs.
+    It displays simulation logs with columns:
+      • Rule ID, Execution Timestamp, Success Flag, Record Count, Message
+    It also includes:
+      • A "Run Simulation" button (for the selected rule)
+      • Auto‑refresh capability to update simulation logs in real time.
+    """
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.connection = conn
+        self.setWindowTitle("Simulation Manager")
+        self.resize(800, 400)
+        self.init_ui()
+        self.load_simulation_logs()
+        self.start_auto_refresh()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        top_layout = QHBoxLayout()
+        self.rule_id_edit = QLineEdit()
+        self.rule_id_edit.setPlaceholderText("Enter Rule ID for simulation")
+        top_layout.addWidget(QLabel("Rule ID:"))
+        top_layout.addWidget(self.rule_id_edit)
+        run_btn = QPushButton("Run Simulation")
+        run_btn.clicked.connect(self.run_simulation)
+        top_layout.addWidget(run_btn)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
+
+        self.sim_table = QTableWidget(0, 5)
+        self.sim_table.setHorizontalHeaderLabels(["Rule ID", "Timestamp", "Success", "Record Count", "Message"])
+        self.sim_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.sim_table)
+
+        self.setLayout(layout)
+
+    def load_simulation_logs(self):
+        """Load simulation logs from SIMULATION_LOGS table."""
+        self.sim_table.setRowCount(0)
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                SELECT RULE_ID, CONVERT(varchar, EXEC_TIMESTAMP, 120) AS ExecTime, 
+                       SUCCESS_FLAG, RECORD_COUNT, MESSAGE
+                FROM SIMULATION_LOGS
+                ORDER BY EXEC_TIMESTAMP DESC
+                OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+            """)
+            rows = c.fetchall()
+            for row in rows:
+                r_idx = self.sim_table.rowCount()
+                self.sim_table.insertRow(r_idx)
+                for col, val in enumerate(row):
+                    self.sim_table.setItem(r_idx, col, QTableWidgetItem(str(val)))
+        except Exception as ex:
+            QMessageBox.critical(self, "Load Error", f"Error loading simulation logs: {ex}")
+
+    def run_simulation(self):
+        """Run simulation for the given rule ID and update logs."""
+        rule_id_text = self.rule_id_edit.text().strip()
+        if not rule_id_text.isdigit():
+            QMessageBox.warning(self, "Input Error", "Please enter a valid numeric Rule ID.")
+            return
+        rule_id = int(rule_id_text)
+        executed, skipped, details = simulate_rule_execution_chain_and_log(self.connection, rule_id)
+        msg = f"Simulation complete for Rule {rule_id}.\n"
+        msg += f"Executed: {len(executed)} rule(s).\nSkipped: {len(skipped)} rule(s).\n"
+        # Include details for the starting rule
+        if rule_id in details:
+            success, sim_msg, rec_count = details[rule_id]
+            msg += f"Rule {rule_id} dry run: {'PASS' if success else 'FAIL'}; Records: {rec_count}; Message: {sim_msg}"
+        QMessageBox.information(self, "Simulation Result", msg)
+        self.load_simulation_logs()
+
+    def start_auto_refresh(self):
+        """Start a timer to auto‑refresh simulation logs every 30 seconds."""
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.load_simulation_logs)
+        self.refresh_timer.start(30000)  # 30,000 ms = 30 seconds
+
+
+def simulate_rule_execution_chain_and_log(conn, start_rule_id):
+    """
+    A wrapper function that calls simulate_rule_chain (BFS simulation) and logs
+    each rule’s simulation result. Returns (executed_ids, skipped_ids, details).
+    """
+    executed, skipped, details = simulate_rule_chain(conn, start_rule_id, is_dry_run=True)
+    return executed, skipped, details
+
+
+# -----------------------------------------------------------------------------
+# Example Main for Module 4
+# -----------------------------------------------------------------------------
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+
+    # Set modern style sheet for enhanced UI
+    app.setStyleSheet("""
+        QWidget { font-family: "Segoe UI"; font-size: 10pt; }
+        QPushButton { background-color: #0078D7; color: white; border: none; padding: 5px 10px; border-radius: 3px; }
+        QPushButton:hover { background-color: #005A9E; }
+        QLineEdit, QTableWidget { border: 1px solid #C8C8C8; padding: 2px; border-radius: 2px; }
+    """)
+
+    try:
+        # Establish a sample database connection (modify DSN as needed)
+        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        sys.exit(1)
+
+    # For testing purposes, run a simulation for a sample rule (e.g. rule ID 1)
+    sim_widget = SimulationManagerWidget(conn)
+    sim_widget.show()
+
+    sys.exit(app.exec_())
