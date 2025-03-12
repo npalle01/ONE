@@ -1,0 +1,170 @@
+# execution_manager.py
+import asyncio
+import time
+import logging
+import json
+from datetime import datetime
+
+# Import common functions and logger from core.py
+from core import logger, insert_audit_log
+
+def run_rule_transaction(conn, rule_info, is_dry_run=False):
+    """
+    Executes a single rule's SQL within a transaction.
+    Returns a tuple: (success: bool, message: str, record_count: int).
+    This function is synchronous and intended to be offloaded via asyncio.
+    """
+    cursor = conn.cursor()
+    cursor.execute("BEGIN TRANSACTION")
+    success = False
+    message = ""
+    record_count = 0
+    try:
+        cursor.execute(rule_info["RULE_SQL"])
+        rows = cursor.fetchall()
+        if rows:
+            record_count = len(rows)
+            value = rows[0][0]
+            success = (value == 1)
+            message = f"Returned: {value}"
+        else:
+            success = True
+            message = "No rows returned – PASS"
+        if is_dry_run or not success:
+            cursor.execute("ROLLBACK")
+        else:
+            cursor.execute("COMMIT")
+    except Exception as ex:
+        cursor.execute("ROLLBACK")
+        success = False
+        message = str(ex)
+    return success, message, record_count
+
+class AsyncExecutionManager:
+    """
+    Manages asynchronous and parallel execution of heavy ETL or simulation tasks.
+    It captures detailed logs for each simulation, including record counts impacted,
+    elapsed execution time, and success/failure notifications.
+    """
+    def __init__(self, connection):
+        self.connection = connection
+        # Use the default event loop for asynchronous execution.
+        self.loop = asyncio.get_event_loop()
+        self.logger = logging.getLogger("AsyncExecutionManager")
+    
+    async def run_rule_dry_run(self, rule_info):
+        """
+        Asynchronously runs a dry‑run for a single rule.
+        Returns a dict with the rule ID, success flag, message, record count, and elapsed time (ms).
+        """
+        start_time = time.time()
+        # Offload the blocking database call to the default executor.
+        success, message, record_count = await self.loop.run_in_executor(
+            None, run_rule_transaction, self.connection, rule_info, True
+        )
+        elapsed = (time.time() - start_time) * 1000  # in milliseconds
+        result = {
+            "RULE_ID": rule_info["RULE_ID"],
+            "success": success,
+            "message": message,
+            "record_count": record_count,
+            "elapsed_ms": elapsed
+        }
+        self.logger.info(
+            f"Dry-run for rule {rule_info['RULE_ID']} completed in {elapsed:.2f} ms – "
+            f"Success: {success}, Records impacted: {record_count}"
+        )
+        return result
+
+    async def run_etl_simulation(self, rules):
+        """
+        Runs dry‑run simulations for a list of rule info dictionaries in parallel.
+        Returns a tuple (executed, skipped) where:
+          • executed: list of result dicts for successfully executed rules.
+          • skipped: list of rule IDs that failed simulation.
+        """
+        tasks = [self.run_rule_dry_run(rule) for rule in rules]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        executed = []
+        skipped = []
+        for res in results:
+            if isinstance(res, Exception):
+                self.logger.error(f"Simulation encountered error: {res}")
+                continue
+            if res["success"]:
+                executed.append(res)
+            else:
+                skipped.append(res["RULE_ID"])
+        return executed, skipped
+
+    async def run_simulation_for_chain(self, root_rule_info, adjacency, rule_lookup):
+        """
+        Asynchronously simulates a chain of rules (BFS) starting from the root rule.
+        – 'adjacency' is a dict mapping a rule ID to a set of child rule IDs.
+        – 'rule_lookup' maps rule IDs to full rule info dictionaries.
+        Returns two sets: executed and skipped rule IDs.
+        """
+        executed = set()
+        skipped = set()
+        queue = [root_rule_info["RULE_ID"]]
+        while queue:
+            rid = queue.pop(0)
+            if rid in skipped:
+                continue
+            if rid not in rule_lookup:
+                skipped.add(rid)
+                continue
+            rule_info = rule_lookup[rid]
+            result = await self.run_rule_dry_run(rule_info)
+            if result["success"]:
+                executed.add(rid)
+                for child in adjacency.get(rid, []):
+                    if child not in executed and child not in skipped:
+                        queue.append(child)
+            else:
+                skipped.add(rid)
+                self._skip_descendants(rid, adjacency, skipped)
+        return executed, skipped
+
+    def _skip_descendants(self, rule_id, adjacency, skipped):
+        """
+        Recursively mark all descendant rules of rule_id as skipped.
+        """
+        stack = [rule_id]
+        while stack:
+            cur = stack.pop()
+            if cur in skipped:
+                continue
+            skipped.add(cur)
+            for child in adjacency.get(cur, []):
+                if child not in skipped:
+                    stack.append(child)
+
+    async def run_simulation_for_custom_group(self, custom_group_rule_ids, rule_lookup):
+        """
+        Asynchronously simulates dry‑run execution for all rules in a custom group.
+        Returns two lists: passed (rule IDs) and failed (rule IDs).
+        """
+        tasks = []
+        for rid in custom_group_rule_ids:
+            if rid in rule_lookup:
+                tasks.append(self.run_rule_dry_run(rule_lookup[rid]))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        passed = []
+        failed = []
+        for res in results:
+            if isinstance(res, Exception):
+                self.logger.error(f"Custom group simulation error: {res}")
+                continue
+            if res["success"]:
+                passed.append(res["RULE_ID"])
+            else:
+                failed.append(res["RULE_ID"])
+        return passed, failed
+
+    def run_simulations_sync(self, rules):
+        """
+        Synchronous wrapper that runs ETL simulation for a list of rules using the event loop.
+        Returns the tuple (executed, skipped).
+        """
+        return self.loop.run_until_complete(self.run_etl_simulation(rules))
