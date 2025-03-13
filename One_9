@@ -1,265 +1,315 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 """
-Module: advanced_decision_tables.py
+Module: defect_management.py
 Description:
-  This module provides deep integration for decision tables. It features:
-    • A fully‐functional UI for managing decision tables (add, update, delete)
-    • Execution of decision table logic with dry‐run simulation
-      that logs the number of records impacted and returns detailed pass/fail notifications.
-    • Real‑time notifications and auto‑refresh of the execution log.
-    • Robust error handling and detailed logging.
+  • Provides a defect logging and management system for the Advanced BRM Tool.
+  • DefectDialog: a QDialog to add or edit a single defect record.
+  • DefectManagementTab: a QWidget that displays the defect logs, allows searching,
+    adding/editing/deleting, and auto‑refreshing every 30 seconds.
     
-Assumptions:
-  • Decision tables are stored in a table named DECISION_TABLES with columns:
-      DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY.
-  • The DECISION_QUERY contains SQL that returns a value (typically 1 for PASS).
+Database Requirements:
+  - BRM_DEFECT_LOGS(
+       DEFECT_ID int PK, 
+       RULE_ID int NULL,
+       DESCRIPTION varchar(...), 
+       SEVERITY varchar(20),
+       REPORTER varchar(50),
+       STATUS varchar(20),  -- e.g. 'Open','In Progress','Resolved','Closed'
+       RESOLUTION varchar(...),
+       TIMESTAMP datetime
+    )
 """
 
 import sys
-import json
 import logging
-import pyodbc
-import sqlparse
 from datetime import datetime
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QDialog, QLineEdit, QLabel, QMessageBox, QInputDialog,
-    QPlainTextEdit, QFormLayout, QTextEdit
+    QPushButton, QMessageBox, QDialog, QFormLayout, QLineEdit, QTextEdit,
+    QComboBox, QPlainTextEdit, QInputDialog, QLabel
 )
-from PyQt5.QtCore import Qt, QTimer
+from core_foundation import logger, insert_audit_log
 
-# Configure module-specific logger
-logger = logging.getLogger("advanced_decision_tables")
-
-class AdvancedDecisionTablesTab(QWidget):
+def add_defect_log(conn, rule_id, description, severity, reporter, status="Open", resolution=None):
     """
-    A QWidget for comprehensive management and execution of decision tables.
-    This tab allows users to view, add, update, delete, and execute decision table logic.
-    Execution is performed in a dry-run transaction that logs the number of impacted records
-    along with a pass/fail outcome.
+    Inserts a row into BRM_DEFECT_LOGS with the given details.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO BRM_DEFECT_LOGS(RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION, TIMESTAMP)
+            VALUES(?,?,?,?,?,?,GETDATE())
+        """,(rule_id, description, severity, reporter, status, resolution))
+        conn.commit()
+        logger.info(f"Defect log added for rule {rule_id} by {reporter}.")
+        insert_audit_log(conn, "ADD_DEFECT","BRM_DEFECT_LOGS", None, reporter, None,
+                         {"rule_id":rule_id, "desc":description, "severity":severity})
+    except Exception as ex:
+        logger.error(f"Error adding defect log for rule {rule_id}: {ex}")
+        raise
+
+# -----------------------------------------------------------------------------
+# 1. DefectDialog – QDialog to add/edit a defect
+# -----------------------------------------------------------------------------
+class DefectDialog(QDialog):
+    """
+    A dialog for adding or editing a defect record. 
+    If defect_data is provided, we load it for editing.
+    """
+    def __init__(self, connection, defect_data=None, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.defect_data = defect_data
+        self.setWindowTitle("Edit Defect" if defect_data else "Add New Defect")
+        self.resize(500,400)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.rule_id_edit = QLineEdit()
+        self.rule_id_edit.setPlaceholderText("Optional: Rule ID")
+        form.addRow("Rule ID:", self.rule_id_edit)
+
+        self.description_edit = QTextEdit()
+        form.addRow("Description:", self.description_edit)
+
+        self.severity_combo = QComboBox()
+        self.severity_combo.addItems(["Low","Medium","High","Critical"])
+        form.addRow("Severity:", self.severity_combo)
+
+        self.reporter_edit = QLineEdit()
+        form.addRow("Reporter:", self.reporter_edit)
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["Open","In Progress","Resolved","Closed"])
+        form.addRow("Status:", self.status_combo)
+
+        self.resolution_edit = QTextEdit()
+        form.addRow("Resolution:", self.resolution_edit)
+
+        layout.addLayout(form)
+
+        btn_h = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.save_defect)
+        btn_h.addWidget(save_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_h.addWidget(cancel_btn)
+        layout.addLayout(btn_h)
+        self.setLayout(layout)
+
+        if self.defect_data:
+            self.load_existing_data()
+
+    def load_existing_data(self):
+        """
+        Populate dialog fields with the existing defect data.
+        """
+        self.rule_id_edit.setText(str(self.defect_data.get("RULE_ID","")))
+        self.description_edit.setPlainText(self.defect_data.get("DESCRIPTION",""))
+        sev = self.defect_data.get("SEVERITY","Low")
+        idx = self.severity_combo.findText(sev, Qt.MatchFixedString)
+        if idx>=0:
+            self.severity_combo.setCurrentIndex(idx)
+        self.reporter_edit.setText(self.defect_data.get("REPORTER",""))
+        st = self.defect_data.get("STATUS","Open")
+        idx2 = self.status_combo.findText(st, Qt.MatchFixedString)
+        if idx2>=0:
+            self.status_combo.setCurrentIndex(idx2)
+        self.resolution_edit.setPlainText(self.defect_data.get("RESOLUTION",""))
+
+    def save_defect(self):
+        """
+        Insert or update the defect in DB, then close if successful.
+        """
+        try:
+            rule_id_text = self.rule_id_edit.text().strip()
+            rule_id = int(rule_id_text) if rule_id_text else None
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Rule ID must be an integer or blank.")
+            return
+
+        description = self.description_edit.toPlainText().strip()
+        if not description:
+            QMessageBox.warning(self, "Input Error", "Description is required.")
+            return
+        severity = self.severity_combo.currentText()
+        reporter = self.reporter_edit.text().strip()
+        if not reporter:
+            QMessageBox.warning(self, "Input Error", "Reporter is required.")
+            return
+        status = self.status_combo.currentText()
+        resolution = self.resolution_edit.toPlainText().strip() or None
+
+        c = self.connection.cursor()
+        if self.defect_data:
+            # update
+            defect_id = self.defect_data["DEFECT_ID"]
+            try:
+                c.execute("""
+                    UPDATE BRM_DEFECT_LOGS
+                    SET RULE_ID=?, DESCRIPTION=?, SEVERITY=?, REPORTER=?,
+                        STATUS=?, RESOLUTION=?, TIMESTAMP=GETDATE()
+                    WHERE DEFECT_ID=?
+                """,(rule_id, description, severity, reporter, status, resolution, defect_id))
+                c.connection.commit()
+                logger.info(f"Defect {defect_id} updated by {reporter}.")
+                insert_audit_log(self.connection, "UPDATE_DEFECT","BRM_DEFECT_LOGS", defect_id, reporter,
+                                 None, {"desc":description,"status":status})
+            except Exception as ex:
+                logger.error(f"Error updating defect {defect_id}: {ex}")
+                QMessageBox.critical(self, "Error", str(ex))
+                return
+        else:
+            # add new
+            try:
+                add_defect_log(self.connection, rule_id, description, severity, reporter, status, resolution)
+            except Exception as ex:
+                QMessageBox.critical(self, "Error", str(ex))
+                return
+
+        self.accept()
+
+# -----------------------------------------------------------------------------
+# 2. DefectManagementTab – main UI for listing/managing defects
+# -----------------------------------------------------------------------------
+class DefectManagementTab(QWidget):
+    """
+    A tab that displays a table of BRM_DEFECT_LOGS, supports searching, adding,
+    editing, deleting, and auto-refresh every 30 seconds.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.setWindowTitle("Advanced Decision Tables")
-        self.layout = QVBoxLayout(self)
-        self.init_ui()
-        self.load_decision_tables()
+        self.last_defect_count = 0
+        layout = QVBoxLayout(self)
 
-    def init_ui(self):
-        # Decision Tables Display
-        self.dt_table = QTableWidget(0, 4)
-        self.dt_table.setHorizontalHeaderLabels(["DT_ID", "Table Name", "Description", "Query"])
-        self.dt_table.horizontalHeader().setStretchLastSection(True)
-        self.layout.addWidget(self.dt_table)
+        self.notification_label = QLabel("")
+        self.notification_label.setStyleSheet("color: green; font-weight:bold;")
+        layout.addWidget(self.notification_label)
 
-        # Control Buttons for CRUD and Execution
-        btn_layout = QHBoxLayout()
-        add_btn = QPushButton("Add Decision Table")
-        add_btn.clicked.connect(self.add_decision_table)
-        btn_layout.addWidget(add_btn)
+        top_h = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search defects...")
+        self.search_edit.textChanged.connect(self.search_defects)
+        top_h.addWidget(QLabel("Search:"))
+        top_h.addWidget(self.search_edit)
+        layout.addLayout(top_h)
 
-        update_btn = QPushButton("Update Decision Table")
-        update_btn.clicked.connect(self.update_decision_table)
-        btn_layout.addWidget(update_btn)
+        self.defect_table = QTableWidget(0,7)
+        self.defect_table.setHorizontalHeaderLabels([
+            "Defect ID","Rule ID","Description","Severity","Reporter","Status","Timestamp"
+        ])
+        self.defect_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.defect_table)
 
-        delete_btn = QPushButton("Delete Decision Table")
-        delete_btn.clicked.connect(self.delete_decision_table)
-        btn_layout.addWidget(delete_btn)
+        btn_h = QHBoxLayout()
+        add_btn = QPushButton("Add Defect")
+        add_btn.clicked.connect(self.add_defect)
+        btn_h.addWidget(add_btn)
 
-        execute_btn = QPushButton("Execute Decision Table")
-        execute_btn.clicked.connect(self.execute_decision_table)
-        btn_layout.addWidget(execute_btn)
+        edit_btn = QPushButton("Edit Defect")
+        edit_btn.clicked.connect(self.edit_defect)
+        btn_h.addWidget(edit_btn)
+
+        del_btn = QPushButton("Delete Defect")
+        del_btn.clicked.connect(self.delete_defect)
+        btn_h.addWidget(del_btn)
 
         refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.load_decision_tables)
-        btn_layout.addWidget(refresh_btn)
-        btn_layout.addStretch()
-        self.layout.addLayout(btn_layout)
+        refresh_btn.clicked.connect(self.load_defects)
+        btn_h.addWidget(refresh_btn)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
 
-        # Execution Log Area (for simulation logging)
-        self.execution_log = QPlainTextEdit()
-        self.execution_log.setReadOnly(True)
-        self.execution_log.setPlaceholderText("Decision Table Execution Log...")
-        self.layout.addWidget(self.execution_log)
+        self.setLayout(layout)
+        # auto-refresh
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.auto_refresh)
+        self.refresh_timer.start(30000)
+        self.load_defects()
 
-    def load_decision_tables(self):
-        """
-        Load decision table entries from the DECISION_TABLES table.
-        Expected columns: DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY.
-        """
-        self.dt_table.setRowCount(0)
+    def load_defects(self):
+        self.defect_table.setRowCount(0)
+        c = self.connection.cursor()
         try:
-            c = self.connection.cursor()
             c.execute("""
-                SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
-                FROM DECISION_TABLES
-                ORDER BY DECISION_TABLE_ID
+                SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP
+                FROM BRM_DEFECT_LOGS
+                ORDER BY TIMESTAMP DESC
             """)
             rows = c.fetchall()
+            curr_count = len(rows)
             for row in rows:
-                row_index = self.dt_table.rowCount()
-                self.dt_table.insertRow(row_index)
-                for col_index, val in enumerate(row):
-                    self.dt_table.setItem(row_index, col_index, QTableWidgetItem(str(val) if val else ""))
+                r_i = self.defect_table.rowCount()
+                self.defect_table.insertRow(r_i)
+                for col_i, val in enumerate(row):
+                    self.defect_table.setItem(r_i, col_i, QTableWidgetItem(str(val) if val else ""))
+            if self.last_defect_count and curr_count>self.last_defect_count:
+                new_count = curr_count - self.last_defect_count
+                self.notification_label.setText(f"{new_count} new defect(s) logged.")
+                QtCore.QTimer.singleShot(5000, lambda: self.notification_label.setText(""))
+            self.last_defect_count = curr_count
         except Exception as ex:
-            logger.error(f"Error loading decision tables: {ex}")
-            QMessageBox.critical(self, "Error", f"Error loading decision tables: {ex}")
+            logger.error(f"Error loading defects: {ex}")
+            QMessageBox.critical(self, "Error", str(ex))
 
-    def add_decision_table(self):
-        """
-        Add a new decision table entry via input dialogs.
-        """
-        dt_name, ok = QInputDialog.getText(self, "Add Decision Table", "Table Name:")
-        if not ok or not dt_name.strip():
-            return
-        description, ok = QInputDialog.getMultiLineText(self, "Add Decision Table", "Description:")
-        if not ok:
-            description = ""
-        query, ok = QInputDialog.getMultiLineText(self, "Add Decision Table", "Decision Query (SQL):")
-        if not ok or not query.strip():
-            QMessageBox.warning(self, "Input Error", "Decision Query is required.")
-            return
+    def search_defects(self, text):
+        text_lower = text.lower().strip()
+        for row in range(self.defect_table.rowCount()):
+            visible = False
+            for col in range(self.defect_table.columnCount()):
+                item = self.defect_table.item(row, col)
+                if item and text_lower in item.text().lower():
+                    visible = True
+                    break
+            self.defect_table.setRowHidden(row, not visible)
 
+    def auto_refresh(self):
+        self.load_defects()
+
+    def add_defect(self):
+        dlg = DefectDialog(self.connection)
+        if dlg.exec_()==QDialog.Accepted:
+            self.load_defects()
+
+    def edit_defect(self):
+        row = self.defect_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self, "No Selection", "Select a defect to edit.")
+            return
+        defect_data = {
+            "DEFECT_ID": int(self.defect_table.item(row,0).text()),
+            "RULE_ID": self.defect_table.item(row,1).text(),
+            "DESCRIPTION": self.defect_table.item(row,2).text(),
+            "SEVERITY": self.defect_table.item(row,3).text(),
+            "REPORTER": self.defect_table.item(row,4).text(),
+            "STATUS": self.defect_table.item(row,5).text(),
+            "TIMESTAMP": self.defect_table.item(row,6).text()
+        }
+        dlg = DefectDialog(self.connection, defect_data=defect_data)
+        if dlg.exec_()==QDialog.Accepted:
+            self.load_defects()
+
+    def delete_defect(self):
+        row = self.defect_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self, "No Selection", "Select a defect to delete.")
+            return
+        defect_id = int(self.defect_table.item(row,0).text())
+        confirm = QMessageBox.question(self, "Confirm", f"Delete defect ID {defect_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
         try:
-            c = self.connection.cursor()
-            c.execute("""
-                INSERT INTO DECISION_TABLES (TABLE_NAME, DESCRIPTION, DECISION_QUERY)
-                VALUES (?, ?, ?)
-            """, (dt_name.strip(), description.strip(), query.strip()))
-            self.connection.commit()
-            QMessageBox.information(self, "Success", "Decision Table added successfully.")
-            self.load_decision_tables()
+            c.execute("DELETE FROM BRM_DEFECT_LOGS WHERE DEFECT_ID=?", (defect_id,))
+            c.connection.commit()
+            QMessageBox.information(self, "Deleted", f"Defect {defect_id} deleted.")
+            self.load_defects()
         except Exception as ex:
-            logger.error(f"Error adding decision table: {ex}")
-            QMessageBox.critical(self, "Error", f"Error adding decision table: {ex}")
-
-    def update_decision_table(self):
-        """
-        Update an existing decision table entry.
-        """
-        row = self.dt_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Selection Error", "No decision table selected.")
-            return
-        dt_id_item = self.dt_table.item(row, 0)
-        if not dt_id_item:
-            return
-        dt_id = int(dt_id_item.text())
-        current_name = self.dt_table.item(row, 1).text() if self.dt_table.item(row, 1) else ""
-        current_desc = self.dt_table.item(row, 2).text() if self.dt_table.item(row, 2) else ""
-        current_query = self.dt_table.item(row, 3).text() if self.dt_table.item(row, 3) else ""
-
-        dt_name, ok = QInputDialog.getText(self, "Update Decision Table", "Table Name:", text=current_name)
-        if not ok or not dt_name.strip():
-            return
-        description, ok = QInputDialog.getMultiLineText(self, "Update Decision Table", "Description:", text=current_desc)
-        if not ok:
-            description = current_desc
-        query, ok = QInputDialog.getMultiLineText(self, "Update Decision Table", "Decision Query (SQL):", text=current_query)
-        if not ok or not query.strip():
-            QMessageBox.warning(self, "Input Error", "Decision Query is required.")
-            return
-
-        try:
-            c = self.connection.cursor()
-            c.execute("""
-                UPDATE DECISION_TABLES
-                SET TABLE_NAME = ?, DESCRIPTION = ?, DECISION_QUERY = ?
-                WHERE DECISION_TABLE_ID = ?
-            """, (dt_name.strip(), description.strip(), query.strip(), dt_id))
-            self.connection.commit()
-            QMessageBox.information(self, "Success", "Decision Table updated successfully.")
-            self.load_decision_tables()
-        except Exception as ex:
-            logger.error(f"Error updating decision table: {ex}")
-            QMessageBox.critical(self, "Error", f"Error updating decision table: {ex}")
-
-    def delete_decision_table(self):
-        """
-        Delete the selected decision table.
-        """
-        row = self.dt_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Selection Error", "No decision table selected.")
-            return
-        dt_id_item = self.dt_table.item(row, 0)
-        if not dt_id_item:
-            return
-        dt_id = int(dt_id_item.text())
-        confirm = QMessageBox.question(self, "Confirm Delete", f"Delete Decision Table ID {dt_id}?")
-        if confirm != QMessageBox.Yes:
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID = ?", (dt_id,))
-            self.connection.commit()
-            QMessageBox.information(self, "Deleted", "Decision Table deleted successfully.")
-            self.load_decision_tables()
-        except Exception as ex:
-            logger.error(f"Error deleting decision table: {ex}")
-            QMessageBox.critical(self, "Error", f"Error deleting decision table: {ex}")
-
-    def execute_decision_table(self):
-        """
-        Execute the decision table logic for the selected decision table.
-        The query is executed in a dry-run transaction. The function logs the number of impacted
-        records and provides a pass/fail result via detailed notifications.
-        """
-        row = self.dt_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "Selection Error", "No decision table selected.")
-            return
-        dt_id_item = self.dt_table.item(row, 0)
-        if not dt_id_item:
-            return
-        dt_id = int(dt_id_item.text())
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID = ?", (dt_id,))
-            row_query = c.fetchone()
-            if not row_query or not row_query[0]:
-                QMessageBox.warning(self, "No Query", "Selected decision table has no query defined.")
-                return
-            decision_query = row_query[0]
-            # Begin dry-run execution
-            c.execute("BEGIN TRANSACTION")
-            c.execute(decision_query)
-            result_rows = c.fetchall()
-            impacted_count = len(result_rows)
-            if result_rows:
-                result_value = result_rows[0][0]
-                pass_flag = (result_value == 1)
-                message = f"Decision Table executed. Returned value: {result_value}. Records impacted: {impacted_count}."
-            else:
-                pass_flag = True
-                message = f"Decision Table executed. No rows returned. Considered PASS by default."
-            c.execute("ROLLBACK")  # Ensure no permanent change during simulation
-            logger.info(f"Decision Table ID {dt_id} execution: {message}")
-            self.execution_log.appendPlainText(message)
-            if pass_flag:
-                QMessageBox.information(self, "Decision Table Execution", message)
-            else:
-                QMessageBox.warning(self, "Decision Table Execution", message)
-        except Exception as ex:
-            c.execute("ROLLBACK")
-            error_msg = f"Error executing decision table ID {dt_id}: {ex}"
-            logger.error(error_msg)
-            self.execution_log.appendPlainText(error_msg)
-            QMessageBox.critical(self, "Execution Error", error_msg)
-
-
-# For standalone testing
-if __name__ == "__main__":
-    from PyQt5.QtWidgets import QApplication
-    app = QApplication(sys.argv)
-    try:
-        # Establish a test connection (replace with your DSN or connection string)
-        connection = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
-    except Exception as ex:
-        print(f"Database connection error: {ex}")
-        sys.exit(1)
-    window = AdvancedDecisionTablesTab(connection)
-    window.show()
-    sys.exit(app.exec_())
+            logger.error(f"Error deleting defect {defect_id}: {ex}")
+            QMessageBox.critical(self, "Error", str(ex))
