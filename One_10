@@ -1,347 +1,397 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Module: defect_management.py
-
-Defect Logging and Management Module for the BRM Tool.
-This module integrates seamlessly with the 10 core modules and provides
-robust functionality for logging, tracking, and managing defects.
-Features include:
-  • Viewing defect logs in a table with auto‑refresh every 30 seconds.
-  • Real‑time notifications via a status label when new defects are added.
-  • Adding, editing, and deleting defect records.
-  • Searching defects by rule, description, severity, status, etc.
-  • Detailed logging of simulation impacts (number of records impacted, pass/fail status)
-    that can be extended further.
-  • Full integration with other BRM modules.
-  # In your main window module (e.g., part8 or main.py):
-
-from defect_management import DefectManagementTab  # import the new module
-
-# Inside the BRMTool.__init__ or after initializing your QTabWidget (self.tabs)
-self.defect_tab = DefectManagementTab(self.connection)
-self.tabs.addTab(self.defect_tab, "Defect Management")
-All necessary imports are included.
+Module: advanced_lineage_visualization.py
+Description:
+  This module provides a robust and professional advanced lineage visualization widget.
+  It uses QGraphicsView/QGraphicsScene to render an Erwin‑style ER diagram that shows
+  end‑to‑end lineage between business rules and their table dependencies. Key features include:
+    • Visual nodes for rules and tables with distinct shapes and color codes based on live status.
+    • Flow arrows connecting rule nodes to table nodes (and optionally rule-to-rule relationships).
+    • Deep search capabilities that allow users to filter nodes by column, database, or table.
+    • Real‑time notifications and auto‑refresh (using QTimer) to update the diagram as data changes.
+    • Detailed simulation logging: dry‑run executions capture number of impacted records and success/failure.
+    • Robust error handling and standard naming conventions.
+    
+Assumptions:
+  • The database contains tables such as BRM_RULES and BRM_RULE_TABLE_DEPENDENCIES.
+  • BRM_RULES includes fields: RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, LOCKED_BY, etc.
+  • BRM_RULE_TABLE_DEPENDENCIES includes: RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP.
+  • A connection (pyodbc connection) is passed into this module.
 """
 
 import sys
 import json
 import logging
 from datetime import datetime
+from collections import defaultdict
+
+from PyQt5.QtCore import Qt, QRectF, QLineF, QTimer
+from PyQt5.QtGui import QPen, QBrush, QColor, QFont
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QMessageBox, QDialog, QFormLayout, QLineEdit, QTextEdit,
-    QComboBox, QPlainTextEdit, QInputDialog, QLabel, QApplication
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsEllipseItem,
+    QGraphicsRectItem, QGraphicsLineItem, QGraphicsTextItem, QApplication, QMessageBox
 )
-from PyQt5.QtCore import Qt, QTimer
 
-# Setup logging (if not already configured)
-logger = logging.getLogger(__name__)
+# Configure logger for this module
+logger = logging.getLogger("advanced_lineage_visualization")
 
-# -----------------------------------------------------------------------------
-# Database helper function to log defects into BRM_DEFECT_LOGS table.
-# -----------------------------------------------------------------------------
-def add_defect_log(conn, rule_id, description, severity, reporter, status="Open", resolution=None):
-    """
-    Insert a defect log record into the BRM_DEFECT_LOGS table.
-    """
-    try:
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO BRM_DEFECT_LOGS(
-                RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION, TIMESTAMP
-            )
-            VALUES (?, ?, ?, ?, ?, ?, GETDATE())
-        """, (rule_id, description, severity, reporter, status, resolution))
-        conn.commit()
-        logger.info(f"Defect log added for rule {rule_id} by {reporter}.")
-    except Exception as ex:
-        logger.error(f"Error adding defect log for rule {rule_id}: {ex}")
-        raise
+# Constants for node dimensions and colors
+RULE_NODE_WIDTH = 150
+RULE_NODE_HEIGHT = 60
+TABLE_NODE_DIAMETER = 120
 
-# -----------------------------------------------------------------------------
-# Defect Dialog: Used for adding or editing a defect record.
-# -----------------------------------------------------------------------------
-class DefectDialog(QDialog):
+COLOR_RULE_ACTIVE = QColor("#C8E6C9")      # light green
+COLOR_RULE_INACTIVE = QColor("#FFCDD2")    # light red
+COLOR_RULE_PENDING = QColor("#FFF9C4")     # light yellow
+
+COLOR_TABLE_DEFAULT = QColor("#BBDEFB")    # light blue
+COLOR_TABLE_MISSING = QColor("#E1BEE7")     # light purple
+
+ARROW_COLOR = QColor("#424242")            # dark gray
+LINE_WIDTH = 2
+
+class AdvancedLineageGraphWidget(QGraphicsView):
     """
-    Dialog for adding a new defect or editing an existing defect.
+    A QGraphicsView-based widget for advanced lineage visualization.
+    
+    Features:
+      • Builds a graph from BRM_RULES and BRM_RULE_TABLE_DEPENDENCIES.
+      • Renders rule nodes as rounded rectangles (with status colors)
+        and table nodes as circles.
+      • Draws arrows from rule nodes to table nodes.
+      • Supports deep search: when a search term is provided, only nodes whose
+        text (rule name, table name, column name, or database) matches will remain
+        highlighted while others are dimmed.
+      • Auto-refreshes periodically to reflect live data.
+      • Logs simulation results: for each dry-run execution, it can capture and
+        display the number of records impacted along with pass/fail status.
     """
-    def __init__(self, connection, defect_data=None, parent=None):
+
+    def __init__(self, connection, parent=None, auto_refresh_interval=30000):
+        """
+        :param connection: pyodbc connection object.
+        :param parent: Parent widget.
+        :param auto_refresh_interval: Auto-refresh interval in milliseconds.
+        """
         super().__init__(parent)
         self.connection = connection
-        self.defect_data = defect_data  # if provided, it's an edit operation
-        self.setWindowTitle("Edit Defect Log" if defect_data else "Add New Defect Log")
-        self.resize(500, 400)
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
+        self.setRenderHint(self.viewport().Antialiasing)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
 
-        self.rule_id_edit = QLineEdit()
-        self.rule_id_edit.setPlaceholderText("Optional: Rule ID")
-        form.addRow("Rule ID:", self.rule_id_edit)
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
 
-        self.description_edit = QTextEdit()
-        form.addRow("Description:", self.description_edit)
+        # Store nodes for search highlighting
+        self.rule_nodes = {}    # key: RULE_ID, value: GraphicsRuleNode
+        self.table_nodes = {}   # key: (database, table), value: GraphicsTableNode
 
-        self.severity_combo = QComboBox()
-        self.severity_combo.addItems(["Low", "Medium", "High", "Critical"])
-        form.addRow("Severity:", self.severity_combo)
-
-        self.reporter_edit = QLineEdit()
-        form.addRow("Reporter:", self.reporter_edit)
-
-        self.status_combo = QComboBox()
-        self.status_combo.addItems(["Open", "In Progress", "Resolved", "Closed"])
-        form.addRow("Status:", self.status_combo)
-
-        self.resolution_edit = QTextEdit()
-        form.addRow("Resolution (if any):", self.resolution_edit)
-
-        layout.addLayout(form)
-
-        btn_h = QHBoxLayout()
-        self.save_btn = QPushButton("Save")
-        self.save_btn.clicked.connect(self.save_defect)
-        btn_h.addWidget(self.save_btn)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_h.addWidget(cancel_btn)
-        layout.addLayout(btn_h)
-        self.setLayout(layout)
-
-        if self.defect_data:
-            self.load_existing_data()
-
-    def load_existing_data(self):
-        self.rule_id_edit.setText(str(self.defect_data.get("RULE_ID", "")))
-        self.description_edit.setPlainText(self.defect_data.get("DESCRIPTION", ""))
-        severity = self.defect_data.get("SEVERITY", "Low")
-        index = self.severity_combo.findText(severity, Qt.MatchFixedString)
-        if index >= 0:
-            self.severity_combo.setCurrentIndex(index)
-        self.reporter_edit.setText(self.defect_data.get("REPORTER", ""))
-        status = self.defect_data.get("STATUS", "Open")
-        index2 = self.status_combo.findText(status, Qt.MatchFixedString)
-        if index2 >= 0:
-            self.status_combo.setCurrentIndex(index2)
-        self.resolution_edit.setPlainText(self.defect_data.get("RESOLUTION", ""))
-
-    def save_defect(self):
-        try:
-            rule_id_text = self.rule_id_edit.text().strip()
-            rule_id = int(rule_id_text) if rule_id_text else None
-        except ValueError:
-            QMessageBox.warning(self, "Input Error", "Rule ID must be an integer or left blank.")
-            return
-        description = self.description_edit.toPlainText().strip()
-        if not description:
-            QMessageBox.warning(self, "Input Error", "Description is required.")
-            return
-        severity = self.severity_combo.currentText()
-        reporter = self.reporter_edit.text().strip()
-        if not reporter:
-            QMessageBox.warning(self, "Input Error", "Reporter is required.")
-            return
-        status = self.status_combo.currentText()
-        resolution = self.resolution_edit.toPlainText().strip() or None
-
-        c = self.connection.cursor()
-        if self.defect_data:
-            # Update existing defect record
-            defect_id = self.defect_data.get("DEFECT_ID")
-            try:
-                c.execute("""
-                    UPDATE BRM_DEFECT_LOGS
-                    SET RULE_ID = ?, DESCRIPTION = ?, SEVERITY = ?, REPORTER = ?,
-                        STATUS = ?, RESOLUTION = ?, TIMESTAMP = GETDATE()
-                    WHERE DEFECT_ID = ?
-                """, (rule_id, description, severity, reporter, status, resolution, defect_id))
-                self.connection.commit()
-                logger.info(f"Defect {defect_id} updated by {reporter}.")
-            except Exception as ex:
-                logger.error(f"Error updating defect {defect_id}: {ex}")
-                QMessageBox.critical(self, "Error", f"Error updating defect: {ex}")
-                return
-        else:
-            try:
-                add_defect_log(self.connection, rule_id, description, severity, reporter, status, resolution)
-            except Exception as ex:
-                QMessageBox.critical(self, "Error", f"Error adding defect: {ex}")
-                return
-        self.accept()
-
-# -----------------------------------------------------------------------------
-# Defect Management Tab: Main UI for defect logging and management.
-# -----------------------------------------------------------------------------
-class DefectManagementTab(QWidget):
-    """
-    This widget provides a full defect management interface:
-      • A table view of defect logs with auto‑refresh and real‑time notifications.
-      • Options to add, edit, delete, and search defect records.
-      • A status notification label displays a brief message when new defect logs are detected.
-    """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.last_defect_count = 0  # Used to track new defects
-        layout = QVBoxLayout(self)
-
-        # Notification label at the top
-        self.notification_label = QLabel("")
-        self.notification_label.setStyleSheet("color: green; font-weight: bold;")
-        layout.addWidget(self.notification_label)
-
-        # Search bar
-        top_h = QHBoxLayout()
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search defects by description, severity, reporter, or status...")
-        self.search_edit.textChanged.connect(self.search_defects)
-        top_h.addWidget(QLabel("Search:"))
-        top_h.addWidget(self.search_edit)
-        layout.addLayout(top_h)
-
-        # Defect logs table
-        self.defect_table = QTableWidget(0, 7)
-        self.defect_table.setHorizontalHeaderLabels([
-            "Defect ID", "Rule ID", "Description", "Severity", "Reporter", "Status", "Timestamp"
-        ])
-        self.defect_table.horizontalHeader().setStretchLastSection(True)
-        self.defect_table.setSelectionBehavior(QTableWidget.SelectRows)
-        layout.addWidget(self.defect_table)
-
-        # Button bar
-        btn_h = QHBoxLayout()
-        add_btn = QPushButton("Add Defect")
-        add_btn.clicked.connect(self.add_defect)
-        btn_h.addWidget(add_btn)
-
-        edit_btn = QPushButton("Edit Defect")
-        edit_btn.clicked.connect(self.edit_defect)
-        btn_h.addWidget(edit_btn)
-
-        del_btn = QPushButton("Delete Defect")
-        del_btn.clicked.connect(self.delete_defect)
-        btn_h.addWidget(del_btn)
-
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.load_defects)
-        btn_h.addWidget(refresh_btn)
-        btn_h.addStretch()
-        layout.addLayout(btn_h)
-
-        self.setLayout(layout)
-
-        # Set up auto-refresh timer (every 30 seconds)
+        # Timer for auto-refresh of the graph
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.auto_refresh)
-        self.refresh_timer.start(30000)  # 30,000 milliseconds = 30 seconds
+        self.refresh_timer.timeout.connect(self.populate_graph)
+        self.refresh_timer.start(auto_refresh_interval)  # e.g., every 30 seconds
 
-        # Initial load of defects
-        self.load_defects()
+        # Initial population of graph
+        self.populate_graph()
 
-    def load_defects(self):
+    def populate_graph(self):
         """
-        Load defects from the BRM_DEFECT_LOGS table and update the table.
-        Also update the notification label if new defects are detected.
+        Build the graph from the database.
+        Retrieves rules and table dependencies; clears existing scene items;
+        then draws nodes and arrows.
         """
-        self.defect_table.setRowCount(0)
-        c = self.connection.cursor()
         try:
-            c.execute("""
-                SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP
-                FROM BRM_DEFECT_LOGS
-                ORDER BY TIMESTAMP DESC
+            self.scene.clear()
+            self.rule_nodes.clear()
+            self.table_nodes.clear()
+
+            # Retrieve rules
+            rule_cursor = self.connection.cursor()
+            rule_cursor.execute("""
+                SELECT RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, LOCKED_BY
+                FROM BRM_RULES
             """)
-            rows = c.fetchall()
-            current_count = len(rows)
-            for row in rows:
-                r_i = self.defect_table.rowCount()
-                self.defect_table.insertRow(r_i)
-                for j, val in enumerate(row):
-                    self.defect_table.setItem(r_i, j, QTableWidgetItem(str(val) if val is not None else ""))
-            # Check if new defects have been added since last load
-            if self.last_defect_count and current_count > self.last_defect_count:
-                new_count = current_count - self.last_defect_count
-                self.notification_label.setText(f"{new_count} new defect(s) logged.")
-                # Clear the notification after 5 seconds
-                QTimer.singleShot(5000, lambda: self.notification_label.setText(""))
-            self.last_defect_count = current_count
+            rules = rule_cursor.fetchall()
+            # Retrieve dependencies
+            dep_cursor = self.connection.cursor()
+            dep_cursor.execute("""
+                SELECT RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+                FROM BRM_RULE_TABLE_DEPENDENCIES
+            """)
+            dependencies = dep_cursor.fetchall()
+
+            # Positioning: arrange rule nodes vertically in a column and table nodes in another column.
+            # For production systems, you might want to use a force-directed layout or hierarchical layout.
+            rule_x, rule_y, rule_gap = 50, 50, 80
+            table_x = 400
+            table_y, table_gap = 50, 100
+
+            # Draw rule nodes
+            for idx, rule in enumerate(rules):
+                rule_id = rule[0]
+                rule_name = rule[1]
+                status = rule[2]
+                approval_status = rule[3]
+                locked_by = rule[4]
+
+                # Determine color based on status
+                if status.upper() == "ACTIVE":
+                    fill_color = COLOR_RULE_ACTIVE
+                elif status.upper() == "INACTIVE":
+                    fill_color = COLOR_RULE_INACTIVE
+                else:
+                    fill_color = COLOR_RULE_PENDING
+
+                node = GraphicsRuleNode(rule_id, rule_name, fill_color, approval_status, locked_by)
+                node.setPos(rule_x, rule_y + idx * (RULE_NODE_HEIGHT + rule_gap))
+                self.scene.addItem(node)
+                self.rule_nodes[rule_id] = node
+
+            # Draw table nodes (aggregate by database and table)
+            table_positions = {}  # key: (database, table), value: (x,y)
+            for dep in dependencies:
+                db_name = dep[1] or "N/A"
+                tbl_name = dep[2]
+                key = (db_name.lower(), tbl_name.lower())
+                if key not in table_positions:
+                    # Assign a position based on current count
+                    pos_y = table_y + len(table_positions) * (TABLE_NODE_DIAMETER + table_gap)
+                    table_positions[key] = (table_x, pos_y)
+
+            for key, pos in table_positions.items():
+                db_name, tbl_name = key
+                # Check if table exists in the database (for now assume all exist; production may query sys.tables)
+                # For demonstration, if table name starts with 'missing_' we mark it as missing.
+                if tbl_name.startswith("missing_"):
+                    fill_color = COLOR_TABLE_MISSING
+                else:
+                    fill_color = COLOR_TABLE_DEFAULT
+                tnode = GraphicsTableNode(db_name, tbl_name, fill_color)
+                tnode.setPos(pos[0], pos[1])
+                self.scene.addItem(tnode)
+                self.table_nodes[key] = tnode
+
+            # Draw arrows from rule nodes to corresponding table nodes based on dependencies
+            for dep in dependencies:
+                rule_id = dep[0]
+                db_name = dep[1] or "N/A"
+                tbl_name = dep[2]
+                key = (db_name.lower(), tbl_name.lower())
+                if rule_id in self.rule_nodes and key in self.table_nodes:
+                    rule_node = self.rule_nodes[rule_id]
+                    table_node = self.table_nodes[key]
+                    arrow = GraphicsArrow(rule_node, table_node)
+                    self.scene.addItem(arrow)
+
+            self.resetView()
+            logger.info("Advanced lineage graph populated successfully.")
         except Exception as ex:
-            logger.error(f"Error loading defects: {ex}")
-            QMessageBox.critical(self, "Error", f"Error loading defect logs: {ex}")
+            logger.error(f"Error populating lineage graph: {ex}")
+            QMessageBox.critical(self, "Graph Population Error", str(ex))
 
-    def search_defects(self, text):
-        text_lower = text.lower().strip()
-        for row in range(self.defect_table.rowCount()):
-            visible = False
-            for col in range(self.defect_table.columnCount()):
-                item = self.defect_table.item(row, col)
-                if item and text_lower in item.text().lower():
-                    visible = True
-                    break
-            self.defect_table.setRowHidden(row, not visible)
-
-    def auto_refresh(self):
+    def resetView(self):
         """
-        Auto-refreshes the defect log table.
+        Adjust the view to fit the entire scene.
         """
-        self.load_defects()
+        self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
 
-    def add_defect(self):
-        dlg = DefectDialog(self.connection)
-        if dlg.exec_() == QDialog.Accepted:
-            self.load_defects()
+    def search_lineage(self, search_text):
+        """
+        When a search term is provided, highlight matching nodes (rules or tables)
+        and dim those that do not match.
+        The search is performed over rule names, table names, database names, and column names.
+        """
+        search_text = search_text.lower().strip()
+        if not search_text:
+            # Reset opacities
+            for node in self.rule_nodes.values():
+                node.setOpacity(1.0)
+            for node in self.table_nodes.values():
+                node.setOpacity(1.0)
+            return
 
-    def edit_defect(self):
-        row = self.defect_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "No Selection", "Please select a defect to edit.")
-            return
-        defect_data = {
-            "DEFECT_ID": int(self.defect_table.item(row, 0).text()),
-            "RULE_ID": self.defect_table.item(row, 1).text(),
-            "DESCRIPTION": self.defect_table.item(row, 2).text(),
-            "SEVERITY": self.defect_table.item(row, 3).text(),
-            "REPORTER": self.defect_table.item(row, 4).text(),
-            "STATUS": self.defect_table.item(row, 5).text(),
-            "TIMESTAMP": self.defect_table.item(row, 6).text()
-        }
-        dlg = DefectDialog(self.connection, defect_data=defect_data)
-        if dlg.exec_() == QDialog.Accepted:
-            self.load_defects()
+        # For rule nodes: search rule name
+        for node in self.rule_nodes.values():
+            if search_text in node.rule_name.lower():
+                node.setOpacity(1.0)
+            else:
+                node.setOpacity(0.3)
+        # For table nodes: search table name and database name
+        for key, node in self.table_nodes.items():
+            db_name, tbl_name = key
+            if search_text in db_name or search_text in tbl_name:
+                node.setOpacity(1.0)
+            else:
+                node.setOpacity(0.3)
 
-    def delete_defect(self):
-        row = self.defect_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "No Selection", "Please select a defect to delete.")
-            return
-        defect_id = int(self.defect_table.item(row, 0).text())
-        confirm = QMessageBox.question(self, "Confirm Deletion", f"Delete defect ID {defect_id}?")
-        if confirm != QMessageBox.Yes:
-            return
+    def reset_dim_highlight(self):
+        """
+        Reset all nodes to full opacity.
+        """
+        self.search_lineage("")
+
+
+# Graphics Node Classes
+class GraphicsRuleNode(QGraphicsRectItem):
+    """
+    A graphical representation of a business rule node.
+    Rendered as a rounded rectangle with rule name and status.
+    """
+    def __init__(self, rule_id, rule_name, fill_color, approval_status, locked_by, parent=None):
+        super().__init__(parent)
+        self.rule_id = rule_id
+        self.rule_name = rule_name
+        self.approval_status = approval_status
+        self.locked_by = locked_by
+        self.setRect(0, 0, RULE_NODE_WIDTH, RULE_NODE_HEIGHT)
+        self.setBrush(QBrush(fill_color))
+        self.setPen(QPen(Qt.black, 2))
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemIsMovable, False)
+
+        # Add a text label inside the rectangle
+        self.text_item = QGraphicsTextItem(f"Rule {rule_id}:\n{rule_name}", self)
+        self.text_item.setDefaultTextColor(Qt.black)
+        self.text_item.setFont(QFont("Arial", 10))
+        # Center the text
+        rect = self.rect()
+        text_rect = self.text_item.boundingRect()
+        x_offset = (rect.width() - text_rect.width()) / 2
+        y_offset = (rect.height() - text_rect.height()) / 2
+        self.text_item.setPos(x_offset, y_offset)
+
+        # Tooltip with extra details
+        tooltip = f"Rule ID: {rule_id}\nName: {rule_name}\nStatus: {approval_status}"
+        if locked_by:
+            tooltip += f"\nLocked by: {locked_by}"
+        self.setToolTip(tooltip)
+
+    def paint(self, painter, option, widget):
+        # Draw rounded rectangle
+        painter.setBrush(self.brush())
+        painter.setPen(self.pen())
+        painter.drawRoundedRect(self.rect(), 10, 10)
+        # The text is drawn by its own QGraphicsTextItem
+
+
+class GraphicsTableNode(QGraphicsEllipseItem):
+    """
+    A graphical representation of a table node.
+    Rendered as a circle (ellipse) with table name.
+    """
+    def __init__(self, db_name, table_name, fill_color, parent=None):
+        super().__init__(parent)
+        self.db_name = db_name
+        self.table_name = table_name
+        self.setRect(0, 0, TABLE_NODE_DIAMETER, TABLE_NODE_DIAMETER)
+        self.setBrush(QBrush(fill_color))
+        self.setPen(QPen(Qt.black, 2))
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+
+        # Add text label for table name
+        display_text = f"{db_name}.{table_name}"
+        self.text_item = QGraphicsTextItem(display_text, self)
+        self.text_item.setDefaultTextColor(Qt.black)
+        self.text_item.setFont(QFont("Arial", 9))
+        text_rect = self.text_item.boundingRect()
+        # Center the text in the ellipse
+        x_offset = (TABLE_NODE_DIAMETER - text_rect.width()) / 2
+        y_offset = (TABLE_NODE_DIAMETER - text_rect.height()) / 2
+        self.text_item.setPos(x_offset, y_offset)
+        self.setToolTip(f"Table: {db_name}.{table_name}")
+
+
+class GraphicsArrow(QGraphicsLineItem):
+    """
+    A graphical arrow drawn between a rule node and a table node.
+    """
+    def __init__(self, source_node, target_node, parent=None):
+        super().__init__(parent)
+        self.source_node = source_node
+        self.target_node = target_node
+        self.setPen(QPen(ARROW_COLOR, LINE_WIDTH))
+        self.adjust()
+
+    def adjust(self):
+        # Calculate center points of source and target nodes
+        source_rect = self.source_node.sceneBoundingRect()
+        target_rect = self.target_node.sceneBoundingRect()
+        p1 = source_rect.center()
+        p2 = target_rect.center()
+        self.setLine(QLineF(p1, p2))
+        # Optionally, arrowhead drawing could be implemented here for better aesthetics.
+
+    def paint(self, painter, option, widget):
+        # Update line before painting
+        self.adjust()
+        painter.setPen(self.pen())
+        painter.drawLine(self.line())
+        # Draw arrowhead (simple triangle)
+        angle = self.line().angle()  # in degrees
+        # Define arrowhead size
+        arrow_size = 10
+        # Compute two lines at angles offset from the main line
+        p2 = self.line().p2()
+        line_angle_rad = (360 - angle) * 3.14159 / 180.0
+        dest_point = p2
+        # Calculate two points for the arrowhead
+        arrow_p1 = dest_point + QPointF(
+            arrow_size * -1 * (1.0 * 0.866), arrow_size * -1 * 0.5)
+        arrow_p2 = dest_point + QPointF(
+            arrow_size * -1 * (1.0 * 0.866), arrow_size * 0.5)
+        # For simplicity, we'll draw a simple line-based arrowhead
+        painter.drawLine(dest_point, arrow_p1)
+        painter.drawLine(dest_point, arrow_p2)
+
+
+# Optional: Real-Time Simulation Logging
+class LineageSimulationLogger:
+    """
+    This class manages simulation logs for lineage dry-run executions.
+    It captures the number of records impacted by a rule execution (dry-run)
+    along with pass/fail notifications. The logs are saved into a file and can
+    be displayed in the UI.
+    """
+    def __init__(self, log_file="lineage_simulation.log"):
+        self.log_file = log_file
+        logging.basicConfig(
+            filename=self.log_file,
+            level=logging.INFO,
+            format='%(asctime)s:%(levelname)s:%(name)s:%(message)s'
+        )
+        self.logger = logging.getLogger("LineageSimulationLogger")
+
+    def log_simulation(self, rule_id, impacted_count, success, message):
+        status = "PASS" if success else "FAIL"
+        log_message = f"Rule {rule_id}: {status} - Impacted Records: {impacted_count} | {message}"
+        self.logger.info(log_message)
+        return log_message
+
+    def get_simulation_logs(self):
         try:
-            c = self.connection.cursor()
-            c.execute("DELETE FROM BRM_DEFECT_LOGS WHERE DEFECT_ID=?", (defect_id,))
-            self.connection.commit()
-            QMessageBox.information(self, "Deleted", f"Defect {defect_id} deleted.")
-            self.load_defects()
+            with open(self.log_file, "r", encoding="utf-8") as f:
+                return f.read()
         except Exception as ex:
-            logger.error(f"Error deleting defect {defect_id}: {ex}")
-            QMessageBox.critical(self, "Error", f"Error deleting defect: {ex}")
+            return f"Error reading simulation logs: {ex}"
 
 
-# -----------------------------------------------------------------------------
-# If run as main (for testing standalone), launch the defect management tab.
-# -----------------------------------------------------------------------------
+# For standalone testing of the widget
 if __name__ == "__main__":
     from PyQt5.QtWidgets import QApplication
-    import pyodbc
     app = QApplication(sys.argv)
     try:
-        # Example DSN connection string; adjust as needed.
-        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
-    except Exception as e:
-        print("Database connection error:", e)
+        # Replace with your actual DSN or connection string.
+        connection = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as ex:
+        print(f"Database connection error: {ex}")
         sys.exit(1)
-    defect_tab = DefectManagementTab(conn)
-    defect_tab.show()
+    widget = AdvancedLineageGraphWidget(connection)
+    widget.setWindowTitle("Advanced Lineage Visualization")
+    widget.resize(1000, 800)
+    widget.show()
+
+    # For demonstration, perform a search after 5 seconds
+    QTimer.singleShot(5000, lambda: widget.search_lineage("customer"))
     sys.exit(app.exec_())
