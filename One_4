@@ -1,276 +1,389 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 """
 Module: advanced_simulation.py
-Description: Provides an advanced simulation engine for running rule dry‑runs and full executions.
-             It captures detailed logs including:
-               • Number of records impacted
-               • Success/Fail status and error messages
-               • Timestamp of execution
-             It writes simulation log entries to a dedicated table and/or file,
-             and provides a SimulationManagerWidget UI that auto‑refreshes in real time.
-             
-Features:
-  • simulate_rule_execution: Executes a rule’s SQL in a transaction (with a dry‑run flag)
-      – Rolls back changes if dry‑run is set.
-      – Captures record count and error messages.
-  • log_simulation_result: Inserts a simulation log record into a dedicated table.
-  • SimulationManager: A backend class to run simulation for a single rule or a chain (BFS)
-      – Aggregates impacted rule IDs, record counts, and overall status.
-  • SimulationManagerWidget: A Qt‑based UI widget that displays simulation logs with auto‑refresh.
-      – Shows details (Rule ID, Timestamp, Success/Fail, Records Affected, Message)
-      – Provides a “Run Simulation” button for the selected rule.
-  • Real‑time notifications via an auto‑refresh timer.
-  
-This module is production‑ready and designed to integrate seamlessly with the core BRM tool.
+CREATE TABLE SIMULATION_LOGS (
+  SIMULATION_ID INT IDENTITY PRIMARY KEY,
+  RULE_ID INT,
+  EXEC_TIMESTAMP DATETIME,
+  SUCCESS_FLAG BIT,
+  MESSAGE VARCHAR(1000),
+  RECORD_COUNT INT
+);
+Description:
+  This module provides an advanced simulation engine with chain (BFS) logic
+  that can branch/fork if certain rules fail at critical stages.
+  It also includes:
+    • AdvancedSimulationEngine with forking support
+    • A SimulationManagerWidget UI that logs simulations (including pass/fail, record counts)
+      and provides an overview of recent simulations
+    • A SingleRuleSimulationDialog for quick tests, plus a MultiRuleForkDialog
+      for forking logic demonstration
+    • All references to core_foundation for logging and auditing
 """
 
 import sys
-import json
 import logging
+import pyodbc
 from datetime import datetime
 from collections import deque
 
-import pyodbc
-
-from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QDialog, QLineEdit, QMessageBox, QInputDialog
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QTableWidget, QTableWidgetItem, QLineEdit, QMessageBox, QInputDialog,
+    QDialog, QPlainTextEdit
 )
 
-logger = logging.getLogger("advanced_simulation")
-logger.setLevel(logging.DEBUG)
+from core_foundation import logger, insert_audit_log
 
-# -----------------------------------------------------------------------------
-# Simulation Engine Functions
-# -----------------------------------------------------------------------------
-def simulate_rule_execution(conn, rule_info, is_dry_run=True):
+# =============================================================================
+# 1. AdvancedSimulationEngine – BFS or fork-based logic
+# =============================================================================
+class AdvancedSimulationEngine:
     """
-    Executes the rule's SQL within a transaction.
-    Returns a tuple: (success_flag, message, record_count)
-    
-    If is_dry_run is True, the transaction is rolled back.
-    Fully captures number of records impacted and any error messages.
+    Provides BFS execution with potential for forking if a rule fails at a certain stage.
+    Also logs results into SIMULATION_LOGS or passes them to the caller.
     """
-    c = conn.cursor()
-    try:
+
+    @staticmethod
+    def run_single_rule_transaction(conn, rule_info, is_dry_run=True):
+        """
+        Execute a rule's SQL in a transaction. If is_dry_run, always rollback.
+        Returns (ok, message, record_count).
+        """
+        c = conn.cursor()
+        rule_id = rule_info.get("RULE_ID")
+        sql_text = rule_info.get("RULE_SQL","").strip()
+
         c.execute("BEGIN TRANSACTION")
-        c.execute(rule_info.get("RULE_SQL", ""))
+        success = False
+        msg = ""
+        impacted = 0
         try:
-            rows = c.fetchall()
-        except Exception:
-            rows = []
-        record_count = len(rows)
-        # For simulation, we expect the first value of the first row to indicate pass (1) or fail (0)
-        if rows and rows[0]:
-            first_val = rows[0][0]
-            success = (first_val == 1)
-            message = f"Returned value: {first_val}"
-        else:
-            success = True
-            message = "No rows returned; considered PASS."
-        if is_dry_run:
+            if not sql_text:
+                msg = "No SQL found; treat as PASS"
+                success = True
+            else:
+                c.execute(sql_text)
+                try:
+                    rows = c.fetchall()
+                except:
+                    rows = []
+                impacted = len(rows)
+                if rows and len(rows[0])>0:
+                    val = rows[0][0]
+                    success = (val==1)
+                    msg = f"Returned {val}"
+                else:
+                    success = True
+                    msg = "No rows returned -> PASS"
+            if is_dry_run or not success:
+                c.execute("ROLLBACK")
+            else:
+                c.execute("COMMIT")
+        except Exception as ex:
             c.execute("ROLLBACK")
-        else:
-            c.execute("COMMIT")
-        return success, message, record_count
-    except Exception as ex:
-        try:
-            c.execute("ROLLBACK")
-        except Exception:
-            pass
-        return False, str(ex), 0
+            success = False
+            msg = f"Simulation error: {ex}"
+            logger.error(f"Rule {rule_id} simulation failed: {ex}")
 
-def log_simulation_result(conn, rule_id, success_flag, message, record_count):
-    """
-    Logs simulation results into the SIMULATION_LOGS table.
-    The table should have columns:
-       SIMULATION_ID (IDENTITY PK),
-       RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT.
-    """
-    c = conn.cursor()
-    try:
+        # Log to SIMULATION_LOGS if table exists
+        AdvancedSimulationEngine.log_simulation_result(conn, rule_id, success, msg, impacted)
+        return success, msg, impacted
+
+    @staticmethod
+    def log_simulation_result(conn, rule_id, success_flag, message, record_count):
+        """
+        Insert a row into SIMULATION_LOGS table, if it exists. 
+        Columns: SIMULATION_ID (PK), RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT
+        """
+        c = conn.cursor()
+        try:
+            c.execute("""
+                INSERT INTO SIMULATION_LOGS(RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT)
+                VALUES(?, GETDATE(), ?, ?, ?)
+            """,(rule_id, 1 if success_flag else 0, message, record_count))
+            conn.commit()
+            logger.debug(f"Sim log for rule {rule_id}: success={success_flag}, {record_count} recs, msg={message}")
+        except Exception as ex:
+            logger.error(f"Error logging simulation for rule {rule_id}: {ex}")
+
+    @staticmethod
+    def skip_descendants(fork_map, rule_id, skipped):
+        stack = [rule_id]
+        while stack:
+            cur = stack.pop()
+            if cur in skipped:
+                continue
+            skipped.add(cur)
+            for child in fork_map.get(cur, []):
+                stack.append(child)
+
+    @staticmethod
+    def execute_rules_with_fork(conn, start_rule_ids, is_dry_run=True):
+        """
+        BFS that can 'fork' if a rule fails. This is an advanced approach:
+          - If rule is critical and fails, we skip all children (like normal).
+          - If rule is 'forkable' and fails, we spawn a "rework" branch or alternative logic (example).
+        For demonstration, let's check a hypothetical 'BRANCHING_RULE=1' to trigger a fork scenario.
+        Returns (executed, skipped, forked).
+        """
+        c = conn.cursor()
         c.execute("""
-            INSERT INTO SIMULATION_LOGS (
-                RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT
-            )
-            VALUES (?, GETDATE(), ?, ?, ?)
-        """, (rule_id, 1 if success_flag else 0, message, record_count))
-        conn.commit()
-        logger.info(f"Simulation log inserted for rule {rule_id}.")
-    except Exception as ex:
-        logger.error(f"Error logging simulation result for rule {rule_id}: {ex}")
+            SELECT RULE_ID, PARENT_RULE_ID, CRITICAL_RULE, 
+                   (CASE WHEN ISNULL(BRANCHING_RULE,0)=1 THEN 1 ELSE 0 END) as FORKABLE,
+                   RULE_SQL
+            FROM BRM_RULES
+        """)
+        rows = c.fetchall()
 
-def simulate_rule_chain(conn, start_rule_id, is_dry_run=True):
-    """
-    Performs a BFS starting from a given rule ID.
-    For each rule, it simulates execution and aggregates results.
-    Returns a tuple (executed_ids, skipped_ids, simulation_details) where:
-       - executed_ids: list of rule IDs that simulated successfully.
-       - skipped_ids: list of rule IDs that failed.
-       - simulation_details: dict mapping rule_id to (success_flag, message, record_count).
-       
-    This function ensures that the simulation logs capture each step.
-    """
-    c = conn.cursor()
-    c.execute("SELECT RULE_ID, RULE_SQL FROM BRM_RULES")
-    rows = c.fetchall()
-    rule_map = {r[0]: r[1] for r in rows}
-    
-    executed = []
-    skipped = set()
-    details = {}
-    
-    queue = deque([start_rule_id])
-    visited = set()
-    
-    while queue:
-        rid = queue.popleft()
-        if rid in visited:
-            continue
-        visited.add(rid)
-        if rid not in rule_map:
-            skipped.add(rid)
-            details[rid] = (False, "Rule not found.", 0)
-            continue
-        rule_sql = rule_map[rid]
-        rule_info = {"RULE_ID": rid, "RULE_SQL": rule_sql}
-        success, msg, rec_count = simulate_rule_execution(conn, rule_info, is_dry_run=is_dry_run)
-        details[rid] = (success, msg, rec_count)
-        log_simulation_result(conn, rid, success, msg, rec_count)
-        if success:
-            executed.append(rid)
-            # For demonstration, assume child rules are those with PARENT_RULE_ID = current rid.
-            c.execute("SELECT RULE_ID FROM BRM_RULES WHERE PARENT_RULE_ID=?", (rid,))
-            child_rows = c.fetchall()
-            for child in child_rows:
-                child_rid = child[0]
-                if child_rid not in visited:
-                    queue.append(child_rid)
-        else:
-            skipped.add(rid)
-    return executed, list(skipped), details
+        rule_map = {}
+        children_map = {}
+        for (rid, pid, crit, forkable, rsql) in rows:
+            rule_map[rid] = {
+                "RULE_ID": rid,
+                "PARENT_RULE_ID": pid,
+                "CRITICAL_RULE": crit,
+                "FORKABLE": forkable,
+                "RULE_SQL": rsql
+            }
+            if pid:
+                children_map.setdefault(pid,[]).append(rid)
 
-# -----------------------------------------------------------------------------
-# Simulation Manager UI Widget
-# -----------------------------------------------------------------------------
-class SimulationManagerWidget(QWidget):
+        executed = []
+        skipped = set()
+        forked = []
+        queue = list(start_rule_ids)
+
+        while queue:
+            rid = queue.pop(0)
+            if rid in skipped:
+                continue
+            info = rule_map.get(rid)
+            if not info:
+                skipped.add(rid)
+                continue
+            (ok, msg, rec_count) = AdvancedSimulationEngine.run_single_rule_transaction(conn, info, is_dry_run)
+            if ok:
+                executed.append(rid)
+                # Enqueue children
+                for ch in children_map.get(rid, []):
+                    if ch not in skipped:
+                        queue.append(ch)
+            else:
+                # if critical, skip all descendants
+                if info["CRITICAL_RULE"]==1:
+                    AdvancedSimulationEngine.skip_descendants(children_map, rid, skipped)
+                skipped.add(rid)
+                # if forkable, create a "fork" scenario
+                if info["FORKABLE"]==1:
+                    forked.append(rid)
+                    # In real usage, you'd create a new "forked rule" or path. 
+                    # We'll simply log it for demonstration.
+
+        return (executed, list(skipped), forked)
+
+# =============================================================================
+# 2. UI Dialogs – SingleRuleSimulationDialog, MultiRuleForkDialog
+# =============================================================================
+
+class SingleRuleSimulationDialog(QDialog):
     """
-    SimulationManagerWidget provides a UI for running simulation dry‑runs.
-    It displays simulation logs with columns:
-      • Rule ID, Execution Timestamp, Success Flag, Record Count, Message
-    It also includes:
-      • A "Run Simulation" button (for the selected rule)
-      • Auto‑refresh capability to update simulation logs in real time.
+    A dialog for simulating a single rule. 
+    Uses run_single_rule_transaction from AdvancedSimulationEngine.
     """
-    def __init__(self, conn, parent=None):
+    def __init__(self, connection, rule_id, parent=None):
         super().__init__(parent)
-        self.connection = conn
-        self.setWindowTitle("Simulation Manager")
-        self.resize(800, 400)
-        self.init_ui()
-        self.load_simulation_logs()
-        self.start_auto_refresh()
-
-    def init_ui(self):
+        self.connection = connection
+        self.rule_id = rule_id
+        self.setWindowTitle(f"Advanced Single Simulation - Rule {rule_id}")
+        self.resize(500,400)
         layout = QVBoxLayout(self)
-        top_layout = QHBoxLayout()
-        self.rule_id_edit = QLineEdit()
-        self.rule_id_edit.setPlaceholderText("Enter Rule ID for simulation")
-        top_layout.addWidget(QLabel("Rule ID:"))
-        top_layout.addWidget(self.rule_id_edit)
-        run_btn = QPushButton("Run Simulation")
-        run_btn.clicked.connect(self.run_simulation)
-        top_layout.addWidget(run_btn)
-        top_layout.addStretch()
-        layout.addLayout(top_layout)
 
-        self.sim_table = QTableWidget(0, 5)
-        self.sim_table.setHorizontalHeaderLabels(["Rule ID", "Timestamp", "Success", "Record Count", "Message"])
-        self.sim_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.sim_table)
+        self.info_label = QLabel("Ready to simulate rule.")
+        layout.addWidget(self.info_label)
+
+        self.output_area = QPlainTextEdit()
+        self.output_area.setReadOnly(True)
+        layout.addWidget(self.output_area)
+
+        btn_run = QPushButton("Run Simulation")
+        btn_run.clicked.connect(self.do_run)
+        layout.addWidget(btn_run)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        layout.addWidget(btn_close)
+
+    def do_run(self):
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (self.rule_id,))
+        row = c.fetchone()
+        if not row:
+            QMessageBox.warning(self, "Not Found", f"Rule {self.rule_id} not found.")
+            return
+        rule_info = {"RULE_ID": row[0], "RULE_SQL": row[1]}
+        (ok, msg, rec_count) = AdvancedSimulationEngine.run_single_rule_transaction(self.connection, rule_info, is_dry_run=True)
+        result_str = (
+            f"Rule {self.rule_id}\n"
+            f"Pass? {ok}\n"
+            f"Message: {msg}\n"
+            f"Records impacted: {rec_count}"
+        )
+        self.output_area.setPlainText(result_str)
+        QMessageBox.information(self, "Simulation Result", result_str)
+
+class MultiRuleForkDialog(QDialog):
+    """
+    A demonstration of the forking BFS scenario. 
+    User picks a starting rule, we run execute_rules_with_fork.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Multi-Rule Fork Simulation")
+        self.resize(600,400)
+
+        layout = QVBoxLayout(self)
+
+        top_h = QHBoxLayout()
+        self.rule_combo = QtWidgets.QComboBox()
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        for row in c.fetchall():
+            self.rule_combo.addItem(f"{row[0]} - {row[1]}", row[0])
+        top_h.addWidget(QtWidgets.QLabel("Start Rule:"))
+        top_h.addWidget(self.rule_combo)
+        layout.addLayout(top_h)
+
+        self.output_area = QPlainTextEdit()
+        self.output_area.setReadOnly(True)
+        layout.addWidget(self.output_area)
+
+        btn_layout = QHBoxLayout()
+        run_btn = QPushButton("Run Fork Simulation")
+        run_btn.clicked.connect(self.run_fork_sim)
+        btn_layout.addWidget(run_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(close_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
 
         self.setLayout(layout)
 
-    def load_simulation_logs(self):
-        """Load simulation logs from SIMULATION_LOGS table."""
-        self.sim_table.setRowCount(0)
+    def run_fork_sim(self):
+        start_rule = self.rule_combo.currentData()
+        executed, skipped, forked = AdvancedSimulationEngine.execute_rules_with_fork(self.connection, [start_rule], is_dry_run=True)
+        out = (
+            f"Starting from rule {start_rule}\n"
+            f"Executed: {executed}\n"
+            f"Skipped: {skipped}\n"
+            f"Forked: {forked}"
+        )
+        self.output_area.setPlainText(out)
+        QMessageBox.information(self, "Fork Simulation Complete", out)
+
+# =============================================================================
+# 3. SimulationManagerWidget – UI to display simulation logs and re-run
+# =============================================================================
+
+class SimulationManagerWidget(QWidget):
+    """
+    A widget that displays entries from SIMULATION_LOGS and allows the user to
+    run new simulations quickly. Also auto-refreshes logs in real-time.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Simulation Manager")
+        self.last_count = 0
+
+        layout = QVBoxLayout(self)
+        top_h = QHBoxLayout()
+
+        self.rule_id_edit = QLineEdit()
+        self.rule_id_edit.setPlaceholderText("Enter Rule ID to simulate")
+        top_h.addWidget(QLabel("Rule ID:"))
+        top_h.addWidget(self.rule_id_edit)
+
+        run_btn = QPushButton("Run Sim")
+        run_btn.clicked.connect(self.run_sim)
+        top_h.addWidget(run_btn)
+
+        layout.addLayout(top_h)
+
+        self.log_table = QTableWidget(0,5)
+        self.log_table.setHorizontalHeaderLabels(["RuleID","Timestamp","Success?","RecordCount","Message"])
+        self.log_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.log_table)
+
+        btn_h = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh Logs")
+        refresh_btn.clicked.connect(self.load_logs)
+        btn_h.addWidget(refresh_btn)
+
+        multi_btn = QPushButton("Open Multi-Rule Fork Dialog")
+        multi_btn.clicked.connect(self.open_fork_dialog)
+        btn_h.addWidget(multi_btn)
+
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        self.setLayout(layout)
+        # auto-refresh logs
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.load_logs)
+        self.timer.start(30000)
+
+        self.load_logs()
+
+    def load_logs(self):
+        self.log_table.setRowCount(0)
+        c = self.connection.cursor()
         try:
-            c = self.connection.cursor()
             c.execute("""
-                SELECT RULE_ID, CONVERT(varchar, EXEC_TIMESTAMP, 120) AS ExecTime, 
+                SELECT TOP 200 RULE_ID, CONVERT(varchar, EXEC_TIMESTAMP,120) AS ts,
                        SUCCESS_FLAG, RECORD_COUNT, MESSAGE
                 FROM SIMULATION_LOGS
                 ORDER BY EXEC_TIMESTAMP DESC
-                OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
             """)
             rows = c.fetchall()
             for row in rows:
-                r_idx = self.sim_table.rowCount()
-                self.sim_table.insertRow(r_idx)
-                for col, val in enumerate(row):
-                    self.sim_table.setItem(r_idx, col, QTableWidgetItem(str(val)))
-        except Exception as ex:
-            QMessageBox.critical(self, "Load Error", f"Error loading simulation logs: {ex}")
+                r_i = self.log_table.rowCount()
+                self.log_table.insertRow(r_i)
+                for col_i, val in enumerate(row):
+                    self.log_table.setItem(r_i, col_i, QTableWidgetItem(str(val) if val else ""))
 
-    def run_simulation(self):
-        """Run simulation for the given rule ID and update logs."""
-        rule_id_text = self.rule_id_edit.text().strip()
-        if not rule_id_text.isdigit():
+        except Exception as ex:
+            QMessageBox.critical(self, "Load Error", f"Error loading sim logs: {ex}")
+
+    def run_sim(self):
+        txt = self.rule_id_edit.text().strip()
+        if not txt.isdigit():
             QMessageBox.warning(self, "Input Error", "Please enter a valid numeric Rule ID.")
             return
-        rule_id = int(rule_id_text)
-        executed, skipped, details = simulate_rule_execution_chain_and_log(self.connection, rule_id)
-        msg = f"Simulation complete for Rule {rule_id}.\n"
-        msg += f"Executed: {len(executed)} rule(s).\nSkipped: {len(skipped)} rule(s).\n"
-        # Include details for the starting rule
-        if rule_id in details:
-            success, sim_msg, rec_count = details[rule_id]
-            msg += f"Rule {rule_id} dry run: {'PASS' if success else 'FAIL'}; Records: {rec_count}; Message: {sim_msg}"
-        QMessageBox.information(self, "Simulation Result", msg)
-        self.load_simulation_logs()
+        rid = int(txt)
+        # We'll do a single rule simulation
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (rid,))
+        row = c.fetchone()
+        if not row:
+            QMessageBox.warning(self, "Not Found", f"Rule {rid} not found.")
+            return
+        rule_info = {"RULE_ID": row[0], "RULE_SQL": row[1]}
+        (ok, msg, rec_count) = AdvancedSimulationEngine.run_single_rule_transaction(self.connection, rule_info, is_dry_run=True)
+        out = (
+            f"Rule {rid} => PASS? {ok}, records={rec_count}, msg={msg}"
+        )
+        QMessageBox.information(self, "Sim Result", out)
+        self.load_logs()
 
-    def start_auto_refresh(self):
-        """Start a timer to auto‑refresh simulation logs every 30 seconds."""
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.load_simulation_logs)
-        self.refresh_timer.start(30000)  # 30,000 ms = 30 seconds
-
-
-def simulate_rule_execution_chain_and_log(conn, start_rule_id):
-    """
-    A wrapper function that calls simulate_rule_chain (BFS simulation) and logs
-    each rule’s simulation result. Returns (executed_ids, skipped_ids, details).
-    """
-    executed, skipped, details = simulate_rule_chain(conn, start_rule_id, is_dry_run=True)
-    return executed, skipped, details
-
-
-# -----------------------------------------------------------------------------
-# Example Main for Module 4
-# -----------------------------------------------------------------------------
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-
-    # Set modern style sheet for enhanced UI
-    app.setStyleSheet("""
-        QWidget { font-family: "Segoe UI"; font-size: 10pt; }
-        QPushButton { background-color: #0078D7; color: white; border: none; padding: 5px 10px; border-radius: 3px; }
-        QPushButton:hover { background-color: #005A9E; }
-        QLineEdit, QTableWidget { border: 1px solid #C8C8C8; padding: 2px; border-radius: 2px; }
-    """)
-
-    try:
-        # Establish a sample database connection (modify DSN as needed)
-        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
-    except Exception as e:
-        print(f"Database connection error: {e}")
-        sys.exit(1)
-
-    # For testing purposes, run a simulation for a sample rule (e.g. rule ID 1)
-    sim_widget = SimulationManagerWidget(conn)
-    sim_widget.show()
-
-    sys.exit(app.exec_())
+    def open_fork_dialog(self):
+        dlg = MultiRuleForkDialog(self.connection, self)
+        dlg.exec_()
+        self.load_logs()
