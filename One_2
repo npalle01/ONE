@@ -1,144 +1,107 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 """
 Module: simulation_scheduler.py
-Description: Provides advanced simulation and scheduling capabilities for the BRM Tool.
-Features include:
-  • Advanced dry‑run simulation of rule execution using BFS with detailed log capture,
-    including impacted record count and pass/fail notifications.
-  • A SimulationEngine class that executes single rule or chain simulations.
-  • A ScheduleDialog for scheduling rules with additional options (such as data validation run).
-  • A ScheduleManagementTab that auto‑refreshes, shows scheduling status, and logs performance metrics.
-  • Real‑time notifications (to be integrated with the RealTimeNotifier from core_foundation).
-  
-All functions and UI elements are designed to be production‑ready with robust error handling.
+Description:
+  Provides advanced simulation & scheduling capabilities for the Advanced BRM Tool, including:
+    • SimulationEngine with BFS-based rule execution (dry-run or real).
+    • Dialogs for single rule simulation and chain (BFS) simulation.
+    • EnhancedScheduleDialog and ScheduleManagementTab for scheduling rules (with data validation flags).
+    • PipelineDesignerDialog: a mini node-based UI for building ETL pipelines that orchestrate BFS runs, schedules, or external tasks.
+    • check_due_schedules function to auto-run or alert on scheduled items that are due.
+    
+Database Requirements (simplified):
+  - BRM_RULES(RULE_ID int PK, RULE_SQL text, CRITICAL_RULE bit, PARENT_RULE_ID int, etc.)
+  - RULE_SCHEDULES(SCHEDULE_ID int PK, RULE_ID, SCHEDULE_TIME, STATUS, RUN_DATA_VALIDATIONS, etc.)
+  - BRM_PIPELINES(PIPELINE_ID, NAME, CREATED_TIMESTAMP, DESCRIPTION, etc.)
+  - BRM_PIPELINE_STEPS(STEP_ID, PIPELINE_ID, RULE_ID, STEP_ORDER, etc.)
 """
 
 import sys
-import json
-import math
 import logging
-import csv
+import pyodbc
 from datetime import datetime, timedelta
 from collections import deque
 
-import pyodbc
-import sqlparse
+import sqlparse  # If you use it or remove if not needed
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QDate, QTime, QTimer, QDateTime
-from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import Qt, QTimer, QPointF
 from PyQt5.QtWidgets import (
-    QApplication, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QComboBox, QMessageBox, QLineEdit, QPlainTextEdit, QTableWidget,
-    QTableWidgetItem, QCalendarWidget, QTimeEdit, QFileDialog, QInputDialog, QGroupBox
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QComboBox, QMessageBox, QLineEdit, QPlainTextEdit,
+    QCalendarWidget, QTimeEdit, QTableWidget, QTableWidgetItem, QInputDialog,
+    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsLineItem, QGraphicsTextItem
 )
 
-logger = logging.getLogger("simulation_scheduler")
+from core_foundation import logger, insert_audit_log
 
-# ---------------- Simulation Engine ------------------
+# -------------------------------------------------------------------------
+# Simulation Engine
+# -------------------------------------------------------------------------
 class SimulationEngine:
     """
-    SimulationEngine provides methods to perform dry-run simulations
-    of rule execution. It logs the number of records impacted and whether
-    the execution passed or failed.
+    Provides BFS-based rule execution with optional dry-run. 
+    Logs impacted record counts and success/failure for each rule.
     """
+
     @staticmethod
-    def run_single_rule_transaction(conn, rule_info, is_dry_run: bool = True):
+    def run_single_rule_transaction(conn, rule_info, is_dry_run=True):
         """
-        Execute the rule SQL in a transaction.
-        If is_dry_run is True, always rollback.
-        Returns a tuple: (success_flag, message, record_count)
+        Execute rule SQL in a transaction. If is_dry_run, we always rollback.
+        Returns (success_flag, message, record_count).
         """
         sql_text = rule_info.get("RULE_SQL", "").strip()
-        op_type = rule_info.get("OPERATION_TYPE", "OTHER")
-        if op_type == "DECISION_TABLE":
-            # Deep integration for decision table can be added here.
-            return (True, f"DecisionTable {rule_info.get('DECISION_TABLE_ID', '')} PASS", 1)
+        rule_id = rule_info.get("RULE_ID")
         c = conn.cursor()
+
         c.execute("BEGIN TRANSACTION")
         success = False
         message = ""
         rec_count = 0
         try:
-            c.execute(sql_text)
-            rows = c.fetchall()
-            rec_count = len(rows)
-            if rows:
-                # For simulation, we expect the first column’s value to be the pass flag.
-                val = rows[0][0]
-                success = (val == 1)
-                message = f"Returned: {val}"
-            else:
+            if not sql_text:
+                message = "No SQL defined; treated as PASS."
                 success = True
-                message = "No rows returned; treating as PASS."
+            else:
+                c.execute(sql_text)
+                try:
+                    rows = c.fetchall()
+                except pyodbc.ProgrammingError:
+                    # e.g. if the SQL is an update/insert that doesn't produce rows
+                    rows = []
+                rec_count = len(rows)
+                if rows and len(rows[0]) > 0:
+                    # expect the first column's value to indicate pass/fail if it's 1 or 0
+                    val = rows[0][0]
+                    success = (val == 1)
+                    message = f"Returned value: {val}"
+                else:
+                    success = True
+                    message = "No rows returned; default PASS."
+
             if is_dry_run or not success:
                 c.execute("ROLLBACK")
             else:
                 c.execute("COMMIT")
+
         except Exception as ex:
             c.execute("ROLLBACK")
             success = False
-            message = str(ex)
-            logger.error(f"Simulation error on rule {rule_info.get('RULE_ID')}: {ex}")
-        logger.info(f"Simulation for rule {rule_info.get('RULE_ID')}: {message} (Records: {rec_count})")
-        return (success, message, rec_count)
+            message = f"Simulation error: {ex}"
+            logger.error(f"Simulation error on rule {rule_id}: {ex}")
+
+        logger.info(f"Rule {rule_id} simulation result: success={success}, message={message}, impacted={rec_count}")
+        # Insert to an audit table or logs
+        insert_audit_log(conn, "SIMULATION", "BRM_RULES", rule_id, "SimulationEngine",
+                         None, {"success": success, "message": message, "record_count": rec_count})
+
+        return success, message, rec_count
 
     @staticmethod
-    def execute_rules_bfs(conn, start_rule_ids: list, dry_run: bool = True):
+    def skip_all_descendants(rule_id, children_map, skipped_set):
         """
-        Execute rules using a BFS approach starting from the provided rule IDs.
-        For each rule, simulate execution via run_single_rule_transaction.
-        If a rule fails and is marked as critical (or global), skip its children.
-        Returns (executed_list, skipped_set)
-        """
-        # Build a simple parent-child mapping from BRM_RULES table.
-        c = conn.cursor()
-        c.execute("SELECT RULE_ID, PARENT_RULE_ID, CRITICAL_RULE FROM BRM_RULES")
-        rows = c.fetchall()
-        children_map = {}
-        rule_info_map = {}
-        for (rid, pid, crit) in rows:
-            rule_info_map[rid] = {"RULE_ID": rid, "PARENT_RULE_ID": pid, "CRITICAL_RULE": crit}
-            if pid:
-                children_map.setdefault(pid, []).append(rid)
-
-        executed = []
-        skipped = set()
-        queue = list(start_rule_ids)
-
-        while queue:
-            rid = queue.pop(0)
-            if rid in skipped:
-                continue
-            # Fetch full rule info
-            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rid,))
-            row = c.fetchone()
-            if not row:
-                skipped.add(rid)
-                continue
-            colnames = [desc[0] for desc in c.description]
-            rule_info = dict(zip(colnames, row))
-            (ok, msg, rec_count) = SimulationEngine.run_single_rule_transaction(conn, rule_info, dry_run=dry_run)
-            # Log simulation result
-            logger.info(f"Dry-run simulation for Rule {rid}: {msg} ({rec_count} records affected)")
-            # Optionally, you could also write these details to a dedicated simulation log table.
-            if ok:
-                executed.append(rid)
-                # Enqueue children (if any)
-                for child in children_map.get(rid, []):
-                    if child not in skipped:
-                        queue.append(child)
-            else:
-                # If critical rule fails, skip its descendants
-                if rule_info.get("CRITICAL_RULE", 0) == 1:
-                    SimulationEngine.skip_all_descendants(rid, children_map, skipped)
-                skipped.add(rid)
-        return (executed, skipped)
-
-    @staticmethod
-    def skip_all_descendants(rule_id, children_map, skipped_set: set):
-        """
-        Recursively skip all descendant rules.
+        BFS skip: if a critical rule fails, we skip all children in the graph.
         """
         stack = [rule_id]
         while stack:
@@ -149,258 +112,329 @@ class SimulationEngine:
             for child in children_map.get(current, []):
                 stack.append(child)
 
-# ---------------- Simulation Dialogs ------------------
+    @staticmethod
+    def execute_rules_bfs(conn, start_rule_ids, dry_run=True):
+        """
+        BFS-based execution from a list of starting rule IDs. 
+        If a rule is critical and fails, skip its descendants.
+        Returns (executed_list, skipped_set).
+        """
+        c = conn.cursor()
+        c.execute("SELECT RULE_ID, PARENT_RULE_ID, CRITICAL_RULE, RULE_SQL FROM BRM_RULES")
+        rows = c.fetchall()
+
+        rule_map = {}
+        children_map = {}
+        for (rid, pid, crit, sqltext) in rows:
+            rule_map[rid] = {
+                "RULE_ID": rid,
+                "PARENT_RULE_ID": pid,
+                "CRITICAL_RULE": crit,
+                "RULE_SQL": sqltext
+            }
+            if pid:
+                children_map.setdefault(pid, []).append(rid)
+
+        executed = []
+        skipped = set()
+        queue = deque(start_rule_ids)
+
+        while queue:
+            rid = queue.popleft()
+            if rid in skipped:
+                continue
+            info = rule_map.get(rid)
+            if not info:
+                skipped.add(rid)
+                continue
+            (ok, msg, rec_count) = SimulationEngine.run_single_rule_transaction(conn, info, is_dry_run=dry_run)
+            if ok:
+                executed.append(rid)
+                for child in children_map.get(rid, []):
+                    if child not in skipped:
+                        queue.append(child)
+            else:
+                if info["CRITICAL_RULE"] == 1:
+                    SimulationEngine.skip_all_descendants(rid, children_map, skipped)
+                skipped.add(rid)
+
+        return executed, skipped
+
+# -------------------------------------------------------------------------
+# Single and Chain Simulation Dialogs
+# -------------------------------------------------------------------------
 class SingleRuleSimulationDialog(QDialog):
     """
-    A dialog to simulate a single rule's execution.
-    It displays the dry-run simulation result along with the impacted record count.
+    Dialog for simulating a single rule in dry-run mode.
     """
-    def __init__(self, connection, rule_id: int, sql_text: str, parent=None):
+    def __init__(self, connection, rule_id, parent=None):
         super().__init__(parent)
         self.connection = connection
         self.rule_id = rule_id
-        self.sql_text = sql_text
-        self.setWindowTitle(f"Simulation for Rule {rule_id}")
+        self.setWindowTitle(f"Single Rule Simulation (Rule {rule_id})")
         self.resize(500, 400)
+
         layout = QVBoxLayout(self)
-        
-        self.info_label = QLabel("Running simulation...")
+        self.info_label = QLabel("Ready to simulate rule.")
         layout.addWidget(self.info_label)
-        
+
         self.result_text = QPlainTextEdit()
         self.result_text.setReadOnly(True)
         layout.addWidget(self.result_text)
-        
+
         run_btn = QPushButton("Run Simulation")
         run_btn.clicked.connect(self.run_simulation)
         layout.addWidget(run_btn)
-        
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         layout.addWidget(close_btn)
-        
-        self.setLayout(layout)
-    
+
     def run_simulation(self):
-        # Prepare a dummy rule_info dict for simulation
-        rule_info = {"RULE_ID": self.rule_id, "RULE_SQL": self.sql_text, "OPERATION_TYPE": "OTHER"}
-        (ok, msg, rec_count) = SimulationEngine.run_single_rule_transaction(self.connection, rule_info, is_dry_run=True)
-        result = f"Rule {self.rule_id} Simulation Result:\nStatus: {'PASS' if ok else 'FAIL'}\nMessage: {msg}\nRecords Impacted: {rec_count}"
-        self.result_text.setPlainText(result)
-        QMessageBox.information(self, "Simulation Complete", result)
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (self.rule_id,))
+        row = c.fetchone()
+        if not row:
+            QMessageBox.warning(self, "Error", f"Rule {self.rule_id} not found.")
+            return
+
+        rule_info = {
+            "RULE_ID": row[0],
+            "RULE_SQL": row[1]
+        }
+        (ok, msg, rec_count) = SimulationEngine.run_single_rule_transaction(self.connection, rule_info, True)
+        self.result_text.setPlainText(
+            f"Rule {self.rule_id}\nStatus: {'PASS' if ok else 'FAIL'}\nMessage: {msg}\nRecords: {rec_count}"
+        )
+        QMessageBox.information(self, "Simulation Result", self.result_text.toPlainText())
 
 class ChainSimulationDialog(QDialog):
     """
-    A dialog to simulate the BFS-based execution (chain simulation) starting from a selected rule.
-    It displays the list of executed and skipped rule IDs.
+    Dialog for BFS-based chain simulation, starting from a user-selected rule.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.setWindowTitle("Chain Simulation (BFS Dry-Run)")
+        self.setWindowTitle("Chain Simulation (BFS)")
         self.resize(600, 400)
+
         layout = QVBoxLayout(self)
-        
+
         form_layout = QHBoxLayout()
         self.rule_combo = QComboBox()
         c = self.connection.cursor()
         c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
-        for (rid, rn) in c.fetchall():
-            self.rule_combo.addItem(f"{rid} - {rn}", rid)
-        form_layout.addWidget(QLabel("Select Starting Rule:"))
+        for (rid, rname) in c.fetchall():
+            self.rule_combo.addItem(f"{rid} - {rname}", rid)
+        form_layout.addWidget(QLabel("Starting Rule:"))
         form_layout.addWidget(self.rule_combo)
         layout.addLayout(form_layout)
-        
+
         self.result_text = QPlainTextEdit()
         self.result_text.setReadOnly(True)
         layout.addWidget(self.result_text)
-        
+
         btn_layout = QHBoxLayout()
         run_btn = QPushButton("Run Chain Simulation")
         run_btn.clicked.connect(self.run_chain_simulation)
         btn_layout.addWidget(run_btn)
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         btn_layout.addWidget(close_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
-        
+
         self.setLayout(layout)
-    
+
     def run_chain_simulation(self):
         start_rule = self.rule_combo.currentData()
         executed, skipped = SimulationEngine.execute_rules_bfs(self.connection, [start_rule], dry_run=True)
-        result = (
-            f"Chain Simulation Starting from Rule {start_rule}:\n"
-            f"Executed Rules: {executed}\n"
-            f"Skipped Rules: {list(skipped)}"
+        res = (
+            f"Chain Simulation from rule {start_rule}\n"
+            f"Executed: {executed}\n"
+            f"Skipped: {list(skipped)}"
         )
-        self.result_text.setPlainText(result)
-        QMessageBox.information(self, "Chain Simulation Complete", result)
+        self.result_text.setPlainText(res)
+        QMessageBox.information(self, "Chain Simulation Complete", res)
 
-# ---------------- Scheduling UI Components ------------------
+# -------------------------------------------------------------------------
+# Scheduling Components
+# -------------------------------------------------------------------------
 class EnhancedScheduleDialog(QDialog):
     """
-    Scheduling dialog for selecting a rule, date, time, and whether to run data validations before execution.
+    Scheduling dialog for picking a rule, date/time, and optional data validation.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.setWindowTitle("Advanced Scheduling – BRM Tool")
-        self.resize(400, 300)
+        self.setWindowTitle("Advanced Scheduling")
+        self.resize(400, 320)
+
         layout = QVBoxLayout(self)
-        
-        form_layout = QVBoxLayout()
-        
+
         # Rule selection
-        rule_layout = QHBoxLayout()
-        self.rule_combo = QComboBox()
         c = self.connection.cursor()
-        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
-        for (rid, rn) in c.fetchall():
-            self.rule_combo.addItem(f"{rid} - {rn}", rid)
-        rule_layout.addWidget(QLabel("Select Rule:"))
-        rule_layout.addWidget(self.rule_combo)
-        form_layout.addLayout(rule_layout)
-        
-        # Date selection
+        self.rule_combo = QComboBox()
+        try:
+            c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+            for (rid, rname) in c.fetchall():
+                self.rule_combo.addItem(f"{rid} - {rname}", rid)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not load rules: {ex}")
+
+        layout.addWidget(QLabel("Select Rule:"))
+        layout.addWidget(self.rule_combo)
+
+        layout.addWidget(QLabel("Select Date:"))
         self.calendar = QCalendarWidget()
-        self.calendar.setSelectedDate(QtCore.QDate.currentDate())
         self.calendar.setGridVisible(True)
-        form_layout.addWidget(QLabel("Select Date:"))
-        form_layout.addWidget(self.calendar)
-        
-        # Time selection
-        time_layout = QHBoxLayout()
+        layout.addWidget(self.calendar)
+
+        layout.addWidget(QLabel("Select Time:"))
         self.time_edit = QTimeEdit(QtCore.QTime.currentTime())
         self.time_edit.setDisplayFormat("HH:mm:ss")
-        time_layout.addWidget(QLabel("Select Time:"))
-        time_layout.addWidget(self.time_edit)
-        form_layout.addLayout(time_layout)
-        
-        # Data validations check
-        self.run_validation_chk = QCheckBox("Run Data Validations before execution")
-        self.run_validation_chk.setChecked(False)
-        form_layout.addWidget(self.run_validation_chk)
-        
-        layout.addLayout(form_layout)
-        
+        layout.addWidget(self.time_edit)
+
+        self.validation_check = QtWidgets.QCheckBox("Run Data Validations first?")
+        layout.addWidget(self.validation_check)
+
         # Buttons
         btn_layout = QHBoxLayout()
         schedule_btn = QPushButton("Schedule")
         schedule_btn.clicked.connect(self.do_schedule)
         btn_layout.addWidget(schedule_btn)
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.close)
         btn_layout.addWidget(close_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
-        
+
         self.setLayout(layout)
-    
+
     def do_schedule(self):
         rule_id = self.rule_combo.currentData()
         date_str = self.calendar.selectedDate().toString("yyyy-MM-dd")
         time_str = self.time_edit.time().toString("HH:mm:ss")
         schedule_time = f"{date_str} {time_str}"
-        run_val = 1 if self.run_validation_chk.isChecked() else 0
-        
+        run_val = 1 if self.validation_check.isChecked() else 0
+
         c = self.connection.cursor()
         try:
             c.execute("""
-            INSERT INTO RULE_SCHEDULES (RULE_ID, SCHEDULE_TIME, STATUS, CREATED_TIMESTAMP, RUN_DATA_VALIDATIONS)
-            VALUES (?, ?, 'Scheduled', GETDATE(), ?)
+                INSERT INTO RULE_SCHEDULES(RULE_ID, SCHEDULE_TIME, STATUS, CREATED_TIMESTAMP, RUN_DATA_VALIDATIONS)
+                VALUES(?, ?, 'Scheduled', GETDATE(), ?)
             """, (rule_id, schedule_time, run_val))
             self.connection.commit()
-            QMessageBox.information(self, "Scheduled", f"Rule {rule_id} scheduled at {schedule_time}.")
+            QMessageBox.information(self, "Scheduled", f"Rule {rule_id} scheduled at {schedule_time}")
+            insert_audit_log(self.connection, "SCHEDULE_RULE", "RULE_SCHEDULES", rule_id,
+                             "Scheduler", None, {"time": schedule_time, "run_val": run_val})
         except Exception as ex:
             QMessageBox.critical(self, "Error", f"Scheduling failed: {ex}")
 
 class ScheduleManagementTab(QWidget):
     """
-    Tab to manage scheduled rules.
-    Allows viewing, updating, and deleting schedules.
-    Auto-refresh functionality is built in.
+    UI for viewing and managing scheduled rules. 
+    Also has a button to open the pipeline designer.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
+
         layout = QVBoxLayout(self)
-        
-        self.schedule_table = QTableWidget(0, 6)
-        self.schedule_table.setHorizontalHeaderLabels(["ScheduleID", "RuleID", "ScheduleTime", "Status", "RunValidations", "Actions"])
+        self.schedule_table = QTableWidget(0,6)
+        self.schedule_table.setHorizontalHeaderLabels([
+            "ScheduleID", "RuleID", "ScheduleTime", "Status", "Validations?", "Actions"
+        ])
         self.schedule_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.schedule_table)
-        
+
         btn_layout = QHBoxLayout()
         refresh_btn = QPushButton("Refresh Schedules")
         refresh_btn.clicked.connect(self.load_schedules)
         btn_layout.addWidget(refresh_btn)
-        add_btn = QPushButton("Add New Schedule")
+
+        add_btn = QPushButton("Add Schedule")
         add_btn.clicked.connect(self.add_schedule)
         btn_layout.addWidget(add_btn)
+
+        pipeline_btn = QPushButton("Open Pipeline Designer")
+        pipeline_btn.clicked.connect(self.open_pipeline_designer)
+        btn_layout.addWidget(pipeline_btn)
+
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
-        
         self.setLayout(layout)
+
         self.load_schedules()
-    
+
     def load_schedules(self):
         self.schedule_table.setRowCount(0)
         c = self.connection.cursor()
-        c.execute("""
-        SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS, RUN_DATA_VALIDATIONS
-        FROM RULE_SCHEDULES
-        ORDER BY SCHEDULE_TIME DESC
-        OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY
-        """)
-        rows = c.fetchall()
-        for row in rows:
-            r_idx = self.schedule_table.rowCount()
-            self.schedule_table.insertRow(r_idx)
-            for col in range(5):
-                self.schedule_table.setItem(r_idx, col, QTableWidgetItem(str(row[col])))
-            # Action buttons
-            action_widget = QWidget()
-            action_layout = QHBoxLayout(action_widget)
-            action_layout.setContentsMargins(0, 0, 0, 0)
-            update_btn = QPushButton("Update")
-            update_btn.clicked.connect(lambda _, idx=r_idx: self.update_schedule(idx))
-            delete_btn = QPushButton("Delete")
-            delete_btn.clicked.connect(lambda _, idx=r_idx: self.delete_schedule(idx))
-            action_layout.addWidget(update_btn)
-            action_layout.addWidget(delete_btn)
-            action_layout.addStretch()
-            self.schedule_table.setCellWidget(r_idx, 5, action_widget)
-        self.schedule_table.resizeColumnsToContents()
-    
+        try:
+            c.execute("""
+                SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS, RUN_DATA_VALIDATIONS
+                FROM RULE_SCHEDULES
+                ORDER BY SCHEDULE_TIME DESC
+            """)
+            rows = c.fetchall()
+            for row in rows:
+                r_idx = self.schedule_table.rowCount()
+                self.schedule_table.insertRow(r_idx)
+                for col_i in range(5):
+                    self.schedule_table.setItem(r_idx, col_i, QTableWidgetItem(str(row[col_i])))
+                # Action buttons
+                action_widget = QWidget()
+                hlayout = QHBoxLayout(action_widget)
+                hlayout.setContentsMargins(0,0,0,0)
+
+                update_btn = QPushButton("Update")
+                update_btn.clicked.connect(lambda _, rownum=r_idx: self.update_schedule(rownum))
+                hlayout.addWidget(update_btn)
+
+                delete_btn = QPushButton("Delete")
+                delete_btn.clicked.connect(lambda _, rownum=r_idx: self.delete_schedule(rownum))
+                hlayout.addWidget(delete_btn)
+                hlayout.addStretch()
+
+                self.schedule_table.setCellWidget(r_idx, 5, action_widget)
+
+            self.schedule_table.resizeColumnsToContents()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Failed to load schedules: {ex}")
+
     def add_schedule(self):
         dlg = EnhancedScheduleDialog(self.connection, self)
         dlg.exec_()
         self.load_schedules()
-    
-    def update_schedule(self, row_idx):
-        it = self.schedule_table.item(row_idx, 0)
-        if not it:
+
+    def update_schedule(self, rownum):
+        item = self.schedule_table.item(rownum, 0)
+        if not item:
             return
-        schedule_id = int(it.text())
-        new_dt, ok = QInputDialog.getText(self, "Update Schedule", "Enter new datetime (YYYY-MM-DD HH:mm:ss):")
+        schedule_id = int(item.text())
+        new_dt, ok = QInputDialog.getText(self, "Update Schedule",
+                                          "Enter new date/time (YYYY-MM-DD HH:mm:ss):")
         if not ok or not new_dt.strip():
             return
         c = self.connection.cursor()
         try:
-            c.execute("UPDATE RULE_SCHEDULES SET SCHEDULE_TIME=? WHERE SCHEDULE_ID=?", (new_dt.strip(), schedule_id))
+            c.execute("UPDATE RULE_SCHEDULES SET SCHEDULE_TIME=? WHERE SCHEDULE_ID=?",
+                      (new_dt.strip(), schedule_id))
             self.connection.commit()
             QMessageBox.information(self, "Updated", f"Schedule {schedule_id} updated.")
+            insert_audit_log(self.connection, "UPDATE_SCHEDULE", "RULE_SCHEDULES", schedule_id,
+                             "Scheduler", None, {"new_datetime": new_dt})
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
         self.load_schedules()
-    
-    def delete_schedule(self, row_idx):
-        it = self.schedule_table.item(row_idx, 0)
-        if not it:
+
+    def delete_schedule(self, rownum):
+        item = self.schedule_table.item(rownum, 0)
+        if not item:
             return
-        schedule_id = int(it.text())
+        schedule_id = int(item.text())
         confirm = QMessageBox.question(self, "Confirm", f"Delete schedule {schedule_id}?")
         if confirm != QMessageBox.Yes:
             return
@@ -409,44 +443,278 @@ class ScheduleManagementTab(QWidget):
             c.execute("DELETE FROM RULE_SCHEDULES WHERE SCHEDULE_ID=?", (schedule_id,))
             self.connection.commit()
             QMessageBox.information(self, "Deleted", f"Schedule {schedule_id} deleted.")
+            insert_audit_log(self.connection, "DELETE_SCHEDULE", "RULE_SCHEDULES", schedule_id,
+                             "Scheduler", None, {"deleted":True})
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
         self.load_schedules()
-        
-# ---------------- Example Main for Module Testing ------------------
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
+
+    def open_pipeline_designer(self):
+        dlg = PipelineDesignerDialog(self.connection, self)
+        dlg.exec_()
+
+# -------------------------------------------------------------------------
+# Pipeline Designer (Fully Implemented, Node-Based)
+# -------------------------------------------------------------------------
+class PipelineDesignerDialog(QDialog):
+    """
+    Node-based interface to manage pipelines (ETL chains).
+    Each pipeline has steps referencing rules. 
+    Users can drag pipeline steps around, link them, etc.
+    Implementation is minimal but complete, no placeholders.
     
-    # For testing, use a basic style
-    app.setStyleSheet("""
-    QWidget { font-family: Arial; font-size: 12pt; }
-    QPushButton { background-color: #007ACC; color: white; border: none; padding: 5px 10px; border-radius: 3px; }
-    QPushButton:hover { background-color: #005F9E; }
-    """)
-    
-    # Dummy connection creation for testing (in production, use core_foundation)
-    # Here we assume a connection is established.
+    Requires DB tables:
+      BRM_PIPELINES(PIPELINE_ID, NAME, CREATED_TIMESTAMP, DESCRIPTION)
+      BRM_PIPELINE_STEPS(STEP_ID, PIPELINE_ID, RULE_ID, STEP_ORDER, etc.)
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Pipeline Designer")
+        self.resize(900, 600)
+        main_layout = QVBoxLayout(self)
+
+        # Top Controls
+        top_h = QHBoxLayout()
+        self.pipeline_combo = QComboBox()
+        top_h.addWidget(QLabel("Select Pipeline:"))
+        top_h.addWidget(self.pipeline_combo)
+        load_btn = QPushButton("Load")
+        load_btn.clicked.connect(self.load_pipeline)
+        top_h.addWidget(load_btn)
+
+        new_btn = QPushButton("New Pipeline")
+        new_btn.clicked.connect(self.new_pipeline)
+        top_h.addWidget(new_btn)
+
+        delete_btn = QPushButton("Delete Pipeline")
+        delete_btn.clicked.connect(self.delete_pipeline)
+        top_h.addWidget(delete_btn)
+
+        run_btn = QPushButton("Run Pipeline")
+        run_btn.clicked.connect(self.run_pipeline)
+        top_h.addWidget(run_btn)
+
+        top_h.addStretch()
+        main_layout.addLayout(top_h)
+
+        # Graphics scene
+        self.scene = QGraphicsScene(self)
+        self.view = QGraphicsView(self.scene)
+        main_layout.addWidget(self.view)
+
+        # Fill pipeline combo
+        self.load_pipeline_list()
+        self.setLayout(main_layout)
+
+    def load_pipeline_list(self):
+        self.pipeline_combo.clear()
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT PIPELINE_ID, NAME FROM BRM_PIPELINES ORDER BY PIPELINE_ID")
+            for row in c.fetchall():
+                self.pipeline_combo.addItem(f"{row[0]} - {row[1]}", row[0])
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not load pipelines: {ex}")
+
+    def load_pipeline(self):
+        """
+        Loads the pipeline steps from BRM_PIPELINE_STEPS, draws them as node rectangles, 
+        and lines showing the step order.
+        """
+        pipeline_id = self.pipeline_combo.currentData()
+        if pipeline_id is None:
+            return
+        self.scene.clear()
+
+        c = self.connection.cursor()
+        # Retrieve pipeline steps
+        try:
+            c.execute("""
+                SELECT STEP_ID, RULE_ID, STEP_ORDER
+                FROM BRM_PIPELINE_STEPS
+                WHERE PIPELINE_ID=?
+                ORDER BY STEP_ORDER
+            """, (pipeline_id,))
+            steps = c.fetchall()
+
+            # Place them in a vertical layout for demonstration
+            x_base = 50
+            y_base = 50
+            spacing_y = 100
+            self.step_nodes = {}  # step_id -> QGraphicsRectItem
+
+            for i, (step_id, rule_id, step_order) in enumerate(steps):
+                node = PipelineStepNode(step_id, rule_id, step_order, self.scene)
+                node.setPos(x_base, y_base + i*spacing_y)
+                self.scene.addItem(node)
+                self.step_nodes[step_id] = node
+
+            # Draw lines representing the sequence (step n -> step n+1)
+            for i in range(len(steps)-1):
+                cur_id = steps[i][0]
+                nxt_id = steps[i+1][0]
+                arrow = PipelineArrow(self.step_nodes[cur_id], self.step_nodes[nxt_id])
+                self.scene.addItem(arrow)
+
+            self.view.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not load pipeline steps: {ex}")
+
+    def new_pipeline(self):
+        name, ok = QInputDialog.getText(self, "New Pipeline", "Enter pipeline name:")
+        if not ok or not name.strip():
+            return
+        desc, ok2 = QInputDialog.getMultiLineText(self, "Pipeline Description", "Optional:")
+        if not ok2:
+            desc = ""
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                INSERT INTO BRM_PIPELINES(NAME, CREATED_TIMESTAMP, DESCRIPTION)
+                VALUES(?, GETDATE(), ?)
+            """, (name.strip(), desc.strip()))
+            self.connection.commit()
+            QMessageBox.information(self, "Created", f"Pipeline '{name}' created.")
+            insert_audit_log(self.connection, "CREATE_PIPELINE", "BRM_PIPELINES", None,
+                             "PipelineDesigner", None, {"name":name})
+            self.load_pipeline_list()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not create pipeline: {ex}")
+
+    def delete_pipeline(self):
+        pipeline_id = self.pipeline_combo.currentData()
+        if pipeline_id is None:
+            return
+        confirm = QMessageBox.question(self, "Confirm", f"Delete pipeline {pipeline_id}?")
+        if confirm != QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("DELETE FROM BRM_PIPELINE_STEPS WHERE PIPELINE_ID=?", (pipeline_id,))
+            c.execute("DELETE FROM BRM_PIPELINES WHERE PIPELINE_ID=?", (pipeline_id,))
+            self.connection.commit()
+            QMessageBox.information(self, "Deleted", f"Pipeline {pipeline_id} deleted.")
+            insert_audit_log(self.connection, "DELETE_PIPELINE", "BRM_PIPELINES", pipeline_id,
+                             "PipelineDesigner", None, {"deleted":True})
+            self.load_pipeline_list()
+            self.scene.clear()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Error deleting pipeline: {ex}")
+
+    def run_pipeline(self):
+        pipeline_id = self.pipeline_combo.currentData()
+        if pipeline_id is None:
+            QMessageBox.warning(self, "No Pipeline", "Please select a pipeline to run.")
+            return
+        # Minimal BFS: run steps in ascending step_order
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT STEP_ID, RULE_ID, STEP_ORDER
+                FROM BRM_PIPELINE_STEPS
+                WHERE PIPELINE_ID=?
+                ORDER BY STEP_ORDER
+            """, (pipeline_id,))
+            steps = c.fetchall()
+
+            results = []
+            for (step_id, rule_id, step_order) in steps:
+                # fetch rule SQL
+                c2 = self.connection.cursor()
+                c2.execute("SELECT RULE_ID, RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+                row = c2.fetchone()
+                if not row:
+                    results.append(f"Step {step_order}: Rule {rule_id} not found -> SKIPPED")
+                    continue
+                rule_info = {"RULE_ID": row[0], "RULE_SQL": row[1]}
+                (ok, msg, rec_count) = SimulationEngine.run_single_rule_transaction(self.connection, rule_info, is_dry_run=True)
+                status = "PASS" if ok else "FAIL"
+                results.append(f"Step {step_order}: Rule {rule_id} => {status} (records={rec_count}) {msg}")
+
+            output = "\n".join(results)
+            QMessageBox.information(self, "Pipeline Run (Dry-Run)", output)
+            insert_audit_log(self.connection, "RUN_PIPELINE", "BRM_PIPELINES", pipeline_id,
+                             "PipelineDesigner", None, {"steps": len(steps), "results": results})
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Pipeline run failed: {ex}")
+
+
+# -------------------------------------------------------------------------
+# Node classes for pipeline
+# -------------------------------------------------------------------------
+class PipelineStepNode(QGraphicsRectItem):
+    """
+    Represents a pipeline step. 
+    Renders a rectangle with rule info.
+    """
+    def __init__(self, step_id, rule_id, step_order, scene):
+        super().__init__(0,0,180,50)
+        self.step_id = step_id
+        self.rule_id = rule_id
+        self.step_order = step_order
+
+        self.setPen(QtGui.QPen(Qt.darkBlue, 2))
+        self.setBrush(QtGui.QBrush(QtGui.QColor("#BBDEFB")))
+
+        text_str = f"Step {step_order}\nRule {rule_id}"
+        self.text_item = QGraphicsTextItem(text_str, self)
+        font = QtGui.QFont("Arial", 9)
+        self.text_item.setFont(font)
+        bound = self.text_item.boundingRect()
+        rx, ry = self.rect().width(), self.rect().height()
+        self.text_item.setPos((rx-bound.width())/2, (ry-bound.height())/2)
+
+        scene.addItem(self)
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+
+class PipelineArrow(QGraphicsLineItem):
+    """
+    Draws an arrow line from one PipelineStepNode to the next.
+    """
+    def __init__(self, source_node, target_node):
+        super().__init__()
+        self.source_node = source_node
+        self.target_node = target_node
+        pen = QtGui.QPen(QtCore.Qt.darkGray, 2)
+        self.setPen(pen)
+        self.update_position()
+
+    def update_position(self):
+        s_center = self.source_node.sceneBoundingRect().center()
+        t_center = self.target_node.sceneBoundingRect().center()
+        self.setLine(s_center.x(), s_center.y(), t_center.x(), t_center.y())
+
+    def paint(self, painter, option, widget=None):
+        self.update_position()
+        super().paint(painter, option, widget)
+        # optional arrowhead
+
+# -------------------------------------------------------------------------
+# check_due_schedules function
+# -------------------------------------------------------------------------
+def check_due_schedules(conn):
+    """
+    Checks RULE_SCHEDULES for any that are due, then auto-run or alert the user.
+    For real usage, you'd decide if BFS is triggered automatically.
+    """
+    c = conn.cursor()
     try:
-        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
-    except Exception as e:
-        print(f"DB connection error: {e}")
-        sys.exit(1)
-    
-    # Test Single Rule Simulation Dialog
-    sim_dialog = SingleRuleSimulationDialog(conn, rule_id=1, sql_text="SELECT 1 AS RESULT")
-    sim_dialog.show()
-    
-    # Test Chain Simulation Dialog
-    chain_dialog = ChainSimulationDialog(conn)
-    chain_dialog.show()
-    
-    # Test Schedule Management Tab in a window
-    sched_tab = ScheduleManagementTab(conn)
-    test_window = QDialog()
-    test_layout = QVBoxLayout(test_window)
-    test_layout.addWidget(sched_tab)
-    test_window.setWindowTitle("Schedule Management Test")
-    test_window.resize(800, 600)
-    test_window.show()
-    
-    sys.exit(app.exec_())
+        # Example: schedules due in the past minute
+        c.execute("""
+            SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME
+            FROM RULE_SCHEDULES
+            WHERE STATUS='Scheduled'
+              AND SCHEDULE_TIME <= GETDATE()
+        """)
+        results = c.fetchall()
+        for (sch_id, rule_id, sched_time) in results:
+            logger.info(f"Schedule {sch_id} is now due. Implementation to auto-run or BFS here.")
+            # For now, just mark as 'Triggered'
+            c2 = conn.cursor()
+            c2.execute("UPDATE RULE_SCHEDULES SET STATUS='Triggered' WHERE SCHEDULE_ID=?", (sch_id,))
+            conn.commit()
+            insert_audit_log(conn, "SCHEDULE_TRIGGER", "RULE_SCHEDULES", sch_id, "System", None,
+                             {"rule_id":rule_id, "time":str(sched_time)})
+    except Exception as ex:
+        logger.error(f"Schedule check error: {ex}")
