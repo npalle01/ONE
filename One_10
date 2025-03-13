@@ -1,397 +1,302 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 """
-Module: advanced_lineage_visualization.py
+Module: advanced_decision_tables.py
 Description:
-  This module provides a robust and professional advanced lineage visualization widget.
-  It uses QGraphicsView/QGraphicsScene to render an Erwin‑style ER diagram that shows
-  end‑to‑end lineage between business rules and their table dependencies. Key features include:
-    • Visual nodes for rules and tables with distinct shapes and color codes based on live status.
-    • Flow arrows connecting rule nodes to table nodes (and optionally rule-to-rule relationships).
-    • Deep search capabilities that allow users to filter nodes by column, database, or table.
-    • Real‑time notifications and auto‑refresh (using QTimer) to update the diagram as data changes.
-    • Detailed simulation logging: dry‑run executions capture number of impacted records and success/failure.
-    • Robust error handling and standard naming conventions.
-    
+  Provides an advanced module for managing decision tables, separate from 
+  the basic one in advanced_lineage. This version includes:
+    • A DecisionTableEngine that logs each execution in a DECISION_TABLE_LOGS table (if present).
+    • AdvancedDecisionTablesTab, a QWidget with:
+        - QTableWidget for listing decision tables
+        - add/edit/delete
+        - an “Execute” button that runs the decision query in a dry-run transaction
+          and logs results (impacted records, pass/fail, etc.)
+    • Extended searching, plus an optional “Export to CSV” feature for the list.
+
 Assumptions:
-  • The database contains tables such as BRM_RULES and BRM_RULE_TABLE_DEPENDENCIES.
-  • BRM_RULES includes fields: RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, LOCKED_BY, etc.
-  • BRM_RULE_TABLE_DEPENDENCIES includes: RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP.
-  • A connection (pyodbc connection) is passed into this module.
+  - DECISION_TABLES table with columns:
+      DECISION_TABLE_ID int PK,
+      TABLE_NAME varchar(...),
+      DESCRIPTION varchar(...),
+      DECISION_QUERY text,
+      ...
+  - DECISION_TABLE_LOGS (optional):
+      LOG_ID int PK IDENTITY,
+      DECISION_TABLE_ID int,
+      EXEC_TIMESTAMP datetime,
+      SUCCESS_FLAG bit,
+      RECORD_COUNT int,
+      MESSAGE varchar(...)
 """
 
 import sys
-import json
 import logging
+import pyodbc
 from datetime import datetime
-from collections import defaultdict
-
-from PyQt5.QtCore import Qt, QRectF, QLineF, QTimer
-from PyQt5.QtGui import QPen, QBrush, QColor, QFont
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsEllipseItem,
-    QGraphicsRectItem, QGraphicsLineItem, QGraphicsTextItem, QApplication, QMessageBox
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QPushButton, QMessageBox, QLineEdit, QInputDialog, QPlainTextEdit,
+    QFileDialog, QLabel
 )
 
-# Configure logger for this module
-logger = logging.getLogger("advanced_lineage_visualization")
+from core_foundation import logger, insert_audit_log
 
-# Constants for node dimensions and colors
-RULE_NODE_WIDTH = 150
-RULE_NODE_HEIGHT = 60
-TABLE_NODE_DIAMETER = 120
-
-COLOR_RULE_ACTIVE = QColor("#C8E6C9")      # light green
-COLOR_RULE_INACTIVE = QColor("#FFCDD2")    # light red
-COLOR_RULE_PENDING = QColor("#FFF9C4")     # light yellow
-
-COLOR_TABLE_DEFAULT = QColor("#BBDEFB")    # light blue
-COLOR_TABLE_MISSING = QColor("#E1BEE7")     # light purple
-
-ARROW_COLOR = QColor("#424242")            # dark gray
-LINE_WIDTH = 2
-
-class AdvancedLineageGraphWidget(QGraphicsView):
+# Optional logs function if DECISION_TABLE_LOGS table exists
+def log_decision_table_execution(conn, dt_id, success_flag, message, record_count):
     """
-    A QGraphicsView-based widget for advanced lineage visualization.
-    
-    Features:
-      • Builds a graph from BRM_RULES and BRM_RULE_TABLE_DEPENDENCIES.
-      • Renders rule nodes as rounded rectangles (with status colors)
-        and table nodes as circles.
-      • Draws arrows from rule nodes to table nodes.
-      • Supports deep search: when a search term is provided, only nodes whose
-        text (rule name, table name, column name, or database) matches will remain
-        highlighted while others are dimmed.
-      • Auto-refreshes periodically to reflect live data.
-      • Logs simulation results: for each dry-run execution, it can capture and
-        display the number of records impacted along with pass/fail status.
+    Insert a row into DECISION_TABLE_LOGS if it exists.
     """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO DECISION_TABLE_LOGS(
+                DECISION_TABLE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT
+            )
+            VALUES(?, GETDATE(), ?, ?, ?)
+        """,(dt_id, 1 if success_flag else 0, message, record_count))
+        conn.commit()
+        logger.debug(f"DT {dt_id} execution logged, success={success_flag}, records={record_count}")
+    except Exception as ex:
+        logger.error(f"Error logging DT execution for {dt_id}: {ex}")
 
-    def __init__(self, connection, parent=None, auto_refresh_interval=30000):
-        """
-        :param connection: pyodbc connection object.
-        :param parent: Parent widget.
-        :param auto_refresh_interval: Auto-refresh interval in milliseconds.
-        """
+class DecisionTableEngine:
+    """
+    Encapsulates decision table execution, possibly with extended logging into DECISION_TABLE_LOGS.
+    """
+    @staticmethod
+    def run_decision_table_query(conn, dt_id, query):
+        c = conn.cursor()
+        c.execute("BEGIN TRANSACTION")
+        success = False
+        msg = ""
+        impacted = 0
+        try:
+            c.execute(query)
+            try:
+                rows = c.fetchall()
+            except:
+                rows = []
+            impacted = len(rows)
+            # For demonstration, we consider success if it doesn't error
+            success = True
+            msg = f"Impacted {impacted} rows."
+            c.execute("ROLLBACK")  # always dry-run
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            success = False
+            msg = f"Error: {ex}"
+            logger.error(f"DT {dt_id} run error: {ex}")
+        # log if table exists
+        log_decision_table_execution(conn, dt_id, success, msg, impacted)
+        insert_audit_log(conn, "RUN_DECISION_TABLE","DECISION_TABLES", dt_id,
+                         "DecisionTableEngine", None, {"impacted":impacted,"msg":msg})
+        return success, msg, impacted
+
+# -----------------------------------------------------------------------------
+# 1. AdvancedDecisionTablesTab – main UI
+# -----------------------------------------------------------------------------
+class AdvancedDecisionTablesTab(QWidget):
+    """
+    A more advanced approach to managing decision tables than the one in advanced_lineage.
+    Includes:
+      - Searching
+      - Export to CSV
+      - Execution logs in DECISION_TABLE_LOGS if available
+    """
+    def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.setRenderHint(self.viewport().Antialiasing)
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setWindowTitle("Advanced Decision Tables (Full)")
+        layout = QVBoxLayout(self)
 
-        self.scene = QGraphicsScene(self)
-        self.setScene(self.scene)
+        # Searching
+        search_layout = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search by table name or description...")
+        self.search_edit.textChanged.connect(self.load_tables)
+        search_layout.addWidget(QLabel("Search:"))
+        search_layout.addWidget(self.search_edit)
+        layout.addLayout(search_layout)
 
-        # Store nodes for search highlighting
-        self.rule_nodes = {}    # key: RULE_ID, value: GraphicsRuleNode
-        self.table_nodes = {}   # key: (database, table), value: GraphicsTableNode
+        # Main table
+        self.dt_table = QTableWidget(0,4)
+        self.dt_table.setHorizontalHeaderLabels(["DT_ID","Table Name","Description","Decision Query"])
+        self.dt_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.dt_table)
 
-        # Timer for auto-refresh of the graph
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.populate_graph)
-        self.refresh_timer.start(auto_refresh_interval)  # e.g., every 30 seconds
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add DT")
+        add_btn.clicked.connect(self.add_dt)
+        btn_layout.addWidget(add_btn)
 
-        # Initial population of graph
-        self.populate_graph()
+        update_btn = QPushButton("Update DT")
+        update_btn.clicked.connect(self.update_dt)
+        btn_layout.addWidget(update_btn)
 
-    def populate_graph(self):
-        """
-        Build the graph from the database.
-        Retrieves rules and table dependencies; clears existing scene items;
-        then draws nodes and arrows.
-        """
+        delete_btn = QPushButton("Delete DT")
+        delete_btn.clicked.connect(self.delete_dt)
+        btn_layout.addWidget(delete_btn)
+
+        exec_btn = QPushButton("Execute DT")
+        exec_btn.clicked.connect(self.execute_dt)
+        btn_layout.addWidget(exec_btn)
+
+        export_btn = QPushButton("Export CSV")
+        export_btn.clicked.connect(self.export_csv)
+        btn_layout.addWidget(export_btn)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_tables)
+        btn_layout.addWidget(refresh_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.exec_log = QPlainTextEdit()
+        self.exec_log.setReadOnly(True)
+        self.exec_log.setPlaceholderText("Decision Table Execution Log...")
+        layout.addWidget(self.exec_log)
+
+        self.setLayout(layout)
+        self.load_tables()
+
+    def load_tables(self):
+        self.dt_table.setRowCount(0)
+        c = self.connection.cursor()
         try:
-            self.scene.clear()
-            self.rule_nodes.clear()
-            self.table_nodes.clear()
-
-            # Retrieve rules
-            rule_cursor = self.connection.cursor()
-            rule_cursor.execute("""
-                SELECT RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, LOCKED_BY
-                FROM BRM_RULES
-            """)
-            rules = rule_cursor.fetchall()
-            # Retrieve dependencies
-            dep_cursor = self.connection.cursor()
-            dep_cursor.execute("""
-                SELECT RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
-                FROM BRM_RULE_TABLE_DEPENDENCIES
-            """)
-            dependencies = dep_cursor.fetchall()
-
-            # Positioning: arrange rule nodes vertically in a column and table nodes in another column.
-            # For production systems, you might want to use a force-directed layout or hierarchical layout.
-            rule_x, rule_y, rule_gap = 50, 50, 80
-            table_x = 400
-            table_y, table_gap = 50, 100
-
-            # Draw rule nodes
-            for idx, rule in enumerate(rules):
-                rule_id = rule[0]
-                rule_name = rule[1]
-                status = rule[2]
-                approval_status = rule[3]
-                locked_by = rule[4]
-
-                # Determine color based on status
-                if status.upper() == "ACTIVE":
-                    fill_color = COLOR_RULE_ACTIVE
-                elif status.upper() == "INACTIVE":
-                    fill_color = COLOR_RULE_INACTIVE
-                else:
-                    fill_color = COLOR_RULE_PENDING
-
-                node = GraphicsRuleNode(rule_id, rule_name, fill_color, approval_status, locked_by)
-                node.setPos(rule_x, rule_y + idx * (RULE_NODE_HEIGHT + rule_gap))
-                self.scene.addItem(node)
-                self.rule_nodes[rule_id] = node
-
-            # Draw table nodes (aggregate by database and table)
-            table_positions = {}  # key: (database, table), value: (x,y)
-            for dep in dependencies:
-                db_name = dep[1] or "N/A"
-                tbl_name = dep[2]
-                key = (db_name.lower(), tbl_name.lower())
-                if key not in table_positions:
-                    # Assign a position based on current count
-                    pos_y = table_y + len(table_positions) * (TABLE_NODE_DIAMETER + table_gap)
-                    table_positions[key] = (table_x, pos_y)
-
-            for key, pos in table_positions.items():
-                db_name, tbl_name = key
-                # Check if table exists in the database (for now assume all exist; production may query sys.tables)
-                # For demonstration, if table name starts with 'missing_' we mark it as missing.
-                if tbl_name.startswith("missing_"):
-                    fill_color = COLOR_TABLE_MISSING
-                else:
-                    fill_color = COLOR_TABLE_DEFAULT
-                tnode = GraphicsTableNode(db_name, tbl_name, fill_color)
-                tnode.setPos(pos[0], pos[1])
-                self.scene.addItem(tnode)
-                self.table_nodes[key] = tnode
-
-            # Draw arrows from rule nodes to corresponding table nodes based on dependencies
-            for dep in dependencies:
-                rule_id = dep[0]
-                db_name = dep[1] or "N/A"
-                tbl_name = dep[2]
-                key = (db_name.lower(), tbl_name.lower())
-                if rule_id in self.rule_nodes and key in self.table_nodes:
-                    rule_node = self.rule_nodes[rule_id]
-                    table_node = self.table_nodes[key]
-                    arrow = GraphicsArrow(rule_node, table_node)
-                    self.scene.addItem(arrow)
-
-            self.resetView()
-            logger.info("Advanced lineage graph populated successfully.")
+            search_txt = self.search_edit.text().strip()
+            if search_txt:
+                c.execute("""
+                    SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
+                    FROM DECISION_TABLES
+                    WHERE TABLE_NAME LIKE ? OR DESCRIPTION LIKE ? OR DECISION_QUERY LIKE ?
+                    ORDER BY DECISION_TABLE_ID
+                """,(f"%{search_txt}%",f"%{search_txt}%",f"%{search_txt}%"))
+            else:
+                c.execute("""
+                    SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
+                    FROM DECISION_TABLES
+                    ORDER BY DECISION_TABLE_ID
+                """)
+            rows = c.fetchall()
+            for row in rows:
+                ridx = self.dt_table.rowCount()
+                self.dt_table.insertRow(ridx)
+                for col_i, val in enumerate(row):
+                    self.dt_table.setItem(ridx, col_i, QTableWidgetItem(str(val) if val else ""))
         except Exception as ex:
-            logger.error(f"Error populating lineage graph: {ex}")
-            QMessageBox.critical(self, "Graph Population Error", str(ex))
+            QMessageBox.critical(self, "Error", f"Error loading DTs: {ex}")
 
-    def resetView(self):
-        """
-        Adjust the view to fit the entire scene.
-        """
-        self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
-
-    def search_lineage(self, search_text):
-        """
-        When a search term is provided, highlight matching nodes (rules or tables)
-        and dim those that do not match.
-        The search is performed over rule names, table names, database names, and column names.
-        """
-        search_text = search_text.lower().strip()
-        if not search_text:
-            # Reset opacities
-            for node in self.rule_nodes.values():
-                node.setOpacity(1.0)
-            for node in self.table_nodes.values():
-                node.setOpacity(1.0)
+    def add_dt(self):
+        name, ok = QInputDialog.getText(self, "Add DT", "Table Name:")
+        if not ok or not name.strip():
             return
-
-        # For rule nodes: search rule name
-        for node in self.rule_nodes.values():
-            if search_text in node.rule_name.lower():
-                node.setOpacity(1.0)
-            else:
-                node.setOpacity(0.3)
-        # For table nodes: search table name and database name
-        for key, node in self.table_nodes.items():
-            db_name, tbl_name = key
-            if search_text in db_name or search_text in tbl_name:
-                node.setOpacity(1.0)
-            else:
-                node.setOpacity(0.3)
-
-    def reset_dim_highlight(self):
-        """
-        Reset all nodes to full opacity.
-        """
-        self.search_lineage("")
-
-
-# Graphics Node Classes
-class GraphicsRuleNode(QGraphicsRectItem):
-    """
-    A graphical representation of a business rule node.
-    Rendered as a rounded rectangle with rule name and status.
-    """
-    def __init__(self, rule_id, rule_name, fill_color, approval_status, locked_by, parent=None):
-        super().__init__(parent)
-        self.rule_id = rule_id
-        self.rule_name = rule_name
-        self.approval_status = approval_status
-        self.locked_by = locked_by
-        self.setRect(0, 0, RULE_NODE_WIDTH, RULE_NODE_HEIGHT)
-        self.setBrush(QBrush(fill_color))
-        self.setPen(QPen(Qt.black, 2))
-        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-        self.setFlag(QGraphicsItem.ItemIsMovable, False)
-
-        # Add a text label inside the rectangle
-        self.text_item = QGraphicsTextItem(f"Rule {rule_id}:\n{rule_name}", self)
-        self.text_item.setDefaultTextColor(Qt.black)
-        self.text_item.setFont(QFont("Arial", 10))
-        # Center the text
-        rect = self.rect()
-        text_rect = self.text_item.boundingRect()
-        x_offset = (rect.width() - text_rect.width()) / 2
-        y_offset = (rect.height() - text_rect.height()) / 2
-        self.text_item.setPos(x_offset, y_offset)
-
-        # Tooltip with extra details
-        tooltip = f"Rule ID: {rule_id}\nName: {rule_name}\nStatus: {approval_status}"
-        if locked_by:
-            tooltip += f"\nLocked by: {locked_by}"
-        self.setToolTip(tooltip)
-
-    def paint(self, painter, option, widget):
-        # Draw rounded rectangle
-        painter.setBrush(self.brush())
-        painter.setPen(self.pen())
-        painter.drawRoundedRect(self.rect(), 10, 10)
-        # The text is drawn by its own QGraphicsTextItem
-
-
-class GraphicsTableNode(QGraphicsEllipseItem):
-    """
-    A graphical representation of a table node.
-    Rendered as a circle (ellipse) with table name.
-    """
-    def __init__(self, db_name, table_name, fill_color, parent=None):
-        super().__init__(parent)
-        self.db_name = db_name
-        self.table_name = table_name
-        self.setRect(0, 0, TABLE_NODE_DIAMETER, TABLE_NODE_DIAMETER)
-        self.setBrush(QBrush(fill_color))
-        self.setPen(QPen(Qt.black, 2))
-        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
-
-        # Add text label for table name
-        display_text = f"{db_name}.{table_name}"
-        self.text_item = QGraphicsTextItem(display_text, self)
-        self.text_item.setDefaultTextColor(Qt.black)
-        self.text_item.setFont(QFont("Arial", 9))
-        text_rect = self.text_item.boundingRect()
-        # Center the text in the ellipse
-        x_offset = (TABLE_NODE_DIAMETER - text_rect.width()) / 2
-        y_offset = (TABLE_NODE_DIAMETER - text_rect.height()) / 2
-        self.text_item.setPos(x_offset, y_offset)
-        self.setToolTip(f"Table: {db_name}.{table_name}")
-
-
-class GraphicsArrow(QGraphicsLineItem):
-    """
-    A graphical arrow drawn between a rule node and a table node.
-    """
-    def __init__(self, source_node, target_node, parent=None):
-        super().__init__(parent)
-        self.source_node = source_node
-        self.target_node = target_node
-        self.setPen(QPen(ARROW_COLOR, LINE_WIDTH))
-        self.adjust()
-
-    def adjust(self):
-        # Calculate center points of source and target nodes
-        source_rect = self.source_node.sceneBoundingRect()
-        target_rect = self.target_node.sceneBoundingRect()
-        p1 = source_rect.center()
-        p2 = target_rect.center()
-        self.setLine(QLineF(p1, p2))
-        # Optionally, arrowhead drawing could be implemented here for better aesthetics.
-
-    def paint(self, painter, option, widget):
-        # Update line before painting
-        self.adjust()
-        painter.setPen(self.pen())
-        painter.drawLine(self.line())
-        # Draw arrowhead (simple triangle)
-        angle = self.line().angle()  # in degrees
-        # Define arrowhead size
-        arrow_size = 10
-        # Compute two lines at angles offset from the main line
-        p2 = self.line().p2()
-        line_angle_rad = (360 - angle) * 3.14159 / 180.0
-        dest_point = p2
-        # Calculate two points for the arrowhead
-        arrow_p1 = dest_point + QPointF(
-            arrow_size * -1 * (1.0 * 0.866), arrow_size * -1 * 0.5)
-        arrow_p2 = dest_point + QPointF(
-            arrow_size * -1 * (1.0 * 0.866), arrow_size * 0.5)
-        # For simplicity, we'll draw a simple line-based arrowhead
-        painter.drawLine(dest_point, arrow_p1)
-        painter.drawLine(dest_point, arrow_p2)
-
-
-# Optional: Real-Time Simulation Logging
-class LineageSimulationLogger:
-    """
-    This class manages simulation logs for lineage dry-run executions.
-    It captures the number of records impacted by a rule execution (dry-run)
-    along with pass/fail notifications. The logs are saved into a file and can
-    be displayed in the UI.
-    """
-    def __init__(self, log_file="lineage_simulation.log"):
-        self.log_file = log_file
-        logging.basicConfig(
-            filename=self.log_file,
-            level=logging.INFO,
-            format='%(asctime)s:%(levelname)s:%(name)s:%(message)s'
-        )
-        self.logger = logging.getLogger("LineageSimulationLogger")
-
-    def log_simulation(self, rule_id, impacted_count, success, message):
-        status = "PASS" if success else "FAIL"
-        log_message = f"Rule {rule_id}: {status} - Impacted Records: {impacted_count} | {message}"
-        self.logger.info(log_message)
-        return log_message
-
-    def get_simulation_logs(self):
+        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Optional desc:")
+        if not ok2:
+            desc = ""
+        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query", "Enter SQL:")
+        if not ok3 or not query.strip():
+            return
+        c = self.connection.cursor()
         try:
-            with open(self.log_file, "r", encoding="utf-8") as f:
-                return f.read()
+            c.execute("INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY) VALUES(?,?,?)",
+                      (name.strip(), desc.strip(), query.strip()))
+            self.connection.commit()
+            QMessageBox.information(self, "Added", "New DT created.")
+            insert_audit_log(self.connection, "ADD_DECISION_TABLE","DECISION_TABLES", None,
+                             "User", None, {"table_name":name})
+            self.load_tables()
         except Exception as ex:
-            return f"Error reading simulation logs: {ex}"
+            QMessageBox.critical(self, "Error", str(ex))
 
+    def update_dt(self):
+        row = self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self, "No selection", "No DT selected.")
+            return
+        dt_id = int(self.dt_table.item(row,0).text())
+        cur_name = self.dt_table.item(row,1).text()
+        cur_desc = self.dt_table.item(row,2).text()
+        cur_query = self.dt_table.item(row,3).text()
 
-# For standalone testing of the widget
-if __name__ == "__main__":
-    from PyQt5.QtWidgets import QApplication
-    app = QApplication(sys.argv)
-    try:
-        # Replace with your actual DSN or connection string.
-        connection = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
-    except Exception as ex:
-        print(f"Database connection error: {ex}")
-        sys.exit(1)
-    widget = AdvancedLineageGraphWidget(connection)
-    widget.setWindowTitle("Advanced Lineage Visualization")
-    widget.resize(1000, 800)
-    widget.show()
+        name, ok = QInputDialog.getText(self, "Edit Table Name", "New name:", text=cur_name)
+        if not ok or not name.strip():
+            return
+        desc, ok2 = QInputDialog.getMultiLineText(self, "Edit Description", "New desc:", text=cur_desc)
+        if not ok2:
+            desc = cur_desc
+        query, ok3 = QInputDialog.getMultiLineText(self, "Edit Query", "New SQL:", text=cur_query)
+        if not ok3 or not query.strip():
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                UPDATE DECISION_TABLES
+                SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
+                WHERE DECISION_TABLE_ID=?
+            """,(name.strip(), desc.strip(), query.strip(), dt_id))
+            self.connection.commit()
+            QMessageBox.information(self, "Updated", f"DT {dt_id} updated.")
+            insert_audit_log(self.connection, "EDIT_DECISION_TABLE","DECISION_TABLES", dt_id,
+                             "User", None, {"table_name":name})
+            self.load_tables()
+        except Exception as ex:
+            QMessageBox.critical(self, "Update Error", str(ex))
 
-    # For demonstration, perform a search after 5 seconds
-    QTimer.singleShot(5000, lambda: widget.search_lineage("customer"))
-    sys.exit(app.exec_())
+    def delete_dt(self):
+        row = self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self, "No selection", "No DT selected.")
+            return
+        dt_id = int(self.dt_table.item(row,0).text())
+        confirm = QMessageBox.question(self, "Confirm", f"Delete DT {dt_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?", (dt_id,))
+            self.connection.commit()
+            QMessageBox.information(self, "Deleted", f"DT {dt_id} deleted.")
+            insert_audit_log(self.connection, "DELETE_DECISION_TABLE","DECISION_TABLES", dt_id,
+                             "User", None, {"deleted":True})
+            self.load_tables()
+        except Exception as ex:
+            QMessageBox.critical(self, "Delete Error", str(ex))
+
+    def execute_dt(self):
+        row = self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self, "No selection", "No DT selected.")
+            return
+        dt_id = int(self.dt_table.item(row,0).text())
+        query = self.dt_table.item(row,3).text()
+        if not query:
+            QMessageBox.warning(self, "No Query", "No query in DT.")
+            return
+        (ok, msg, impacted) = DecisionTableEngine.run_decision_table_query(self.connection, dt_id, query)
+        result_str = f"DT {dt_id} => success={ok}, impacted={impacted}, msg={msg}"
+        self.exec_log.appendPlainText(result_str)
+        QMessageBox.information(self, "Executed", result_str)
+
+    def export_csv(self):
+        """
+        Exports the current DT table to a CSV file.
+        """
+        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "decision_tables.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                header = ["DT_ID","TABLE_NAME","DESCRIPTION","DECISION_QUERY"]
+                f.write(",".join(header)+"\n")
+                for row_i in range(self.dt_table.rowCount()):
+                    row_vals = []
+                    for col_i in range(self.dt_table.columnCount()):
+                        val = self.dt_table.item(row_i, col_i).text()
+                        row_vals.append(val.replace(",", ";"))  # or use csv writer for safety
+                    f.write(",".join(row_vals)+"\n")
+            QMessageBox.information(self, "Exported", f"Exported to {path}")
+        except Exception as ex:
+            QMessageBox.critical(self, "Export Error", str(ex))
