@@ -1,562 +1,276 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Module: brm_tool_main.py
-Description:
-  This is the final, fully integrated, production‑ready BRM Tool.
-  It combines advanced modules including:
-    • Database connection, login, and basic helpers.
-    • Business rules dashboard with full CRUD, force‑activation/deactivation,
-      and simulation logging that captures impacted record counts and success/fail details.
-    • Multi‑step approvals with real‑time notifications and auto‑refresh.
-    • Global/Critical administration (with forced override, locking, and audit logging).
-    • Hierarchy view with drag‑and‑drop re‑parenting.
-    • Advanced lineage visualization (Ervin ER‑style with flow arrows, color‑coded live statuses,
-      and search by column, table, or database).
-    • Custom rule groups management with backup/restore and real‑time context menus.
-    • Scheduling management with advanced simulation and dry‑run logging.
-    • Control tables viewer and metrics dashboard for performance stats.
-    • Group and user management.
-    
-All simulation actions and key operations are logged, and every dry‑run returns detailed information on the
-number of records impacted along with success/failure notifications.
+BRM Tool – Final Integration Module
+
+This module integrates all advanced enhancements for the BRM tool including:
+  • Core functionality: database connection, logging, login, SQL parsing, locking, etc.
+  • Multi‑step BFS rule execution and multi‑level approvals.
+  • Advanced scheduling with auto‑refresh.
+  • Audit logging, rule search, version history with diffs.
+  • Business rule dashboard & rule editor.
+  • Global/Critical administration, hierarchical drag‐n‑drop re‐parenting.
+  • Advanced lineage visualization (ER–style, flow arrows, colour–coded, live status).
+  • Metrics, control tables, group management, and user management.
+  • Custom rule groups and alerts/dashboards.
+  • SQL-to‑Business Language Converter with real‑time notifications.
+  
+All modules are assumed to be available in separate files (10 modules total). This file is the main entry point.
 """
 
+# =====================================================
+# Standard and Third-Party Imports
+# =====================================================
 import sys
 import json
+import math
 import logging
-from datetime import datetime
+import pyodbc
+import sqlparse
+import re
+import csv
+import smtplib
+from datetime import datetime, timedelta
+from collections import deque
+from email.mime.text import MIMEText
+
+# PyQt5 Imports
+from PyQt5.QtCore import Qt, QTimer, QDateTime
+from PyQt5.QtGui import QColor, QBrush, QPen
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
-    QComboBox, QPushButton, QLabel, QMessageBox, QDialog, QLineEdit, QAction,
-    QInputDialog
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QTabWidget, QComboBox, QMessageBox, QLineEdit, QDialog,
+    QTableWidget, QTableWidgetItem, QPlainTextEdit, QGroupBox, QCalendarWidget,
+    QAbstractItemView, QInputDialog, QAction
 )
-from PyQt5.QtCore import QTimer
 
-# -----------------------------------------------------------------------------
-# Assume that the following modules have been defined as part of the tool:
-#   - db_connection_and_helpers.py (DatabaseConnectionDialog, LoginDialog, sync_metadata_improved, insert_audit_log, etc.)
-#   - rule_execution_and_bfs.py (execute_rules_with_conflicts_composites_bfs, dry_run_rule_sql, ChainSimulationDialog,
-#                                GroupSimulationDialog, SingleRuleSimulationDialog)
-#   - scheduling_and_simulations.py (EnhancedScheduleDialog, ScheduleManagementTab, check_due_schedules)
-#   - audit_and_rule_editors.py (AuditLogViewer, RuleSearchDialog, VersionHistoryDialog, RuleDashboard, RuleEditorDialog, delete_rule)
-#   - approvals_and_lineage.py (MultiStepApprovalTab, GlobalCriticalAdminTab, HierarchyViewTab, EnhancedLineageGraphWidget)
-#   - metrics_and_control_tables.py (MetricsDashboardTab, CtrlTablesTab, GroupManagementTab, UserManagementTab, run_data_validations)
-#   - custom_rule_groups_and_alerts.py (CustomRuleGroupEnhancedTab, AlertsAndDashboardsTab)
-#
-# For this integrated module, we import the above as needed.
-# -----------------------------------------------------------------------------
+# =====================================================
+# Module Imports – (Assume each is a separate file)
+# =====================================================
+from database_connection_dialog import DatabaseConnectionDialog
+from login_dialog import LoginDialog
+from sql_parser_module import parse_sql_dependencies, detect_operation_type
+from db_helpers import fetch_all_dict, fetch_one_dict, insert_audit_log
+from locking_module import lock_rule_for_edit, unlock_rule
 
-# Set up root logger
+from multi_step_approval_tab import MultiStepApprovalTab
+from bfs_execution import execute_rules_with_conflicts_composites_bfs
+
+from schedule_management_tab import ScheduleManagementTab
+from schedule_management_module import check_due_schedules
+
+from audit_log_viewer import AuditLogViewer
+from rule_search_dialog import RuleSearchDialog
+from version_history_dialog import VersionHistoryDialog
+from rule_dashboard import RuleDashboard
+from rule_editor_dialog import RuleEditorDialog
+
+from global_critical_admin_tab import GlobalCriticalAdminTab
+from hierarchy_view_tab import HierarchyViewTab
+from enhanced_lineage_graph_widget import EnhancedLineageGraphWidget
+
+from metrics_dashboard_tab import MetricsDashboardTab
+from ctrl_tables_tab import CtrlTablesTab
+from group_management_tab import GroupManagementTab
+from user_management_tab import UserManagementTab
+
+from custom_rule_groups_tab import CustomRuleGroupEnhancedTab
+from alerts_dashboards_tab import AlertsAndDashboardsTab
+
+from sql_to_business_converter import SqlToBusinessLanguageConverterTab
+
+from chain_simulation_module import ChainSimulationDialog
+from group_simulation_module import GroupSimulationDialog
+from data_validations_module import run_all_data_validations
+
+# =====================================================
+# Logging Configuration
+# =====================================================
 logging.basicConfig(
     filename='brm_tool_production.log',
     level=logging.DEBUG,
     format='%(asctime)s:%(levelname)s:%(name)s:%(message)s'
 )
-logger = logging.getLogger("brm_tool_main")
+logger = logging.getLogger(__name__)
 
-
+# =====================================================
+# Main Application Window
+# =====================================================
 class BRMTool(QMainWindow):
-    """
-    Main integration window for the BRM Tool.
-    """
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BRM Tool – Final Integration (Production Ready)")
-        self.resize(1300, 900)
+        self.setWindowTitle("BRM Tool – Final Integration")
+        self.resize(1300, 850)
 
+        # Core variables
         self.connection = None
         self.user_id = None
         self.logged_in_username = None
         self.user_group = None
 
-        # Step 1: Establish Database Connection
-        from db_connection_and_helpers import DatabaseConnectionDialog
-        db_dialog = DatabaseConnectionDialog()
-        if db_dialog.exec_() == QDialog.Accepted:
-            self.connection = db_dialog.get_connection()
+        # 1. Database Connection
+        dbdlg = DatabaseConnectionDialog()
+        if dbdlg.exec_() == QDialog.Accepted:
+            self.connection = dbdlg.get_connection()
             if not self.connection:
                 sys.exit(1)
         else:
             sys.exit(0)
 
-        # Step 2: User Login
-        from db_connection_and_helpers import LoginDialog
-        login_dialog = LoginDialog(self.connection)
-        if login_dialog.exec_() != QDialog.Accepted:
+        # 2. User Login
+        logdlg = LoginDialog(self.connection)
+        if logdlg.exec_() != QDialog.Accepted:
             sys.exit(0)
-        self.user_id = login_dialog.user_id
-        self.user_group = login_dialog.user_group
+        self.user_id = logdlg.user_id
+        self.user_group = logdlg.user_group
 
+        # Retrieve username
         c = self.connection.cursor()
-        c.execute("SELECT USERNAME FROM USERS WHERE USER_ID = ?", (self.user_id,))
+        c.execute("SELECT USERNAME FROM USERS WHERE USER_ID=?", (self.user_id,))
         row = c.fetchone()
-        if row:
-            self.logged_in_username = row[0]
-        else:
-            self.logged_in_username = "UnknownUser"
+        self.logged_in_username = row[0] if row else "UnknownUser"
 
-        # Optional: Onboarding Wizard could be called here if needed.
-        # from db_connection_and_helpers import OnboardingWizard
-        # wizard = OnboardingWizard(self.connection)
-        # wizard.exec_()
+        # Optional: OnboardingWizard may be launched here
 
+        # Initialize UI
         self.init_ui()
 
     def init_ui(self):
-        # Create Menu Bar with actions
+        # Menu Bar Setup
         menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
-        help_menu = menubar.addMenu("Help")
-        tools_menu = menubar.addMenu("Tools")
+        fileMenu = menubar.addMenu("File")
 
-        # File Menu Actions
-        sync_action = QAction("Sync Metadata", self)
-        sync_action.triggered.connect(self.sync_metadata)
-        file_menu.addAction(sync_action)
+        syncAct = QAction("Sync Metadata", self)
+        syncAct.triggered.connect(self.sync_metadata)
+        fileMenu.addAction(syncAct)
 
-        dv_action = QAction("Run All Data Validations", self)
-        dv_action.triggered.connect(self.run_all_data_validations)
-        file_menu.addAction(dv_action)
+        dvAct = QAction("Run Data Validations", self)
+        dvAct.triggered.connect(self.run_data_validations)
+        fileMenu.addAction(dvAct)
 
-        perf_action = QAction("Show Performance Trends", self)
-        perf_action.triggered.connect(self.show_performance_trends)
-        file_menu.addAction(perf_action)
+        perfAct = QAction("Show Performance Trends", self)
+        perfAct.triggered.connect(self.show_performance_trends)
+        fileMenu.addAction(perfAct)
 
-        chain_sim_action = QAction("Simulate Rule Chain", self)
-        chain_sim_action.triggered.connect(self.launch_chain_simulation)
-        file_menu.addAction(chain_sim_action)
+        chainSimAct = QAction("Simulate Rule Chain", self)
+        chainSimAct.triggered.connect(self.simulate_rule_chain)
+        fileMenu.addAction(chainSimAct)
 
-        group_sim_action = QAction("Simulate Custom Group", self)
-        group_sim_action.triggered.connect(self.launch_group_simulation)
-        file_menu.addAction(group_sim_action)
+        groupSimAct = QAction("Simulate Custom Group", self)
+        groupSimAct.triggered.connect(self.simulate_custom_group)
+        fileMenu.addAction(groupSimAct)
 
-        # Help Menu Action
-        help_action = QAction("Show Help", self)
-        help_action.triggered.connect(self.show_help)
-        help_menu.addAction(help_action)
+        helpMenu = menubar.addMenu("Help")
+        helpAct = QAction("Show Help", self)
+        helpAct.triggered.connect(self.show_help)
+        helpMenu.addAction(helpAct)
 
-        # Tools Menu Actions
-        audit_action = QAction("View Audit Logs", self)
-        audit_action.triggered.connect(self.launch_audit_logs)
-        tools_menu.addAction(audit_action)
+        toolsMenu = menubar.addMenu("Tools")
+        auditAct = QAction("View Audit Logs", self)
+        auditAct.triggered.connect(self.open_audit_logs)
+        toolsMenu.addAction(auditAct)
+        searchAct = QAction("Search Rules", self)
+        searchAct.triggered.connect(self.open_rule_search)
+        toolsMenu.addAction(searchAct)
+        versionAct = QAction("Version History", self)
+        versionAct.triggered.connect(self.open_version_history)
+        toolsMenu.addAction(versionAct)
 
-        search_action = QAction("Search Rules", self)
-        search_action.triggered.connect(self.launch_rule_search)
-        tools_menu.addAction(search_action)
+        # Central Widget and Layout
+        centralWidget = QWidget()
+        mainLayout = QVBoxLayout(centralWidget)
 
-        version_action = QAction("Version History", self)
-        version_action.triggered.connect(self.launch_version_history)
-        tools_menu.addAction(version_action)
-
-        # Central widget layout
-        central_widget = QWidget()
-        central_layout = QVBoxLayout(central_widget)
-
-        # Admin Impersonation Section (visible only if user is Admin)
+        # Impersonation (Admin only)
         if self.user_group == "Admin":
-            imp_layout = QHBoxLayout()
-            self.impersonate_combo = QComboBox()
-            self.impersonate_btn = QPushButton("Switch User")
-            self.impersonate_btn.clicked.connect(self.switch_user)
-            imp_layout.addWidget(QLabel("Impersonate:"))
-            imp_layout.addWidget(self.impersonate_combo)
-            imp_layout.addWidget(self.impersonate_btn)
-            imp_layout.addStretch()
-            central_layout.addLayout(imp_layout)
-            self.load_impersonation_options()
+            impLayout = QHBoxLayout()
+            self.impersonationCombo = QComboBox()
+            self.load_impersonation_combo()
+            impBtn = QPushButton("Switch User")
+            impBtn.clicked.connect(self.switch_user)
+            impLayout.addWidget(QLabel("Impersonate:"))
+            impLayout.addWidget(self.impersonationCombo)
+            impLayout.addWidget(impBtn)
+            impLayout.addStretch()
+            mainLayout.addLayout(impLayout)
 
-        # Create main tab widget
-        self.main_tabs = QTabWidget()
-        central_layout.addWidget(self.main_tabs)
+        # Tabs
+        self.tabs = QTabWidget()
 
-        # Business Rules Dashboard Tab
-        from audit_and_rule_editors import RuleDashboard, RuleEditorDialog, delete_rule
-        self.rule_dashboard = RuleDashboard(self.connection, self.user_id, self.user_group)
-        br_tab = QWidget()
-        br_layout = QVBoxLayout(br_tab)
+        # Tab: Business Rules Dashboard
+        self.ruleDashboard = RuleDashboard(self.connection, self.user_id, self.user_group)
+        self.tabs.addTab(self.ruleDashboard, "Business Rules")
 
-        # Top control buttons for rules
-        rule_ctrl_layout = QHBoxLayout()
-        add_rule_btn = QPushButton("Add Rule")
-        add_rule_btn.clicked.connect(self.add_rule)
-        rule_ctrl_layout.addWidget(add_rule_btn)
+        # Tab: Approvals
+        self.approvalTab = MultiStepApprovalTab(self.connection, self.logged_in_username, self.user_group)
+        self.tabs.addTab(self.approvalTab, "Approvals")
 
-        update_rule_btn = QPushButton("Update Rule")
-        update_rule_btn.clicked.connect(self.update_rule)
-        rule_ctrl_layout.addWidget(update_rule_btn)
-
-        force_activate_btn = QPushButton("Force Activate")
-        force_activate_btn.clicked.connect(self.force_activate_rule)
-        rule_ctrl_layout.addWidget(force_activate_btn)
-
-        force_deactivate_btn = QPushButton("Force Deactivate")
-        force_deactivate_btn.clicked.connect(self.force_deactivate_rule)
-        rule_ctrl_layout.addWidget(force_deactivate_btn)
-
-        delete_rule_btn = QPushButton("Delete Rule")
-        delete_rule_btn.clicked.connect(self.delete_rule)
-        rule_ctrl_layout.addWidget(delete_rule_btn)
-
-        etl_bfs_btn = QPushButton("Run ETL BFS")
-        etl_bfs_btn.clicked.connect(self.run_etl_bfs)
-        rule_ctrl_layout.addWidget(etl_bfs_btn)
-
-        simulate_rule_btn = QPushButton("Simulate Single Rule")
-        simulate_rule_btn.clicked.connect(self.simulate_single_rule)
-        rule_ctrl_layout.addWidget(simulate_rule_btn)
-
-        rule_ctrl_layout.addStretch()
-        br_layout.addLayout(rule_ctrl_layout)
-        br_layout.addWidget(self.rule_dashboard)
-        br_tab.setLayout(br_layout)
-        self.main_tabs.addTab(br_tab, "Business Rules")
-
-        # Approvals Tab
-        from approvals_and_lineage import MultiStepApprovalTab
-        self.approvals_tab = MultiStepApprovalTab(self.connection, self.logged_in_username, self.user_group)
-        self.main_tabs.addTab(self.approvals_tab, "Approvals")
-
-        # Global/Critical Admin Tab (Admin only)
+        # Tab: Global/Critical Admin (Admin only)
         if self.user_group == "Admin":
-            from approvals_and_lineage import GlobalCriticalAdminTab
-            self.gcr_admin_tab = GlobalCriticalAdminTab(self, self.connection, self.user_group)
-            self.main_tabs.addTab(self.gcr_admin_tab, "Global/Critical Admin")
+            self.gcrAdminTab = GlobalCriticalAdminTab(self, self.connection, self.user_group)
+            self.tabs.addTab(self.gcrAdminTab, "Global/Critical Admin")
 
-        # Hierarchy View Tab
-        from approvals_and_lineage import HierarchyViewTab
-        self.hierarchy_tab = HierarchyViewTab(self.connection)
-        self.main_tabs.addTab(self.hierarchy_tab, "Hierarchy")
+        # Tab: Hierarchy View
+        self.hierarchyTab = HierarchyViewTab(self.connection)
+        self.tabs.addTab(self.hierarchyTab, "Hierarchy")
 
-        # Advanced Lineage Visualization Tab
-        from approvals_and_lineage import EnhancedLineageGraphWidget
-        lineage_tab = QWidget()
-        lineage_layout = QVBoxLayout(lineage_tab)
-        title_label = QLabel("Advanced Lineage Visualization")
-        title_label.setStyleSheet("font-weight:bold; font-size:14px;")
-        lineage_layout.addWidget(title_label)
-        self.lineage_view = EnhancedLineageGraphWidget(self.connection)
-        lineage_layout.addWidget(self.lineage_view)
-        # Lineage search bar
-        lineage_search_layout = QHBoxLayout()
-        self.lineage_search_edit = QLineEdit()
-        self.lineage_search_edit.setPlaceholderText("Search by column, table, or database...")
-        lineage_search_layout.addWidget(self.lineage_search_edit)
-        search_btn = QPushButton("Search")
-        search_btn.clicked.connect(self.search_lineage)
-        lineage_search_layout.addWidget(search_btn)
-        reset_btn = QPushButton("Reset")
-        reset_btn.clicked.connect(self.lineage_view.reset_dim_highlight)
-        lineage_search_layout.addWidget(reset_btn)
-        lineage_search_layout.addStretch()
-        lineage_layout.addLayout(lineage_search_layout)
-        self.main_tabs.addTab(lineage_tab, "Lineage")
+        # Tab: Enhanced Lineage Visualization
+        self.lineageTab = EnhancedLineageGraphWidget(self.connection)
+        self.tabs.addTab(self.lineageTab, "Lineage")
 
-        # Custom Rule Groups Tab
-        from custom_rule_groups_and_alerts import CustomRuleGroupEnhancedTab
-        self.custom_groups_tab = CustomRuleGroupEnhancedTab(self.connection, self.user_id, self.user_group)
-        self.main_tabs.addTab(self.custom_groups_tab, "Custom Groups")
+        # Tab: Custom Rule Groups
+        self.customGroupTab = CustomRuleGroupEnhancedTab(self.connection, self.user_id, self.user_group)
+        self.tabs.addTab(self.customGroupTab, "Custom Groups")
 
-        # Scheduling Tab
-        from scheduling_and_simulations import ScheduleManagementTab
-        self.scheduling_tab = ScheduleManagementTab(self.connection)
-        self.main_tabs.addTab(self.scheduling_tab, "Scheduling")
+        # Tab: Scheduling
+        self.scheduleTab = ScheduleManagementTab(self.connection)
+        self.tabs.addTab(self.scheduleTab, "Scheduling")
 
-        # Control Tables Tab
-        from metrics_and_control_tables import CtrlTablesTab
-        self.control_tables_tab = CtrlTablesTab(self.connection)
-        self.main_tabs.addTab(self.control_tables_tab, "Control Tables")
+        # Tab: Control Tables
+        self.ctrlTablesTab = CtrlTablesTab(self.connection)
+        self.tabs.addTab(self.ctrlTablesTab, "Control Tables")
 
-        # Metrics Dashboard Tab
-        from metrics_and_control_tables import MetricsDashboardTab
-        self.metrics_tab = MetricsDashboardTab(self.connection)
-        self.main_tabs.addTab(self.metrics_tab, "Metrics")
+        # Tab: Metrics Dashboard
+        self.metricsTab = MetricsDashboardTab(self.connection)
+        self.tabs.addTab(self.metricsTab, "Metrics")
 
-        # Alerts & Dashboards Tab
-        from custom_rule_groups_and_alerts import AlertsAndDashboardsTab
-        self.alerts_tab = AlertsAndDashboardsTab(self.connection, self.user_id, self.user_group)
-        self.main_tabs.addTab(self.alerts_tab, "Alerts & Dashboards")
+        # Tab: Alerts & Dashboards
+        self.alertsTab = AlertsAndDashboardsTab(self.connection, self.user_id, self.user_group)
+        self.tabs.addTab(self.alertsTab, "Alerts/Dashboards")
 
-        # Group Management Tab
-        from metrics_and_control_tables import GroupManagementTab
-        self.group_mgmt_tab = GroupManagementTab(self.connection, self.user_id, self.user_group)
-        self.main_tabs.addTab(self.group_mgmt_tab, "Group Management")
+        # Tab: Group Management
+        self.groupMgmtTab = GroupManagementTab(self.connection, self.user_id, self.user_group)
+        self.tabs.addTab(self.groupMgmtTab, "Group Management")
 
-        # User Management Tab (Admin only)
+        # Tab: User Management (Admin only)
         if self.user_group == "Admin":
-            from metrics_and_control_tables import UserManagementTab
-            self.user_mgmt_tab = UserManagementTab(self.connection)
-            self.main_tabs.addTab(self.user_mgmt_tab, "User Management")
+            self.userMgmtTab = UserManagementTab(self.connection)
+            self.tabs.addTab(self.userMgmtTab, "User Management")
 
-        central_widget.setLayout(central_layout)
-        self.setCentralWidget(central_widget)
+        # Tab: SQL to Business Language Converter
+        self.sqlToBusinessTab = SqlToBusinessLanguageConverterTab(self.connection)
+        self.tabs.addTab(self.sqlToBusinessTab, "SQL → Business Language")
 
-        # Setup auto-refresh timers
-        self.approvals_timer = QTimer(self)
-        self.approvals_timer.timeout.connect(self.approvals_tab.load_approvals)
-        self.approvals_timer.start(5000)  # every 5 seconds
+        mainLayout.addWidget(self.tabs)
+        centralWidget.setLayout(mainLayout)
+        self.setCentralWidget(centralWidget)
 
-        self.schedules_timer = QTimer(self)
-        self.schedules_timer.timeout.connect(self.check_due_schedules)
-        self.schedules_timer.start(60000)  # every 60 seconds
+        # Timers for auto‑refresh
+        self.approvalTimer = QTimer(self)
+        self.approvalTimer.timeout.connect(self.approvalTab.load_approvals)
+        self.approvalTimer.start(5000)
 
-    # ---------------------------
-    # Menu Action Handlers
-    # ---------------------------
-    def sync_metadata(self):
-        try:
-            from db_connection_and_helpers import sync_metadata_improved
-            msg = sync_metadata_improved(self.connection)
-            QMessageBox.information(self, "Sync Metadata", msg)
-        except Exception as ex:
-            logger.error(f"Sync metadata error: {ex}")
-            QMessageBox.critical(self, "Sync Metadata Error", str(ex))
+        self.scheduleTimer = QTimer(self)
+        self.scheduleTimer.timeout.connect(self.check_schedules)
+        self.scheduleTimer.start(60000)
 
-    def run_all_data_validations(self):
-        try:
-            from metrics_and_control_tables import run_data_validations
-            run_data_validations(self.connection)
-            QMessageBox.information(self, "Data Validations", "All data validations executed. Check logs for details.")
-        except Exception as ex:
-            logger.error(f"Data validations error: {ex}")
-            QMessageBox.critical(self, "Data Validation Error", str(ex))
-
-    def show_performance_trends(self):
-        try:
-            from metrics_and_control_tables import MetricsDashboardTab
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Performance Trends")
-            dlg.resize(800, 600)
-            layout = QVBoxLayout(dlg)
-            perf_chart = MetricsDashboardTab(self.connection)
-            layout.addWidget(perf_chart)
-            close_btn = QPushButton("Close")
-            close_btn.clicked.connect(dlg.close)
-            layout.addWidget(close_btn)
-            dlg.exec_()
-        except Exception as ex:
-            logger.error(f"Performance trends error: {ex}")
-            QMessageBox.critical(self, "Performance Trends Error", str(ex))
-
-    def launch_chain_simulation(self):
-        try:
-            from rule_execution_and_bfs import ChainSimulationDialog
-            dlg = ChainSimulationDialog(self.connection, self)
-            dlg.exec_()
-        except Exception as ex:
-            logger.error(f"Chain simulation error: {ex}")
-            QMessageBox.critical(self, "Chain Simulation Error", str(ex))
-
-    def launch_group_simulation(self):
-        try:
-            from rule_execution_and_bfs import GroupSimulationDialog
-            dlg = GroupSimulationDialog(self.connection, self)
-            dlg.exec_()
-        except Exception as ex:
-            logger.error(f"Group simulation error: {ex}")
-            QMessageBox.critical(self, "Group Simulation Error", str(ex))
-
-    def launch_audit_logs(self):
-        try:
-            from audit_and_rule_editors import AuditLogViewer
-            dlg = AuditLogViewer(self.connection, self.user_group, self)
-            dlg.exec_()
-        except Exception as ex:
-            logger.error(f"Audit logs error: {ex}")
-            QMessageBox.critical(self, "Audit Logs Error", str(ex))
-
-    def launch_rule_search(self):
-        try:
-            from audit_and_rule_editors import RuleSearchDialog
-            dlg = RuleSearchDialog(self.connection, self.user_group, self)
-            dlg.exec_()
-        except Exception as ex:
-            logger.error(f"Rule search error: {ex}")
-            QMessageBox.critical(self, "Rule Search Error", str(ex))
-
-    def launch_version_history(self):
-        rid, ok = QInputDialog.getInt(self, "Version History", "Enter rule ID:")
-        if not ok:
-            return
-        try:
-            from audit_and_rule_editors import VersionHistoryDialog
-            dlg = VersionHistoryDialog(self.connection, rid, self)
-            dlg.exec_()
-        except Exception as ex:
-            logger.error(f"Version history error: {ex}")
-            QMessageBox.critical(self, "Version History Error", str(ex))
-
-    # ---------------------------
-    # Business Rules Operations
-    # ---------------------------
-    def add_rule(self):
-        try:
-            from audit_and_rule_editors import RuleEditorDialog
-            dlg = RuleEditorDialog(self.connection, self.user_group, None, self)
-            if dlg.exec_() == QDialog.Accepted:
-                self.rule_dashboard.load_rules()
-        except Exception as ex:
-            logger.error(f"Add rule error: {ex}")
-            QMessageBox.critical(self, "Add Rule Error", str(ex))
-
-    def update_rule(self):
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if len(selected) != 1:
-            QMessageBox.warning(self, "Selection Error", "Select exactly one rule to update.")
-            return
-        rid = selected[0]
-        try:
-            from audit_and_rule_editors import RuleEditorDialog
-            c = self.connection.cursor()
-            c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID = ?", (rid,))
-            row = c.fetchone()
-            if not row:
-                QMessageBox.warning(self, "Not Found", "Rule not found.")
-                return
-            cols = [desc[0] for desc in c.description]
-            rule_data = dict(zip(cols, row))
-            dlg = RuleEditorDialog(self.connection, self.user_group, rule_data, self)
-            if dlg.exec_() == QDialog.Accepted:
-                self.rule_dashboard.load_rules()
-        except Exception as ex:
-            logger.error(f"Update rule error: {ex}")
-            QMessageBox.critical(self, "Update Rule Error", str(ex))
-
-    def force_activate_rule(self):
-        if self.user_group != "Admin":
-            QMessageBox.warning(self, "Permission Denied", "Only Admin can force activate rules.")
-            return
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if not selected:
-            return
+    def load_impersonation_combo(self):
         c = self.connection.cursor()
-        success = 0
-        error_msgs = []
-        for rid in selected:
-            try:
-                c.execute("""
-                    UPDATE BRM_RULES
-                    SET STATUS = 'ACTIVE', LIFECYCLE_STATE = 'ACTIVE', APPROVAL_STATUS = 'APPROVED'
-                    WHERE RULE_ID = ?
-                """, (rid,))
-                from db_connection_and_helpers import insert_audit_log
-                insert_audit_log(self.connection, "FORCE_ACTIVATE", "BRM_RULES", rid, "Admin", None, {"new_status": "ACTIVE"})
-                self.connection.commit()
-                success += 1
-            except Exception as ex:
-                error_msgs.append(str(ex))
-        msg = f"Force activated {success} rule(s)."
-        if error_msgs:
-            msg += "\nErrors:\n" + "\n".join(error_msgs)
-        QMessageBox.information(self, "Force Activate", msg)
-        self.rule_dashboard.load_rules()
+        c.execute("SELECT USER_ID, USERNAME, USER_GROUP FROM USERS ORDER BY USER_ID")
+        for uid, uname, ugroup in c.fetchall():
+            self.impersonationCombo.addItem(f"{uname} ({ugroup})", (uid, ugroup))
 
-    def force_deactivate_rule(self):
-        if self.user_group != "Admin":
-            QMessageBox.warning(self, "Permission Denied", "Only Admin can force deactivate rules.")
-            return
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if not selected:
-            return
-        c = self.connection.cursor()
-        success = 0
-        error_msgs = []
-        for rid in selected:
-            try:
-                c.execute("""
-                    WITH Descendants AS (
-                        SELECT RULE_ID FROM BRM_RULES WHERE RULE_ID = ?
-                        UNION ALL
-                        SELECT R.RULE_ID FROM BRM_RULES R JOIN Descendants D ON R.PARENT_RULE_ID = D.RULE_ID
-                    )
-                    UPDATE BRM_RULES
-                    SET STATUS = 'INACTIVE', LIFECYCLE_STATE = 'INACTIVE', APPROVAL_STATUS = 'FORCE_DEACTIVATED'
-                    WHERE RULE_ID IN (SELECT RULE_ID FROM Descendants)
-                """, (rid,))
-                from db_connection_and_helpers import insert_audit_log
-                insert_audit_log(self.connection, "FORCE_DEACTIVATE", "BRM_RULES", rid, "Admin", None, {"new_status": "INACTIVE"})
-                self.connection.commit()
-                success += 1
-            except Exception as ex:
-                error_msgs.append(str(ex))
-        msg = f"Force deactivated {success} rule(s)."
-        if error_msgs:
-            msg += "\nErrors:\n" + "\n".join(error_msgs)
-        QMessageBox.information(self, "Force Deactivate", msg)
-        self.rule_dashboard.load_rules()
-
-    def delete_rule(self):
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if not selected:
-            return
-        confirm = QMessageBox.question(self, "Confirm Delete", f"Delete {len(selected)} rule(s)?")
-        if confirm != QMessageBox.Yes:
-            return
-        try:
-            from audit_and_rule_editors import delete_rule
-            success = 0
-            error_msgs = []
-            for rid in selected:
-                try:
-                    delete_rule(self.connection, rid, f"User:{self.user_id}", self.user_group)
-                    success += 1
-                except Exception as ex:
-                    error_msgs.append(str(ex))
-            msg = f"Deleted {success} rule(s)."
-            if error_msgs:
-                msg += "\nErrors:\n" + "\n".join(error_msgs)
-            QMessageBox.information(self, "Delete Rule", msg)
-            self.rule_dashboard.load_rules()
-        except Exception as ex:
-            logger.error(f"Delete rule error: {ex}")
-            QMessageBox.critical(self, "Delete Rule Error", str(ex))
-
-    def run_etl_bfs(self):
-        try:
-            from rule_execution_and_bfs import execute_rules_with_conflicts_composites_bfs
-            executed, skipped = execute_rules_with_conflicts_composites_bfs(self.connection)
-            msg = f"ETL BFS Simulation:\nExecuted: {executed}\nSkipped: {list(skipped)}"
-            logger.info(msg)
-            QMessageBox.information(self, "ETL BFS Simulation", msg)
-            self.rule_dashboard.load_rules()
-        except Exception as ex:
-            logger.error(f"ETL BFS error: {ex}")
-            QMessageBox.critical(self, "ETL BFS Error", str(ex))
-
-    def simulate_single_rule(self):
-        selected = self.rule_dashboard.get_selected_rule_ids()
-        if len(selected) != 1:
-            QMessageBox.warning(self, "Selection Error", "Select exactly one rule for simulation.")
-            return
-        rid = selected[0]
-        try:
-            from rule_execution_and_bfs import SingleRuleSimulationDialog
-            dlg = SingleRuleSimulationDialog(self.connection, rid, self)
-            dlg.exec_()
-        except Exception as ex:
-            logger.error(f"Single rule simulation error: {ex}")
-            QMessageBox.critical(self, "Simulation Error", str(ex))
-
-    def check_due_schedules(self):
-        try:
-            from scheduling_and_simulations import check_due_schedules
-            check_due_schedules(self.connection)
-            self.scheduling_tab.load_schedules()
-        except Exception as ex:
-            logger.error(f"Schedule check error: {ex}")
-
-    def search_lineage(self):
-        text = self.lineage_search_edit.text().strip()
-        if not text:
-            self.lineage_view.reset_dim_highlight()
-        else:
-            self.lineage_view.dim_non_matches_and_highlight(text)
-
-    # ---------------------------
-    # Admin Impersonation
-    # ---------------------------
     def switch_user(self):
-        data = self.impersonate_combo.currentData()
+        data = self.impersonationCombo.currentData()
         if not data:
             return
         new_uid, new_group = data
@@ -565,57 +279,94 @@ class BRMTool(QMainWindow):
         self.user_id = new_uid
         self.user_group = new_group
         c = self.connection.cursor()
-        c.execute("SELECT USERNAME FROM USERS WHERE USER_ID = ?", (self.user_id,))
+        c.execute("SELECT USERNAME FROM USERS WHERE USER_ID=?", (self.user_id,))
         row = c.fetchone()
-        if row:
-            self.logged_in_username = row[0]
-        else:
-            self.logged_in_username = "UnknownUser"
-        QMessageBox.information(self, "Switched User", f"Now impersonating {self.logged_in_username} ({self.user_group}).")
-        # Refresh relevant tabs with new user data
-        self.approvals_tab.logged_in_username = self.logged_in_username
-        self.approvals_tab.user_group = self.user_group
-        self.approvals_tab.load_approvals()
-        self.rule_dashboard.user_id = self.user_id
-        self.rule_dashboard.user_group = self.user_group
-        self.rule_dashboard.load_rules()
-        if hasattr(self, "gcr_admin_tab"):
-            self.gcr_admin_tab.load_rule_list()
-        if hasattr(self, "hierarchy_tab"):
-            self.hierarchy_tab.load_hierarchy()
-        if hasattr(self, "alerts_tab"):
-            self.alerts_tab.check_alerts()
-        if hasattr(self, "group_mgmt_tab"):
-            self.group_mgmt_tab.user_id = self.user_id
-            self.group_mgmt_tab.user_group = self.user_group
-            self.group_mgmt_tab.load_data()
-        if hasattr(self, "user_mgmt_tab"):
-            self.user_mgmt_tab.load_users()
+        self.logged_in_username = row[0] if row else "UnknownUser"
+        QMessageBox.information(self, "Switched", f"Now impersonating {self.logged_in_username} ({self.user_group}).")
+        self.approvalTab.logged_in_username = self.logged_in_username
+        self.approvalTab.user_group = self.user_group
+        self.approvalTab.load_approvals()
+        self.ruleDashboard.user_id = self.user_id
+        self.ruleDashboard.user_group = self.user_group
+        self.ruleDashboard.load_rules()
+        if hasattr(self, "gcrAdminTab"):
+            self.gcrAdminTab.load_rule_list()
+            self.gcrAdminTab.load_link_view()
+        if hasattr(self, "hierarchyTab"):
+            self.hierarchyTab.load_hierarchy()
+        if hasattr(self, "alertsTab"):
+            self.alertsTab.check_alerts()
+        if hasattr(self, "groupMgmtTab"):
+            self.groupMgmtTab.user_id = self.user_id
+            self.groupMgmtTab.user_group = self.user_group
+            self.groupMgmtTab.load_data()
+        if hasattr(self, "userMgmtTab"):
+            self.userMgmtTab.load_users()
 
-    def load_impersonation_options(self):
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT USER_ID, USERNAME, USER_GROUP FROM USERS ORDER BY USER_ID")
-            for row in c.fetchall():
-                uid, uname, ugroup = row
-                display = f"{uname} ({ugroup})"
-                self.impersonate_combo.addItem(display, (uid, ugroup))
-        except Exception as ex:
-            logger.error(f"Error loading impersonation options: {ex}")
+    def sync_metadata(self):
+        from sync_metadata_module import sync_metadata_improved
+        msg = sync_metadata_improved(self.connection)
+        QMessageBox.information(self, "Sync Metadata", msg)
 
-    # ---------------------------
-    # Close and Cleanup
-    # ---------------------------
+    def run_data_validations(self):
+        run_all_data_validations(self.connection)
+        QMessageBox.information(self, "Data Validations", "Data validations executed.")
+
+    def show_performance_trends(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Performance Trends")
+        dlg.resize(800,600)
+        layout = QVBoxLayout(dlg)
+        perfWidget = MetricsDashboardTab(self.connection)
+        layout.addWidget(perfWidget)
+        closeBtn = QPushButton("Close")
+        closeBtn.clicked.connect(dlg.close)
+        layout.addWidget(closeBtn)
+        dlg.exec_()
+
+    def simulate_rule_chain(self):
+        dlg = ChainSimulationDialog(self.connection, self)
+        dlg.exec_()
+
+    def simulate_custom_group(self):
+        dlg = GroupSimulationDialog(self.connection, self)
+        dlg.exec_()
+
+    def open_audit_logs(self):
+        dlg = AuditLogViewer(self.connection, self.user_group, self)
+        dlg.exec_()
+
+    def open_rule_search(self):
+        dlg = RuleSearchDialog(self.connection, self.user_group, self)
+        dlg.exec_()
+
+    def open_version_history(self):
+        rid, ok = QInputDialog.getInt(self, "Version History", "Enter Rule ID:")
+        if ok:
+            dlg = VersionHistoryDialog(self.connection, rid, self)
+            dlg.exec_()
+
+    def check_schedules(self):
+        check_due_schedules(self.connection)
+        self.scheduleTab.load_schedules()
+
+    def show_help(self):
+        QMessageBox.information(self, "Help",
+            f"BRM Tool – Final Advanced Version\nLogged in as: {self.logged_in_username} ({self.user_group})\n"
+            "Use the tabs to manage business rules, approvals, scheduling, lineage, custom groups, metrics, etc.")
+
     def closeEvent(self, event):
-        try:
-            if self.connection:
+        if self.connection:
+            try:
                 self.connection.close()
-        except Exception as ex:
-            logger.error(f"Error closing connection: {ex}")
+            except Exception as ex:
+                logger.error(f"Error closing connection: {ex}")
         event.accept()
 
-
-if __name__ == '__main__':
+# =====================================================
+# Main Entrypoint
+# =====================================================
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     tool = BRMTool()
     tool.show()
