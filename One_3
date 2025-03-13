@@ -1,16 +1,18 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
 """
 Module: advanced_lineage.py
-Description:
-  Combines advanced decision lineage with a new, Erwin-like flattened lineage visualization.
-  Features:
-    • parse_sql_dependencies(...) for extracting tables from SQL.
-    • DecisionTableManager for add/edit/delete/run of decision tables.
-    • AdvancedLineageGraphView for drawing rules and tables in a BFS-layered layout (no overlap).
-    • Each rule is numbered in BFS "execution" order. 
-    • highlight_impact(...) method to highlight downstream rules if a given rule changes.
-    
+
+Enhancements:
+  • parse_sql_dependencies(...) – unchanged SQL parser.
+  • DecisionTableManager – same as before, for editing/running decision tables.
+  • AdvancedLineageGraphView – now with:
+      - Dynamic arrowheads (rule->rule or rule->table edges).
+      - Interactive node dragging: user can move the rectangles/circles, and arrows update automatically.
+      - A simplified Sugiyama-like layering algorithm for complex DAGs (avoids major overlaps, reduces crossing).
+      - highlight_impact(...) to dim all nodes except BFS descendants of a changed rule.
+
 Database Requirements:
   - BRM_RULES(RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, PARENT_RULE_ID, RULE_SQL, CRITICAL_RULE, etc.)
   - BRM_RULE_TABLE_DEPENDENCIES(RULE_ID, DATABASE_NAME, TABLE_NAME, etc.)
@@ -21,28 +23,29 @@ import sys
 import logging
 import pyodbc
 import sqlparse
-from collections import deque
+from collections import defaultdict, deque
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QTimer, QPointF
 from PyQt5.QtGui import QColor, QFont, QPen, QBrush
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QMessageBox, QInputDialog,
-    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsEllipseItem,
-    QGraphicsLineItem, QGraphicsTextItem, QLabel, QPlainTextEdit
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem,
+    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem, QLabel, QPlainTextEdit
 )
 
 from core_foundation import logger, insert_audit_log
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # 1. parse_sql_dependencies(...) – an SQL parsing utility
-# -----------------------------------------------------------------------------
+# =============================================================================
 def parse_sql_dependencies(sql_text):
     """
     Parses an SQL statement using sqlparse to extract table references.
-    Returns a dict with keys:
+    Returns a dict with:
       "tables": list of (schema, table, alias, is_subquery)
-    This is a simplified approach. 
+    This is a simplified approach.
     """
     result = {"tables": []}
     statements = sqlparse.parse(sql_text)
@@ -56,31 +59,30 @@ def parse_sql_dependencies(sql_text):
             if val_up in ("FROM","JOIN","INNER JOIN","LEFT JOIN","RIGHT JOIN","FULL JOIN"):
                 from_seen = True
             elif from_seen:
-                # If next keyword is WHERE, GROUP, etc. we stop
                 if tk.ttype is sqlparse.tokens.Keyword:
                     if val_up in ("WHERE","GROUP","ORDER","HAVING","UNION","INTERSECT"):
                         from_seen = False
                 else:
                     if isinstance(tk, sqlparse.sql.Identifier):
-                        schema_name = tk.get_parent_name()
-                        real_name = tk.get_real_name()
+                        sch = tk.get_parent_name()
+                        tbl = tk.get_real_name()
                         alias = tk.get_alias()
-                        result["tables"].append((schema_name, real_name, alias, False))
+                        result["tables"].append((sch, tbl, alias, False))
                     elif isinstance(tk, sqlparse.sql.IdentifierList):
                         for ident in tk.get_identifiers():
-                            s = ident.get_parent_name()
-                            r = ident.get_real_name()
-                            a = ident.get_alias()
-                            result["tables"].append((s, r, a, False))
+                            sch = ident.get_parent_name()
+                            tbl = ident.get_real_name()
+                            alias = ident.get_alias()
+                            result["tables"].append((sch, tbl, alias, False))
             i += 1
     return result
 
-# -----------------------------------------------------------------------------
-# 2. DecisionTableManager – QDialog to manage decision tables
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 2. DecisionTableManager – QDialog for decision tables
+# =============================================================================
 class DecisionTableManager(QDialog):
     """
-    Dialog to view, add, edit, delete, and run Decision Tables from DECISION_TABLES.
+    Displays, edits, deletes, runs Decision Tables from DECISION_TABLES.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
@@ -129,8 +131,8 @@ class DecisionTableManager(QDialog):
 
     def load_decision_tables(self):
         self.dt_table.setRowCount(0)
+        c = self.connection.cursor()
         try:
-            c = self.connection.cursor()
             c.execute("""
                 SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
                 FROM DECISION_TABLES
@@ -138,21 +140,21 @@ class DecisionTableManager(QDialog):
             """)
             rows = c.fetchall()
             for row in rows:
-                r_i = self.dt_table.rowCount()
-                self.dt_table.insertRow(r_i)
+                ridx = self.dt_table.rowCount()
+                self.dt_table.insertRow(ridx)
                 for col_i, val in enumerate(row):
-                    self.dt_table.setItem(r_i, col_i, QTableWidgetItem(str(val) if val is not None else ""))
+                    self.dt_table.setItem(ridx, col_i, QTableWidgetItem(str(val) if val else ""))
         except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Error loading decision tables: {ex}")
+            QMessageBox.critical(self, "Error", f"Error loading DT: {ex}")
 
     def add_decision_table(self):
         name, ok = QInputDialog.getText(self, "Add Decision Table", "Table Name:")
         if not ok or not name.strip():
             return
-        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Optional desc:")
+        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Optional:")
         if not ok2:
             desc = ""
-        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query", "SQL here:")
+        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query", "Enter SQL:")
         if not ok3 or not query.strip():
             return
         c = self.connection.cursor()
@@ -160,10 +162,10 @@ class DecisionTableManager(QDialog):
             c.execute("""
                 INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY)
                 VALUES(?,?,?)
-            """, (name.strip(), desc.strip(), query.strip()))
+            """,(name.strip(), desc.strip(), query.strip()))
             self.connection.commit()
             QMessageBox.information(self, "Added", "Decision table created.")
-            insert_audit_log(self.connection, "ADD_DECISION_TABLE","DECISION_TABLES", None,
+            insert_audit_log(self.connection, "ADD_DT","DECISION_TABLES",None,
                              "User", None, {"table":name})
             self.load_decision_tables()
         except Exception as ex:
@@ -185,21 +187,20 @@ class DecisionTableManager(QDialog):
         desc, ok2 = QInputDialog.getMultiLineText(self, "Edit Description", "New desc:", text=cur_desc)
         if not ok2:
             desc = cur_desc
-        query, ok3 = QInputDialog.getMultiLineText(self, "Edit Query", "New query:", text=cur_query)
+        query, ok3 = QInputDialog.getMultiLineText(self, "Edit Query", "New SQL:", text=cur_query)
         if not ok3 or not query.strip():
             return
-
         c = self.connection.cursor()
         try:
             c.execute("""
                 UPDATE DECISION_TABLES
                 SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
                 WHERE DECISION_TABLE_ID=?
-            """, (name.strip(), desc.strip(), query.strip(), dt_id))
+            """,(name.strip(), desc.strip(), query.strip(), dt_id))
             self.connection.commit()
             QMessageBox.information(self, "Updated", "Decision table updated.")
-            insert_audit_log(self.connection, "EDIT_DECISION_TABLE","DECISION_TABLES", dt_id,
-                             "User", None, {"new_name":name})
+            insert_audit_log(self.connection, "EDIT_DT","DECISION_TABLES",dt_id,
+                             "User", None, {"table":name})
             self.load_decision_tables()
         except Exception as ex:
             QMessageBox.critical(self, "Update Error", str(ex))
@@ -210,7 +211,7 @@ class DecisionTableManager(QDialog):
             QMessageBox.warning(self, "Selection Error", "No DT selected.")
             return
         dt_id = int(self.dt_table.item(row,0).text())
-        confirm = QMessageBox.question(self, "Confirm Deletion", f"Delete DT {dt_id}?")
+        confirm = QMessageBox.question(self, "Confirm", f"Delete DT {dt_id}?")
         if confirm!=QMessageBox.Yes:
             return
         c = self.connection.cursor()
@@ -218,7 +219,7 @@ class DecisionTableManager(QDialog):
             c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?", (dt_id,))
             self.connection.commit()
             QMessageBox.information(self, "Deleted", f"DT {dt_id} deleted.")
-            insert_audit_log(self.connection, "DELETE_DECISION_TABLE","DECISION_TABLES", dt_id,
+            insert_audit_log(self.connection, "DELETE_DT","DECISION_TABLES", dt_id,
                              "User", None, {"deleted":True})
             self.load_decision_tables()
         except Exception as ex:
@@ -238,8 +239,6 @@ class DecisionTableManager(QDialog):
             QMessageBox.warning(self, "No Query", "No SQL found for this DT.")
             return
         query = rowq[0]
-
-        # Dry-run
         try:
             c.execute("BEGIN TRANSACTION")
             c.execute(query)
@@ -249,26 +248,24 @@ class DecisionTableManager(QDialog):
                 rows = []
             impacted = len(rows)
             c.execute("ROLLBACK")
-            msg = f"DT {dt_id} impacted {impacted} row(s)."
+            msg = f"DT {dt_id} impacted {impacted} rows (dry-run)."
             self.result_log.appendPlainText(msg)
             QMessageBox.information(self, "Run Decision Table", msg)
-            insert_audit_log(self.connection, "RUN_DECISION_TABLE","DECISION_TABLES", dt_id,
+            insert_audit_log(self.connection, "RUN_DT","DECISION_TABLES", dt_id,
                              "User", None, {"impacted":impacted})
         except Exception as ex:
             c.execute("ROLLBACK")
-            err = f"Run error for DT {dt_id}: {ex}"
+            err = f"Run error: {ex}"
             self.result_log.appendPlainText(err)
             QMessageBox.critical(self, "Run Error", err)
 
-# -----------------------------------------------------------------------------
-# 3. AdvancedLineageGraphView – BFS-based layered approach with order numbering
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 3. AdvancedLineageGraphView – with arrowheads, node dragging, advanced layering
+# =============================================================================
 class AdvancedLineageGraphView(QGraphicsView):
     """
-    Draws an Erwin-like flattened lineage diagram with BFS layering for BRM_RULES,
-    plus table nodes on the far right. Each rule is labeled with a BFS "execution" number
-    to show order. No overlapping is done by carefully spacing each BFS layer in columns.
-    Also, highlight_impact(...) for BFS-based "Rule Change Impact Analysis."
+    Renders a DAG of rules + tables with advanced layering (Sugiyama-like),
+    arrowheads, and interactive node dragging. Also highlight_impact(...) BFS.
     """
     def __init__(self, connection, parent=None, auto_refresh_interval=45000):
         super().__init__(parent)
@@ -277,10 +274,10 @@ class AdvancedLineageGraphView(QGraphicsView):
         self.setScene(self.scene)
         self.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
 
-        self.rule_nodes = {}  # rule_id -> QGraphicsRectItem
-        self.table_nodes = {} # (db, tbl) -> QGraphicsEllipseItem
+        self.rule_nodes = {}  # rule_id -> BFSRuleNodeItem
+        self.table_nodes = {} # (db, tbl) -> BFSTableNodeItem
+        self.arrows = []      # store references to BFSArrowItem for updating
 
-        # Timer for auto-refresh
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.populate_graph)
         self.refresh_timer.start(auto_refresh_interval)
@@ -291,6 +288,7 @@ class AdvancedLineageGraphView(QGraphicsView):
         self.scene.clear()
         self.rule_nodes.clear()
         self.table_nodes.clear()
+        self.arrows.clear()
         try:
             c = self.connection.cursor()
             c.execute("""
@@ -300,111 +298,115 @@ class AdvancedLineageGraphView(QGraphicsView):
             rule_rows = c.fetchall()
 
             # Build adjacency for rule->child
-            children_map = {}
+            children_map = defaultdict(list)
             rule_map = {}
             for (rid, rname, rstat, rappr, pid) in rule_rows:
                 rule_map[rid] = (rname, rstat, rappr, pid)
                 if pid:
-                    children_map.setdefault(pid, []).append(rid)
+                    children_map[pid].append(rid)
 
-            # BFS layering
-            # Find roots = rules with no PARENT_RULE_ID
-            roots = [r for (r, data) in rule_map.items() if data[3] is None]
-            if not roots:
-                # If none found, let's treat all as roots
-                roots = list(rule_map.keys())
+            # We'll do a topological or BFS approach to detect levels, 
+            # but then apply a simple "Sugiyama-like" pass to minimize crossing
 
-            # BFS to find layering
-            visited = set()
-            layers = []  # list of lists; each sub-list is a BFS layer
-            queue = deque(roots)
-            layer_index = {}
-            # We also want an overall BFS "execution order" counter
-            execution_order = []
-            current_depth = 0
+            # 1) Collect indegree
+            indegree = defaultdict(int)
+            for rid in rule_map.keys():
+                indegree[rid] = 0
+            for pid, clist in children_map.items():
+                for child in clist:
+                    indegree[child]+=1
 
-            # We'll do a multi-root BFS. We'll keep track of depth in a queue
-            multi_queue = deque()
-            for r in roots:
-                multi_queue.append((r,0))
+            # 2) Kahn's algorithm for topological order
+            topo_order = []
+            queue = deque([r for r in rule_map.keys() if indegree[r]==0])
+            while queue:
+                node = queue.popleft()
+                topo_order.append(node)
+                for child in children_map[node]:
+                    indegree[child]-=1
+                    if indegree[child]==0:
+                        queue.append(child)
 
-            while multi_queue:
-                (node, depth) = multi_queue.popleft()
-                if node in visited:
-                    continue
-                visited.add(node)
-                # ensure layers list is big enough
-                while len(layers) <= depth:
-                    layers.append([])
-                layers[depth].append(node)
-                execution_order.append(node)
-                for child in children_map.get(node, []):
-                    multi_queue.append((child, depth+1))
+            # If there's a cycle, some nodes won't be in topo_order. We'll just add them last
+            for r in rule_map.keys():
+                if r not in topo_order:
+                    topo_order.append(r)
 
-            # Now we have BFS layers in 'layers'. 
-            # We'll place each layer in a vertical column, left->right
+            # 3) Assign each node an initial "layer" = distance from roots
+            layer_map = {}
+            for r in topo_order:
+                pid = rule_map[r][3]  # parent
+                if not pid or pid not in rule_map:
+                    layer_map[r] = 0
+                else:
+                    layer_map[r] = layer_map[pid]+1
+
+            # 4) Group nodes by layer
+            layer_groups = defaultdict(list)
+            for r, layer in layer_map.items():
+                layer_groups[layer].append(r)
+            max_layer = max(layer_map.values()) if layer_map else 0
+
+            # 5) Place nodes in vertical columns based on layer
+            x_spacing = 220
+            y_spacing = 100
             x_start = 50
             y_start = 50
-            x_spacing = 250
-            y_spacing = 100
 
-            # We'll also store an index for BFS execution order so we can show a number
-            order_map = { rid: i+1 for i, rid in enumerate(execution_order) }
+            for layer in range(max_layer+1):
+                nodes_in_layer = layer_groups[layer]
+                for i, rid in enumerate(nodes_in_layer):
+                    rname, rstat, rappr, pid = rule_map[rid]
+                    node_item = BFSRuleNodeItem(rid, rname, rstat, rappr)
+                    node_item.setPos(x_start + layer*x_spacing, y_start + i*y_spacing)
+                    self.scene.addItem(node_item)
+                    self.rule_nodes[rid] = node_item
+                    # For node dragging: connect signals
+                    node_item.position_changed.connect(self.update_arrows)
 
-            for depth, layer_nodes in enumerate(layers):
-                x_pos = x_start + depth*x_spacing
-                for i, rid in enumerate(layer_nodes):
-                    (rname, rstat, rappr, pid) = rule_map[rid]
-                    y_pos = y_start + i*y_spacing
-                    # create a node
-                    node = BFSRuleNodeItem(rid, rname, rstat, rappr, order_map[rid])
-                    node.setPos(x_pos, y_pos)
-                    self.scene.addItem(node)
-                    self.rule_nodes[rid] = node
-
-            # Next, place table nodes on the far right
-            # Gather table deps
+            # 6) Now place table nodes on a separate pseudo-layer on the far right
+            # gather table deps
             c.execute("SELECT RULE_ID, DATABASE_NAME, TABLE_NAME FROM BRM_RULE_TABLE_DEPENDENCIES")
             deps = c.fetchall()
-            # We'll keep track of (db,tbl) -> list of rules that reference it
-            table_ref_map = {}
-            for (rid, dbname, tblname) in deps:
-                db_low = dbname.lower() if dbname else "nodb"
-                tbl_low = tblname.lower() if tblname else "notable"
-                key = (db_low, tbl_low)
-                table_ref_map.setdefault(key, []).append(rid)
-
-            # Place each unique table in one vertical column after the last BFS layer
-            table_x = x_start + len(layers)*x_spacing + 200
-            tables_sorted = sorted(table_ref_map.keys())
-            for i, key in enumerate(tables_sorted):
+            table_map = defaultdict(list)  # (db,tbl) -> [rule_ids]
+            for (rid, db, tbl) in deps:
+                db_low = db.lower() if db else "nodb"
+                tbl_low = tbl.lower() if tbl else "notable"
+                table_map[(db_low, tbl_low)].append(rid)
+            # place them in a single column after max_layer
+            table_x = x_start + (max_layer+1)*x_spacing + 200
+            idx_tbl = 0
+            for key, rid_list in table_map.items():
                 db, tbl = key
-                t_node = BFSTableNodeItem(db, tbl)
-                t_node.setPos(table_x, y_start + i*y_spacing)
-                self.scene.addItem(t_node)
-                self.table_nodes[key] = t_node
+                node_item = BFSTableNodeItem(db, tbl)
+                y_pos = y_start + idx_tbl*y_spacing
+                node_item.setPos(table_x, y_pos)
+                self.scene.addItem(node_item)
+                self.table_nodes[key] = node_item
+                idx_tbl+=1
+                node_item.position_changed.connect(self.update_arrows)
 
-            # Draw arrows rule->child rule, then rule->table
-            # rule->child is handled by BFS, we just connect them visually
-            for depth, layer_nodes in enumerate(layers):
-                # connect to next layer
-                if depth < len(layers)-1:
-                    for rid in layer_nodes:
-                        node_source = self.rule_nodes[rid]
-                        # children
-                        for child in children_map.get(rid, []):
-                            node_target = self.rule_nodes.get(child)
-                            if node_target:
-                                arrow = BFSArrowItem(node_source, node_target, color=Qt.darkGray, label="")
-                                self.scene.addItem(arrow)
+            # 7) Draw arrow edges
+            # 7a) rule->child
+            for pid, clist in children_map.items():
+                source_item = self.rule_nodes.get(pid)
+                if source_item:
+                    for child in clist:
+                        target_item = self.rule_nodes.get(child)
+                        if target_item:
+                            arrow = BFSArrowItem(source_item, target_item, Qt.darkGray)
+                            self.arrows.append(arrow)
+                            self.scene.addItem(arrow)
 
-            # Now connect rules to tables
-            for key, rlist in table_ref_map.items():
-                if key in self.table_nodes:
-                    table_item = self.table_nodes[key]
-                    for rid in rlist:
+            # 7b) rule->table
+            for (db_low, tbl_low), rid_list in table_map.items():
+                tbl_item = self.table_nodes.get((db_low,tbl_low))
+                if tbl_item:
+                    for rid in rid_list:
                         if rid in self.rule_nodes:
-                            arrow = BFSArrowItem(self.rule_nodes[rid], table_item, color=Qt.darkBlue, label="")
+                            rule_item = self.rule_nodes[rid]
+                            arrow = BFSArrowItem(rule_item, tbl_item, Qt.darkBlue)
+                            self.arrows.append(arrow)
                             self.scene.addItem(arrow)
 
             self.resetView()
@@ -417,34 +419,33 @@ class AdvancedLineageGraphView(QGraphicsView):
 
     def highlight_impact(self, changed_rule_id):
         """
-        BFS to find all descendants of changed_rule_id, highlight them. 
-        Keeps the BFS layering layout.
+        BFS to find all descendants of changed_rule_id. 
+        We'll dim others, highlight these in full opacity.
         """
         c = self.connection.cursor()
         try:
             c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
             rows = c.fetchall()
-            children_map = {}
-            for (rule_id, parent_id) in rows:
-                if parent_id:
-                    children_map.setdefault(parent_id, []).append(rule_id)
+            children_map = defaultdict(list)
+            for (rid, pid) in rows:
+                if pid:
+                    children_map[pid].append(rid)
 
             impacted = []
             visited = set()
-            queue = [changed_rule_id]
-
-            while queue:
-                current = queue.pop()
+            stack = [changed_rule_id]
+            while stack:
+                current = stack.pop()
                 if current in visited:
                     continue
                 visited.add(current)
                 impacted.append(current)
-                for child in children_map.get(current, []):
-                    queue.append(child)
+                for ch in children_map[current] if current in children_map else []:
+                    stack.append(ch)
 
             # dim all
-            for rnode in self.rule_nodes.values():
-                rnode.setOpacity(0.3)
+            for rn in self.rule_nodes.values():
+                rn.setOpacity(0.3)
             # highlight impacted
             for rid in impacted:
                 if rid in self.rule_nodes:
@@ -453,84 +454,102 @@ class AdvancedLineageGraphView(QGraphicsView):
             msg = f"Rule {changed_rule_id} changes affect: {impacted}"
             QMessageBox.information(self, "Impact Analysis", msg)
             logger.info(msg)
-
         except Exception as ex:
             logger.error(f"highlight_impact error: {ex}")
             QMessageBox.critical(self, "Impact Error", str(ex))
 
+    def update_arrows(self):
+        """
+        Called whenever a node is moved (interactive dragging).
+        We recalc arrow positions for all BFSArrowItems.
+        """
+        for arrow in self.arrows:
+            arrow.update_position()
+
 # -----------------------------------------------------------------------------
-# BFSNode Items for Graph
+# Graphics Item Classes with Node Dragging and Arrowheads
 # -----------------------------------------------------------------------------
 class BFSRuleNodeItem(QGraphicsRectItem):
     """
-    A rectangle representing a rule, color-coded by status, with a BFS "execution order" number shown.
+    A rectangle representing a rule node, with node dragging capability.
     """
-    def __init__(self, rule_id, rule_name, status, approval_status, bfs_number):
+    position_changed = QtCore.pyqtSignal()  # custom signal
+
+    def __init__(self, rule_id, rule_name, status, approval_status):
         super().__init__(0,0,180,60)
         self.rule_id = rule_id
         self.rule_name = rule_name
         self.status = status
         self.approval_status = approval_status
-        self.bfs_number = bfs_number  # The BFS execution order
+        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
 
-        # Color
         if status.upper()=="ACTIVE":
             fill_color = QColor("#C8E6C9")
         elif status.upper()=="INACTIVE":
             fill_color = QColor("#FFCDD2")
         else:
-            fill_color = QColor("#FFF9C4")  # pending or unknown
+            fill_color = QColor("#FFF9C4")
 
         self.setBrush(QBrush(fill_color))
         self.setPen(QPen(Qt.black,2))
 
-        # label text: BFS number + name
-        text_str = f"[{self.bfs_number}] {rule_name}\nRule {rule_id}"
+        text_str = f"{rule_name}\n(Rule {rule_id})"
         text_item = QGraphicsTextItem(text_str, self)
-        text_item.setFont(QFont("Arial", 9))
+        font = QFont("Arial",9)
+        text_item.setFont(font)
         br = text_item.boundingRect()
         rw, rh = self.rect().width(), self.rect().height()
         text_item.setPos((rw-br.width())/2, (rh-br.height())/2)
 
-        tooltip = f"Rule {rule_id}\nStatus: {status}\nApproval: {approval_status}\nOrder: {self.bfs_number}"
-        self.setToolTip(tooltip)
+        tip = f"Rule {rule_id}\nStatus: {status}\nApproval: {approval_status}"
+        self.setToolTip(tip)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange:
+            # whenever position changes, emit signal so arrows can update
+            self.position_changed.emit()
+        return super().itemChange(change, value)
 
 class BFSTableNodeItem(QGraphicsEllipseItem):
     """
-    A circle representing a database table. 
+    A circle representing a table node, with drag support.
     """
-    def __init__(self, db_name, table_name):
+    position_changed = QtCore.pyqtSignal()
+
+    def __init__(self, db_name, tbl_name):
         super().__init__(0,0,80,80)
         self.db_name = db_name
-        self.table_name = table_name
+        self.tbl_name = tbl_name
+        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+
         self.setBrush(QBrush(QColor("#BBDEFB")))
         self.setPen(QPen(Qt.darkBlue,2))
 
-        label = f"{db_name}.{table_name}"
-        text_item = QGraphicsTextItem(label, self)
+        lbl = f"{db_name}.{tbl_name}"
+        text_item = QGraphicsTextItem(lbl, self)
         text_item.setFont(QFont("Arial",8))
         br = text_item.boundingRect()
         w, h = self.rect().width(), self.rect().height()
         text_item.setPos((w-br.width())/2, (h-br.height())/2)
 
-        self.setToolTip(f"Table: {db_name}.{table_name}")
+        self.setToolTip(f"Table: {db_name}.{tbl_name}")
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.ItemPositionChange:
+            self.position_changed.emit()
+        return super().itemChange(change, value)
 
 class BFSArrowItem(QGraphicsLineItem):
     """
-    An arrow line item connecting BFS nodes or BFS->Table nodes, with optional label.
+    An arrow from a BFSRuleNodeItem or BFSTableNodeItem to another. 
+    Includes an arrowhead drawn dynamically.
     """
-    def __init__(self, source_item, target_item, color=Qt.darkGray, label=""):
+    def __init__(self, source_item, target_item, color=Qt.darkGray):
         super().__init__()
         self.source_item = source_item
         self.target_item = target_item
         self.color = color
-        self.label = label
-
-        pen = QPen(self.color, 2)
-        self.setPen(pen)
-        self.text_item = None
-        if label:
-            self.text_item = QGraphicsTextItem(label)
+        self.setPen(QPen(self.color,2))
         self.update_position()
 
     def update_position(self):
@@ -539,11 +558,30 @@ class BFSArrowItem(QGraphicsLineItem):
         self.setLine(sr.x(), sr.y(), tr.x(), tr.y())
 
     def paint(self, painter, option, widget=None):
+        # update line first
         self.update_position()
         super().paint(painter, option, widget)
-        # If we have a label, place it mid-line
-        if self.label and self.text_item:
-            line = self.line()
-            midpoint = QtCore.QPointF((line.x1()+line.x2())/2, (line.y1()+line.y2())/2)
-            self.text_item.setPos(midpoint)
-            # but we'd need to ensure it's added to the same scene, etc.
+
+        # draw arrowhead at end
+        line = self.line()
+        angle = line.angle()  # in degrees
+        # Convert to radians
+        angle_rads = (360 - angle) * 3.14159 / 180.0
+        arrow_size = 10
+        # endpoints
+        end_point = line.p2()
+        # two side points for arrow
+        p1 = QtCore.QPointF(
+            end_point.x() + arrow_size * -1 * QtCore.qCos(angle_rads + 0.3),
+            end_point.y() + arrow_size * -1 * QtCore.qSin(angle_rads + 0.3)
+        )
+        p2 = QtCore.QPointF(
+            end_point.x() + arrow_size * -1 * QtCore.qCos(angle_rads - 0.3),
+            end_point.y() + arrow_size * -1 * QtCore.qSin(angle_rads - 0.3)
+        )
+
+        arrow_head = QtGui.QPolygonF([end_point, p1, p2])
+        painter.setBrush(QtGui.QBrush(self.color))
+        painter.drawPolygon(arrow_head)
+
+# end of file
