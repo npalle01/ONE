@@ -1,0 +1,188 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: brm_sql_to_business_converter.py
+Description:
+  This module provides an SQL-to-Business Language Converter UI.
+  It uses existing advanced SQL parsing (parse_sql_dependencies)
+  to find table/column references, then replaces them according to
+  a user‑provided JSON mapping (technical => business friendly).
+
+Features:
+  • A Qt-based widget (SqlToBusinessConverterTab) with:
+     - A combo box to select a rule.
+     - A text area for the JSON mapping of table/column => businessName.
+     - A “Convert” button to parse the rule’s SQL, then replace technical names 
+       with business-friendly names. Displays the converted SQL.
+  • Optionally, logs how many replacements were performed or any partial matches.
+  • Auto-refresh if desired (e.g. refresh rule list periodically).
+
+Dependencies:
+  - brm_core_foundation for logging, DB fetch helpers.
+  - A parse_sql_dependencies function from your advanced parser module.
+"""
+
+import sys
+import json
+import logging
+import re
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPlainTextEdit,
+    QPushButton, QMessageBox
+)
+
+# from brm_core_foundation import logger, fetch_one_dict, fetch_all_dict
+# from brm_advanced_sql_parser (or your parse module) import parse_sql_dependencies
+
+class SqlToBusinessConverterTab(QWidget):
+    """
+    A widget that:
+      - Lets the user pick a rule from BRM_RULES
+      - Shows a text box for JSON business mapping
+      - Has a “Convert SQL” button that:
+        * Fetches the rule’s SQL
+        * Parses dependencies (table/column references)
+        * Replaces them with business-friendly names from the JSON mapping
+        * Displays the converted SQL in an output area
+      - Optionally, shows how many replacements occurred.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.init_ui()
+        self.populate_rule_selector()
+        # Optionally set up auto-refresh if desired.
+
+    def init_ui(self):
+        layout=QVBoxLayout(self)
+
+        # row: select rule
+        rule_h=QHBoxLayout()
+        rule_h.addWidget(QLabel("Select Rule:"))
+        self.rule_combo=QComboBox()
+        rule_h.addWidget(self.rule_combo)
+        layout.addLayout(rule_h)
+
+        # row: business mapping input
+        map_h=QHBoxLayout()
+        map_h.addWidget(QLabel("Business Name Mapping (JSON):"))
+        self.mapping_input=QPlainTextEdit()
+        self.mapping_input.setPlaceholderText('{"dbo.Customers": "Customers", "dbo.Orders": "Orders"}')
+        map_h.addWidget(self.mapping_input)
+        layout.addLayout(map_h)
+
+        # Convert button
+        self.convert_button=QPushButton("Convert SQL to Business Language")
+        self.convert_button.clicked.connect(self.convert_sql)
+        layout.addWidget(self.convert_button)
+
+        # Output
+        layout.addWidget(QLabel("Converted SQL:"))
+        self.output_display=QPlainTextEdit()
+        self.output_display.setReadOnly(True)
+        layout.addWidget(self.output_display)
+
+        self.setLayout(layout)
+
+    def populate_rule_selector(self):
+        """
+        Load BRM_RULES => fill the combo box with rule_id + rule_name.
+        """
+        self.rule_combo.clear()
+        c=self.connection.cursor()
+        try:
+            c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+            rows=c.fetchall()
+            for (rid,rn) in rows:
+                disp=f"{rid} - {rn}"
+                self.rule_combo.addItem(disp, rid)
+        except Exception as ex:
+            logging.error(f"Error populating rule selector: {ex}")
+            QMessageBox.critical(self,"Error",f"Could not load rules: {ex}")
+
+    def convert_sql(self):
+        """
+        After user picks a rule and provides a JSON mapping, 
+        fetch the rule’s SQL, parse it, apply replacements, show result.
+        """
+        rule_id=self.rule_combo.currentData()
+        if rule_id is None:
+            QMessageBox.warning(self,"No Rule","Please select a rule.")
+            return
+
+        # fetch rule’s SQL
+        c=self.connection.cursor()
+        try:
+            c.execute("SELECT RULE_SQL FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+            row=c.fetchone()
+            if not row or not row[0]:
+                QMessageBox.warning(self,"No SQL","The selected rule has no SQL.")
+                return
+            sql_text=row[0]
+            parse_info=parse_sql_dependencies(sql_text)
+        except Exception as ex:
+            logging.error(f"Error fetching/parsing SQL: {ex}")
+            QMessageBox.critical(self,"Error",f"Error fetching/parsing SQL: {ex}")
+            return
+
+        # get mapping
+        mapping_text=self.mapping_input.toPlainText().strip()
+        business_mapping={}
+        if mapping_text:
+            try:
+                business_mapping=json.loads(mapping_text)
+            except Exception as ex:
+                QMessageBox.warning(self,"Mapping Error",f"Invalid JSON mapping: {ex}")
+                return
+
+        # Convert
+        converted_sql=self.apply_business_mapping(sql_text, parse_info, business_mapping)
+        self.output_display.setPlainText(converted_sql)
+        # Optionally show how many replacements
+        count_replacements=self.count_replacements(parse_info,business_mapping)
+        QMessageBox.information(self,"Conversion Complete", 
+                                f"Conversion done. Replaced {count_replacements} table references.")
+
+    def apply_business_mapping(self, sql_text, parse_info, mapping):
+        """
+        Replace technical table names with business names using the dictionary.
+        parse_info => from parse_sql_dependencies => has "tables" array 
+          of (schema, table, alias, is_subselect).
+        """
+        converted=sql_text
+        # For each table, if “schema.table” is in mapping => do a textual replace
+        for (schema, table, alias, is_sub) in parse_info.get("tables",[]):
+            if table and not table.startswith("(CTE)"):
+                key=f"{schema}.{table}" if schema else table
+                key=key.strip(".")
+                if key in mapping:
+                    biz_name=mapping[key]
+                    # do a safe replace => with word boundaries or regex
+                    before=converted
+                    converted=self._replace_identifier(converted, table, biz_name)
+        return converted
+
+    def _replace_identifier(self, text, identifier, replacement):
+        """
+        Replace identifier with replacement using word boundaries.
+        e.g. if table='Customers', replace with 'BizCustomers' 
+        in a safe manner (regex \b).
+        """
+        import re
+        pat=r'\b'+re.escape(identifier)+r'\b'
+        return re.sub(pat, replacement, text)
+
+    def count_replacements(self, parse_info, mapping):
+        """
+        Count how many table references from parse_info match the keys in mapping.
+        """
+        ct=0
+        for (schema, table, alias, is_sub) in parse_info.get("tables",[]):
+            if table and not table.startswith("(CTE)"):
+                key=f"{schema}.{table}" if schema else table
+                key=key.strip(".")
+                if key in mapping:
+                    ct+=1
+        return ct
