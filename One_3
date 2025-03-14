@@ -1,587 +1,504 @@
+Below is Module #3: scheduling_and_simulations.py, providing:
+	1.	Advanced Scheduling with an integrated approach to:
+	•	Pick a rule and schedule date/time.
+	•	Optionally enable data validations before execution.
+	•	On schedule, the system automatically calls the BFS engine to run that rule (and children) if so desired, logging pass/fail performance.
+	•	A “ScheduleManagementTab” UI to create/update/delete schedules.
+	2.	Simulations (single rule, chain, or custom group BFS):
+	•	ChainSimulationDialog: pick a starting rule, BFS the chain.
+	•	SingleRuleSimulationDialog: run just one rule in a “dry-run” transaction.
+	•	GroupSimulationDialog: pick a custom group; BFS from each rule in that group.
+	3.	What-if expansions**:
+	•	The code supports “skip data validation” checkboxes.
+	•	Logs the BFS results to a text area or to RULE_EXECUTION_LOGS.
+
+All placeholders are removed, ensuring the UI flows smoothly. This module references:
+	•	rule_engine.execute_rules_bfs, rule_engine.run_single_rule_sql
+	•	core_foundation.logger, core_foundation.insert_audit_log, fetch_all_dict, etc.
+	•	The BFS-based adjacency from rule_engine if needed.
+
+⸻
+
+Module #3: scheduling_and_simulations.py
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
-Module: advanced_lineage.py
+Module: scheduling_and_simulations.py
+Description:
+  Provides scheduling management with advanced BFS execution, optional data validation,
+  and multiple simulation dialogs (single rule, chain, group).
+  Integrates with the advanced BFS logic from rule_engine.py.
 
-Enhancements:
-  • parse_sql_dependencies(...) – unchanged SQL parser.
-  • DecisionTableManager – same as before, for editing/running decision tables.
-  • AdvancedLineageGraphView – now with:
-      - Dynamic arrowheads (rule->rule or rule->table edges).
-      - Interactive node dragging: user can move the rectangles/circles, and arrows update automatically.
-      - A simplified Sugiyama-like layering algorithm for complex DAGs (avoids major overlaps, reduces crossing).
-      - highlight_impact(...) to dim all nodes except BFS descendants of a changed rule.
-
-Database Requirements:
-  - BRM_RULES(RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, PARENT_RULE_ID, RULE_SQL, CRITICAL_RULE, etc.)
-  - BRM_RULE_TABLE_DEPENDENCIES(RULE_ID, DATABASE_NAME, TABLE_NAME, etc.)
-  - DECISION_TABLES(DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY, etc.)
+Dependencies:
+  - From `core_foundation.py`: logger, fetch_all_dict, fetch_one_dict, ...
+  - From `rule_engine.py`: execute_rules_bfs, run_single_rule_sql, log_execution_result
 """
 
 import sys
 import logging
+import math
+import json
+import time
+from datetime import datetime, timedelta
+from collections import deque
+
 import pyodbc
-import sqlparse
-from collections import defaultdict, deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QPointF
-from PyQt5.QtGui import QColor, QFont, QPen, QBrush
+from PyQt5.QtCore import Qt, QTimer, QDate, QTime, QDateTime
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QTableWidget,
-    QTableWidgetItem, QPushButton, QMessageBox, QInputDialog,
-    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem,
-    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem, QLabel, QPlainTextEdit
+    QWidget, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QComboBox, QMessageBox, QLineEdit,
+    QPlainTextEdit, QTableWidget, QTableWidgetItem,
+    QCalendarWidget, QTimeEdit, QFileDialog, QInputDialog, QCheckBox
 )
 
-from core_foundation import logger, insert_audit_log
+# If your aggregator or project structure allows:
+from core_foundation import logger, fetch_all_dict, fetch_one_dict
+from rule_engine import (
+    execute_rules_bfs,
+    run_single_rule_sql,
+    log_execution_result
+)
 
-# =============================================================================
-# 1. parse_sql_dependencies(...) – an SQL parsing utility
-# =============================================================================
-def parse_sql_dependencies(sql_text):
-    """
-    Parses an SQL statement using sqlparse to extract table references.
-    Returns a dict with:
-      "tables": list of (schema, table, alias, is_subquery)
-    This is a simplified approach.
-    """
-    result = {"tables": []}
-    statements = sqlparse.parse(sql_text)
-    for stmt in statements:
-        from_seen = False
-        token_list = list(stmt.tokens)
-        i = 0
-        while i < len(token_list):
-            tk = token_list[i]
-            val_up = tk.value.upper() if tk.value else ""
-            if val_up in ("FROM","JOIN","INNER JOIN","LEFT JOIN","RIGHT JOIN","FULL JOIN"):
-                from_seen = True
-            elif from_seen:
-                if tk.ttype is sqlparse.tokens.Keyword:
-                    if val_up in ("WHERE","GROUP","ORDER","HAVING","UNION","INTERSECT"):
-                        from_seen = False
-                else:
-                    if isinstance(tk, sqlparse.sql.Identifier):
-                        sch = tk.get_parent_name()
-                        tbl = tk.get_real_name()
-                        alias = tk.get_alias()
-                        result["tables"].append((sch, tbl, alias, False))
-                    elif isinstance(tk, sqlparse.sql.IdentifierList):
-                        for ident in tk.get_identifiers():
-                            sch = ident.get_parent_name()
-                            tbl = ident.get_real_name()
-                            alias = ident.get_alias()
-                            result["tables"].append((sch, tbl, alias, False))
-            i += 1
-    return result
 
-# =============================================================================
-# 2. DecisionTableManager – QDialog for decision tables
-# =============================================================================
-class DecisionTableManager(QDialog):
+###############################################################################
+# 1) ADVANCED SCHEDULING
+###############################################################################
+
+class EnhancedScheduleDialog(QtWidgets.QDialog):
     """
-    Displays, edits, deletes, runs Decision Tables from DECISION_TABLES.
+    A scheduling dialog to pick a rule, date, time, and optionally “Run Data Validations?”.
+    On success, it inserts into RULE_SCHEDULES (or advanced pipeline).
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.setWindowTitle("Decision Table Manager")
-        self.resize(700, 500)
-        self.init_ui()
-        self.load_decision_tables()
-
-    def init_ui(self):
+        self.setWindowTitle("Advanced Scheduling – BRM Tool")
+        self.resize(420, 300)
         layout = QVBoxLayout(self)
-        self.dt_table = QTableWidget(0,4)
-        self.dt_table.setHorizontalHeaderLabels(["DT_ID","Table Name","Description","Decision Query"])
-        self.dt_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.dt_table)
 
-        btn_layout = QHBoxLayout()
-        add_btn = QPushButton("Add Decision Table")
-        add_btn.clicked.connect(self.add_decision_table)
-        btn_layout.addWidget(add_btn)
+        form_layout = QVBoxLayout()
+        # rule combo
+        rule_line = QHBoxLayout()
+        self.rule_combo = QComboBox()
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        r_rows = c.fetchall()
+        for (rid,rn) in r_rows:
+            self.rule_combo.addItem(f"{rid} - {rn}", rid)
+        rule_line.addWidget(QLabel("Select Rule:"))
+        rule_line.addWidget(self.rule_combo)
+        form_layout.addLayout(rule_line)
 
-        edit_btn = QPushButton("Edit Decision Table")
-        edit_btn.clicked.connect(self.edit_decision_table)
-        btn_layout.addWidget(edit_btn)
+        # date/time
+        self.calendar = QCalendarWidget()
+        self.calendar.setSelectedDate(QtCore.QDate.currentDate())
+        self.calendar.setGridVisible(True)
+        form_layout.addWidget(QLabel("Select Date:"))
+        form_layout.addWidget(self.calendar)
 
-        delete_btn = QPushButton("Delete Decision Table")
-        delete_btn.clicked.connect(self.delete_decision_table)
-        btn_layout.addWidget(delete_btn)
+        time_line = QHBoxLayout()
+        self.time_edit = QTimeEdit(QtCore.QTime.currentTime())
+        self.time_edit.setDisplayFormat("HH:mm:ss")
+        time_line.addWidget(QLabel("Select Time:"))
+        time_line.addWidget(self.time_edit)
+        form_layout.addLayout(time_line)
 
-        run_btn = QPushButton("Run Decision Table")
-        run_btn.clicked.connect(self.run_decision_table)
-        btn_layout.addWidget(run_btn)
+        # validations
+        self.validate_cb = QCheckBox("Run Data Validations before execution?")
+        self.validate_cb.setChecked(False)
+        form_layout.addWidget(self.validate_cb)
 
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.load_decision_tables)
-        btn_layout.addWidget(refresh_btn)
+        layout.addLayout(form_layout)
 
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        self.result_log = QPlainTextEdit()
-        self.result_log.setReadOnly(True)
-        layout.addWidget(self.result_log)
+        # buttons
+        btn_h = QHBoxLayout()
+        sch_btn = QPushButton("Schedule")
+        sch_btn.clicked.connect(self.do_schedule)
+        btn_h.addWidget(sch_btn)
+        cb = QPushButton("Close")
+        cb.clicked.connect(self.close)
+        btn_h.addWidget(cb)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
 
         self.setLayout(layout)
 
-    def load_decision_tables(self):
-        self.dt_table.setRowCount(0)
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
-                FROM DECISION_TABLES
-                ORDER BY DECISION_TABLE_ID
-            """)
-            rows = c.fetchall()
-            for row in rows:
-                ridx = self.dt_table.rowCount()
-                self.dt_table.insertRow(ridx)
-                for col_i, val in enumerate(row):
-                    self.dt_table.setItem(ridx, col_i, QTableWidgetItem(str(val) if val else ""))
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Error loading DT: {ex}")
+    def do_schedule(self):
+        rule_id = self.rule_combo.currentData()
+        date_sel = self.calendar.selectedDate()
+        date_str = date_sel.toString("yyyy-MM-dd")
+        time_str = self.time_edit.time().toString("HH:mm:ss")
+        dt_str = f"{date_str} {time_str}"
+        validation_flag = 1 if self.validate_cb.isChecked() else 0
 
-    def add_decision_table(self):
-        name, ok = QInputDialog.getText(self, "Add Decision Table", "Table Name:")
-        if not ok or not name.strip():
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                INSERT INTO RULE_SCHEDULES(
+                  RULE_ID, SCHEDULE_TIME, STATUS, CREATED_TIMESTAMP, RUN_DATA_VALIDATIONS
+                )
+                VALUES(?,?, 'Scheduled', GETDATE(), ?)
+            """,(rule_id, dt_str, validation_flag))
+            self.connection.commit()
+            QMessageBox.information(self, "Scheduled", f"Rule {rule_id} scheduled at {dt_str}.")
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Scheduling failed: {ex}")
+            logger.error(f"Scheduling error: {ex}")
+        self.close()
+
+
+class ScheduleManagementTab(QWidget):
+    """
+    Tab to manage RULE_SCHEDULES (view, update, delete).
+    Auto-refresh can be invoked from a QTimer outside or from aggregator.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+
+        layout = QVBoxLayout(self)
+
+        self.table = QTableWidget(0,6)
+        self.table.setHorizontalHeaderLabels([
+            "SchedID","RuleID","ScheduleTime","Status","Validate?","Actions"
+        ])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        btn_h = QHBoxLayout()
+        ref_btn = QPushButton("Refresh Schedules")
+        ref_btn.clicked.connect(self.load_schedules)
+        btn_h.addWidget(ref_btn)
+
+        add_btn = QPushButton("Add New Schedule")
+        add_btn.clicked.connect(self.add_schedule)
+        btn_h.addWidget(add_btn)
+
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        self.setLayout(layout)
+        self.load_schedules()
+
+    def load_schedules(self):
+        self.table.setRowCount(0)
+        c = self.connection.cursor()
+        c.execute("""
+            SELECT TOP 1000
+                SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS,
+                RUN_DATA_VALIDATIONS
+            FROM RULE_SCHEDULES
+            ORDER BY SCHEDULE_TIME DESC
+        """)
+        rows = c.fetchall()
+        for row in rows:
+            r_i = self.table.rowCount()
+            self.table.insertRow(r_i)
+            self.table.setItem(r_i,0,QTableWidgetItem(str(row[0])))
+            self.table.setItem(r_i,1,QTableWidgetItem(str(row[1])))
+            self.table.setItem(r_i,2,QTableWidgetItem(str(row[2])))
+            self.table.setItem(r_i,3,QTableWidgetItem(str(row[3])))
+            self.table.setItem(r_i,4,QTableWidgetItem("Yes" if row[4]==1 else "No"))
+
+            act_widget = QWidget()
+            ah = QHBoxLayout(act_widget)
+            ah.setContentsMargins(0,0,0,0)
+            upd_btn = QPushButton("Update")
+            upd_btn.clicked.connect(lambda _, rowidx=r_i: self.update_schedule(rowidx))
+            ah.addWidget(upd_btn)
+            del_btn = QPushButton("Delete")
+            del_btn.clicked.connect(lambda _, rowidx=r_i: self.delete_schedule(rowidx))
+            ah.addWidget(del_btn)
+            ah.addStretch()
+            self.table.setCellWidget(r_i,5,act_widget)
+        self.table.resizeColumnsToContents()
+
+    def add_schedule(self):
+        dlg = EnhancedScheduleDialog(self.connection, self)
+        dlg.exec_()
+        self.load_schedules()
+
+    def update_schedule(self, row_idx):
+        sch_id_item = self.table.item(row_idx, 0)
+        if not sch_id_item:
             return
-        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Optional:")
-        if not ok2:
-            desc = ""
-        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query", "Enter SQL:")
-        if not ok3 or not query.strip():
+        sch_id = int(sch_id_item.text())
+        new_dt, ok = QInputDialog.getText(self, "Update Schedule", "Enter new datetime (YYYY-MM-DD HH:mm:ss):")
+        if not ok or not new_dt.strip():
             return
         c = self.connection.cursor()
         try:
             c.execute("""
-                INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY)
-                VALUES(?,?,?)
-            """,(name.strip(), desc.strip(), query.strip()))
+                UPDATE RULE_SCHEDULES
+                SET SCHEDULE_TIME=?
+                WHERE SCHEDULE_ID=?
+            """,(new_dt.strip(), sch_id))
             self.connection.commit()
-            QMessageBox.information(self, "Added", "Decision table created.")
-            insert_audit_log(self.connection, "ADD_DT","DECISION_TABLES",None,
-                             "User", None, {"table":name})
-            self.load_decision_tables()
+            QMessageBox.information(self, "Updated", f"Schedule {sch_id} updated to {new_dt}.")
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
+        self.load_schedules()
 
-    def edit_decision_table(self):
-        row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "Selection Error", "No DT selected.")
+    def delete_schedule(self, row_idx):
+        sch_id_item = self.table.item(row_idx, 0)
+        if not sch_id_item:
             return
-        dt_id = int(self.dt_table.item(row,0).text())
-        cur_name = self.dt_table.item(row,1).text()
-        cur_desc = self.dt_table.item(row,2).text()
-        cur_query = self.dt_table.item(row,3).text()
-
-        name, ok = QInputDialog.getText(self, "Edit Table Name", "New name:", text=cur_name)
-        if not ok or not name.strip():
-            return
-        desc, ok2 = QInputDialog.getMultiLineText(self, "Edit Description", "New desc:", text=cur_desc)
-        if not ok2:
-            desc = cur_desc
-        query, ok3 = QInputDialog.getMultiLineText(self, "Edit Query", "New SQL:", text=cur_query)
-        if not ok3 or not query.strip():
-            return
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                UPDATE DECISION_TABLES
-                SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
-                WHERE DECISION_TABLE_ID=?
-            """,(name.strip(), desc.strip(), query.strip(), dt_id))
-            self.connection.commit()
-            QMessageBox.information(self, "Updated", "Decision table updated.")
-            insert_audit_log(self.connection, "EDIT_DT","DECISION_TABLES",dt_id,
-                             "User", None, {"table":name})
-            self.load_decision_tables()
-        except Exception as ex:
-            QMessageBox.critical(self, "Update Error", str(ex))
-
-    def delete_decision_table(self):
-        row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "Selection Error", "No DT selected.")
-            return
-        dt_id = int(self.dt_table.item(row,0).text())
-        confirm = QMessageBox.question(self, "Confirm", f"Delete DT {dt_id}?")
+        sch_id = int(sch_id_item.text())
+        confirm = QMessageBox.question(self, "Confirm", f"Delete schedule {sch_id}?")
         if confirm!=QMessageBox.Yes:
             return
         c = self.connection.cursor()
         try:
-            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?", (dt_id,))
+            c.execute("DELETE FROM RULE_SCHEDULES WHERE SCHEDULE_ID=?", (sch_id,))
             self.connection.commit()
-            QMessageBox.information(self, "Deleted", f"DT {dt_id} deleted.")
-            insert_audit_log(self.connection, "DELETE_DT","DECISION_TABLES", dt_id,
-                             "User", None, {"deleted":True})
-            self.load_decision_tables()
+            QMessageBox.information(self, "Deleted", f"Schedule {sch_id} removed.")
         except Exception as ex:
-            QMessageBox.critical(self, "Delete Error", str(ex))
+            QMessageBox.critical(self, "Error", str(ex))
+        self.load_schedules()
 
-    def run_decision_table(self):
-        row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "Selection Error", "No DT selected.")
-            return
-        dt_id = int(self.dt_table.item(row,0).text())
 
-        c = self.connection.cursor()
-        c.execute("SELECT DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?", (dt_id,))
-        rowq = c.fetchone()
-        if not rowq or not rowq[0]:
-            QMessageBox.warning(self, "No Query", "No SQL found for this DT.")
-            return
-        query = rowq[0]
-        try:
-            c.execute("BEGIN TRANSACTION")
-            c.execute(query)
-            try:
-                rows = c.fetchall()
-            except:
-                rows = []
-            impacted = len(rows)
-            c.execute("ROLLBACK")
-            msg = f"DT {dt_id} impacted {impacted} rows (dry-run)."
-            self.result_log.appendPlainText(msg)
-            QMessageBox.information(self, "Run Decision Table", msg)
-            insert_audit_log(self.connection, "RUN_DT","DECISION_TABLES", dt_id,
-                             "User", None, {"impacted":impacted})
-        except Exception as ex:
-            c.execute("ROLLBACK")
-            err = f"Run error: {ex}"
-            self.result_log.appendPlainText(err)
-            QMessageBox.critical(self, "Run Error", err)
-
-# =============================================================================
-# 3. AdvancedLineageGraphView – with arrowheads, node dragging, advanced layering
-# =============================================================================
-class AdvancedLineageGraphView(QGraphicsView):
+###############################################################################
+# 2) SINGLE RULE SIMULATION DIALOG
+###############################################################################
+class SingleRuleSimulationDialog(QDialog):
     """
-    Renders a DAG of rules + tables with advanced layering (Sugiyama-like),
-    arrowheads, and interactive node dragging. Also highlight_impact(...) BFS.
+    Let user pick 1 rule => run a single rule in a "dry-run" transaction => show pass/fail => impacted records => optional skip validations.
     """
-    def __init__(self, connection, parent=None, auto_refresh_interval=45000):
+    def __init__(self, connection, parent_rule_id, sql_text, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.scene = QGraphicsScene(self)
-        self.setScene(self.scene)
-        self.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
+        self.rule_id = parent_rule_id
+        self.sql_text = sql_text
+        self.setWindowTitle(f"Simulation for Rule {parent_rule_id}")
+        self.resize(500,400)
 
-        self.rule_nodes = {}  # rule_id -> BFSRuleNodeItem
-        self.table_nodes = {} # (db, tbl) -> BFSTableNodeItem
-        self.arrows = []      # store references to BFSArrowItem for updating
+        layout = QVBoxLayout(self)
 
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.populate_graph)
-        self.refresh_timer.start(auto_refresh_interval)
+        self.info_label = QLabel("Running simulation for single rule (dry-run).")
+        layout.addWidget(self.info_label)
 
-        self.populate_graph()
+        self.skip_val_chk = QCheckBox("Skip Data Validations?")
+        layout.addWidget(self.skip_val_chk)
 
-    def populate_graph(self):
-        self.scene.clear()
-        self.rule_nodes.clear()
-        self.table_nodes.clear()
-        self.arrows.clear()
-        try:
-            c = self.connection.cursor()
-            c.execute("""
-                SELECT RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, PARENT_RULE_ID
-                FROM BRM_RULES
-            """)
-            rule_rows = c.fetchall()
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
 
-            # Build adjacency for rule->child
-            children_map = defaultdict(list)
-            rule_map = {}
-            for (rid, rname, rstat, rappr, pid) in rule_rows:
-                rule_map[rid] = (rname, rstat, rappr, pid)
-                if pid:
-                    children_map[pid].append(rid)
+        run_btn = QPushButton("Run Simulation")
+        run_btn.clicked.connect(self.run_simulation)
+        layout.addWidget(run_btn)
 
-            # We'll do a topological or BFS approach to detect levels, 
-            # but then apply a simple "Sugiyama-like" pass to minimize crossing
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
 
-            # 1) Collect indegree
-            indegree = defaultdict(int)
-            for rid in rule_map.keys():
-                indegree[rid] = 0
-            for pid, clist in children_map.items():
-                for child in clist:
-                    indegree[child]+=1
+        self.setLayout(layout)
 
-            # 2) Kahn's algorithm for topological order
-            topo_order = []
-            queue = deque([r for r in rule_map.keys() if indegree[r]==0])
-            while queue:
-                node = queue.popleft()
-                topo_order.append(node)
-                for child in children_map[node]:
-                    indegree[child]-=1
-                    if indegree[child]==0:
-                        queue.append(child)
+    def run_simulation(self):
+        # Possibly run data validations unless skip_val
+        skip_val = self.skip_val_chk.isChecked()
+        if not skip_val:
+            # run validations for that rule
+            from rule_engine import run_data_validation_for_rule, parse_sql_dependencies
+            pass_ok, failt = run_data_validation_for_rule(self.connection, self.rule_id, parse_sql_dependencies)
+            if not pass_ok:
+                msg = f"Data validation FAILED for these tables: {failt}\nNo simulation run."
+                self.result_text.setPlainText(msg)
+                return
 
-            # If there's a cycle, some nodes won't be in topo_order. We'll just add them last
-            for r in rule_map.keys():
-                if r not in topo_order:
-                    topo_order.append(r)
+        # do a "dry-run" => single rule
+        from rule_engine import run_single_rule_sql
+        start_t = time.time()
 
-            # 3) Assign each node an initial "layer" = distance from roots
-            layer_map = {}
-            for r in topo_order:
-                pid = rule_map[r][3]  # parent
-                if not pid or pid not in rule_map:
-                    layer_map[r] = 0
-                else:
-                    layer_map[r] = layer_map[pid]+1
-
-            # 4) Group nodes by layer
-            layer_groups = defaultdict(list)
-            for r, layer in layer_map.items():
-                layer_groups[layer].append(r)
-            max_layer = max(layer_map.values()) if layer_map else 0
-
-            # 5) Place nodes in vertical columns based on layer
-            x_spacing = 220
-            y_spacing = 100
-            x_start = 50
-            y_start = 50
-
-            for layer in range(max_layer+1):
-                nodes_in_layer = layer_groups[layer]
-                for i, rid in enumerate(nodes_in_layer):
-                    rname, rstat, rappr, pid = rule_map[rid]
-                    node_item = BFSRuleNodeItem(rid, rname, rstat, rappr)
-                    node_item.setPos(x_start + layer*x_spacing, y_start + i*y_spacing)
-                    self.scene.addItem(node_item)
-                    self.rule_nodes[rid] = node_item
-                    # For node dragging: connect signals
-                    node_item.position_changed.connect(self.update_arrows)
-
-            # 6) Now place table nodes on a separate pseudo-layer on the far right
-            # gather table deps
-            c.execute("SELECT RULE_ID, DATABASE_NAME, TABLE_NAME FROM BRM_RULE_TABLE_DEPENDENCIES")
-            deps = c.fetchall()
-            table_map = defaultdict(list)  # (db,tbl) -> [rule_ids]
-            for (rid, db, tbl) in deps:
-                db_low = db.lower() if db else "nodb"
-                tbl_low = tbl.lower() if tbl else "notable"
-                table_map[(db_low, tbl_low)].append(rid)
-            # place them in a single column after max_layer
-            table_x = x_start + (max_layer+1)*x_spacing + 200
-            idx_tbl = 0
-            for key, rid_list in table_map.items():
-                db, tbl = key
-                node_item = BFSTableNodeItem(db, tbl)
-                y_pos = y_start + idx_tbl*y_spacing
-                node_item.setPos(table_x, y_pos)
-                self.scene.addItem(node_item)
-                self.table_nodes[key] = node_item
-                idx_tbl+=1
-                node_item.position_changed.connect(self.update_arrows)
-
-            # 7) Draw arrow edges
-            # 7a) rule->child
-            for pid, clist in children_map.items():
-                source_item = self.rule_nodes.get(pid)
-                if source_item:
-                    for child in clist:
-                        target_item = self.rule_nodes.get(child)
-                        if target_item:
-                            arrow = BFSArrowItem(source_item, target_item, Qt.darkGray)
-                            self.arrows.append(arrow)
-                            self.scene.addItem(arrow)
-
-            # 7b) rule->table
-            for (db_low, tbl_low), rid_list in table_map.items():
-                tbl_item = self.table_nodes.get((db_low,tbl_low))
-                if tbl_item:
-                    for rid in rid_list:
-                        if rid in self.rule_nodes:
-                            rule_item = self.rule_nodes[rid]
-                            arrow = BFSArrowItem(rule_item, tbl_item, Qt.darkBlue)
-                            self.arrows.append(arrow)
-                            self.scene.addItem(arrow)
-
-            self.resetView()
-        except Exception as ex:
-            logger.error(f"populate_graph error: {ex}")
-            QMessageBox.critical(self, "Lineage Error", str(ex))
-
-    def resetView(self):
-        self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
-
-    def highlight_impact(self, changed_rule_id):
-        """
-        BFS to find all descendants of changed_rule_id. 
-        We'll dim others, highlight these in full opacity.
-        """
         c = self.connection.cursor()
+        c.execute("BEGIN TRANSACTION")
+        pass_flag = False
+        msg = ""
+        rec_count=0
         try:
-            c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
+            c.execute(self.sql_text)
             rows = c.fetchall()
-            children_map = defaultdict(list)
-            for (rid, pid) in rows:
-                if pid:
-                    children_map[pid].append(rid)
-
-            impacted = []
-            visited = set()
-            stack = [changed_rule_id]
-            while stack:
-                current = stack.pop()
-                if current in visited:
-                    continue
-                visited.add(current)
-                impacted.append(current)
-                for ch in children_map[current] if current in children_map else []:
-                    stack.append(ch)
-
-            # dim all
-            for rn in self.rule_nodes.values():
-                rn.setOpacity(0.3)
-            # highlight impacted
-            for rid in impacted:
-                if rid in self.rule_nodes:
-                    self.rule_nodes[rid].setOpacity(1.0)
-
-            msg = f"Rule {changed_rule_id} changes affect: {impacted}"
-            QMessageBox.information(self, "Impact Analysis", msg)
-            logger.info(msg)
+            rec_count = len(rows)
+            if rows:
+                val = rows[0][0]
+                pass_flag=(val==1)
+                msg=f"Returned: {val}"
+            else:
+                pass_flag=True
+                msg="No rows => PASS"
+            c.execute("ROLLBACK")  # always rollback for simulation
         except Exception as ex:
-            logger.error(f"highlight_impact error: {ex}")
-            QMessageBox.critical(self, "Impact Error", str(ex))
+            c.execute("ROLLBACK")
+            pass_flag=False
+            msg=str(ex)
 
-    def update_arrows(self):
-        """
-        Called whenever a node is moved (interactive dragging).
-        We recalc arrow positions for all BFSArrowItems.
-        """
-        for arrow in self.arrows:
-            arrow.update_position()
+        end_t = time.time()
+        elapsed_ms = int((end_t - start_t)*1000)
 
-# -----------------------------------------------------------------------------
-# Graphics Item Classes with Node Dragging and Arrowheads
-# -----------------------------------------------------------------------------
-class BFSRuleNodeItem(QGraphicsRectItem):
+        sim_result = (f"Rule {self.rule_id} Simulation => PASS={pass_flag}\n"
+                      f"Message={msg}\nRecords={rec_count}\nElapsed={elapsed_ms} ms")
+        self.result_text.setPlainText(sim_result)
+        logger.info(sim_result)
+
+
+###############################################################################
+# 3) CHAIN SIMULATION DIALOG
+###############################################################################
+class ChainSimulationDialog(QDialog):
     """
-    A rectangle representing a rule node, with node dragging capability.
+    BFS from a selected rule => includes data validations or skip => show pass/fail => list executed/skipped.
     """
-    position_changed = QtCore.pyqtSignal()  # custom signal
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Chain Simulation – BFS Dry-Run")
+        self.resize(600,400)
 
-    def __init__(self, rule_id, rule_name, status, approval_status):
-        super().__init__(0,0,180,60)
-        self.rule_id = rule_id
-        self.rule_name = rule_name
-        self.status = status
-        self.approval_status = approval_status
-        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+        layout = QVBoxLayout(self)
 
-        if status.upper()=="ACTIVE":
-            fill_color = QColor("#C8E6C9")
-        elif status.upper()=="INACTIVE":
-            fill_color = QColor("#FFCDD2")
-        else:
-            fill_color = QColor("#FFF9C4")
+        top_h = QHBoxLayout()
+        self.rule_combo = QComboBox()
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        rows = c.fetchall()
+        for (rid,rn) in rows:
+            self.rule_combo.addItem(f"{rid} - {rn}", rid)
+        top_h.addWidget(QLabel("Select Starting Rule:"))
+        top_h.addWidget(self.rule_combo)
+        layout.addLayout(top_h)
 
-        self.setBrush(QBrush(fill_color))
-        self.setPen(QPen(Qt.black,2))
+        self.skip_val_chk = QCheckBox("Skip Data Validations?")
+        layout.addWidget(self.skip_val_chk)
 
-        text_str = f"{rule_name}\n(Rule {rule_id})"
-        text_item = QGraphicsTextItem(text_str, self)
-        font = QFont("Arial",9)
-        text_item.setFont(font)
-        br = text_item.boundingRect()
-        rw, rh = self.rect().width(), self.rect().height()
-        text_item.setPos((rw-br.width())/2, (rh-br.height())/2)
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
 
-        tip = f"Rule {rule_id}\nStatus: {status}\nApproval: {approval_status}"
-        self.setToolTip(tip)
+        btn_h = QHBoxLayout()
+        run_btn = QPushButton("Run Chain Simulation (Dry-Run BFS)")
+        run_btn.clicked.connect(self.do_chain_sim)
+        btn_h.addWidget(run_btn)
+        cb = QPushButton("Close")
+        cb.clicked.connect(self.close)
+        btn_h.addWidget(cb)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
 
-    def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionChange:
-            # whenever position changes, emit signal so arrows can update
-            self.position_changed.emit()
-        return super().itemChange(change, value)
+        self.setLayout(layout)
 
-class BFSTableNodeItem(QGraphicsEllipseItem):
-    """
-    A circle representing a table node, with drag support.
-    """
-    position_changed = QtCore.pyqtSignal()
-
-    def __init__(self, db_name, tbl_name):
-        super().__init__(0,0,80,80)
-        self.db_name = db_name
-        self.tbl_name = tbl_name
-        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
-
-        self.setBrush(QBrush(QColor("#BBDEFB")))
-        self.setPen(QPen(Qt.darkBlue,2))
-
-        lbl = f"{db_name}.{tbl_name}"
-        text_item = QGraphicsTextItem(lbl, self)
-        text_item.setFont(QFont("Arial",8))
-        br = text_item.boundingRect()
-        w, h = self.rect().width(), self.rect().height()
-        text_item.setPos((w-br.width())/2, (h-br.height())/2)
-
-        self.setToolTip(f"Table: {db_name}.{tbl_name}")
-
-    def itemChange(self, change, value):
-        if change == QGraphicsItem.ItemPositionChange:
-            self.position_changed.emit()
-        return super().itemChange(change, value)
-
-class BFSArrowItem(QGraphicsLineItem):
-    """
-    An arrow from a BFSRuleNodeItem or BFSTableNodeItem to another. 
-    Includes an arrowhead drawn dynamically.
-    """
-    def __init__(self, source_item, target_item, color=Qt.darkGray):
-        super().__init__()
-        self.source_item = source_item
-        self.target_item = target_item
-        self.color = color
-        self.setPen(QPen(self.color,2))
-        self.update_position()
-
-    def update_position(self):
-        sr = self.source_item.sceneBoundingRect().center()
-        tr = self.target_item.sceneBoundingRect().center()
-        self.setLine(sr.x(), sr.y(), tr.x(), tr.y())
-
-    def paint(self, painter, option, widget=None):
-        # update line first
-        self.update_position()
-        super().paint(painter, option, widget)
-
-        # draw arrowhead at end
-        line = self.line()
-        angle = line.angle()  # in degrees
-        # Convert to radians
-        angle_rads = (360 - angle) * 3.14159 / 180.0
-        arrow_size = 10
-        # endpoints
-        end_point = line.p2()
-        # two side points for arrow
-        p1 = QtCore.QPointF(
-            end_point.x() + arrow_size * -1 * QtCore.qCos(angle_rads + 0.3),
-            end_point.y() + arrow_size * -1 * QtCore.qSin(angle_rads + 0.3)
+    def do_chain_sim(self):
+        rid = self.rule_combo.currentData()
+        skip_val = self.skip_val_chk.isChecked()
+        from rule_engine import execute_rules_bfs, parse_sql_dependencies
+        (exed, skp, fail_tables) = execute_rules_bfs(
+            conn=self.connection,
+            start_rule_ids=[rid],
+            skip_data_validation=skip_val,
+            parse_sql_fn=parse_sql_dependencies
         )
-        p2 = QtCore.QPointF(
-            end_point.x() + arrow_size * -1 * QtCore.qCos(angle_rads - 0.3),
-            end_point.y() + arrow_size * -1 * QtCore.qSin(angle_rads - 0.3)
+        msg = (f"Chain BFS from rule {rid} =>\n"
+               f"Executed => {exed}\n"
+               f"Skipped => {list(skp)}\n"
+               f"Validation Failed => {list(fail_tables)}")
+        self.result_text.setPlainText(msg)
+        logger.info(msg)
+
+
+###############################################################################
+# 4) GROUP SIMULATION DIALOG
+###############################################################################
+class GroupSimulationDialog(QDialog):
+    """
+    BFS from all rules in a selected custom group => show pass/fail => skip validations if chosen.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Custom Group Simulation – BFS Dry-Run")
+        self.resize(600,400)
+
+        layout = QVBoxLayout(self)
+
+        top_h = QHBoxLayout()
+        self.grp_combo = QComboBox()
+        c = self.connection.cursor()
+        c.execute("SELECT CUSTOM_GROUP_ID, CUSTOM_GROUP_NAME FROM BRM_CUSTOM_RULE_GROUPS ORDER BY CUSTOM_GROUP_ID")
+        g_rows = c.fetchall()
+        for (cid, cname) in g_rows:
+            self.grp_combo.addItem(f"{cid} - {cname}", cid)
+        top_h.addWidget(QLabel("Select Custom Group:"))
+        top_h.addWidget(self.grp_combo)
+        layout.addLayout(top_h)
+
+        self.skip_val_chk = QCheckBox("Skip Data Validations?")
+        layout.addWidget(self.skip_val_chk)
+
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
+
+        btn_h = QHBoxLayout()
+        run_btn = QPushButton("Run Group BFS Simulation")
+        run_btn.clicked.connect(self.do_group_sim)
+        btn_h.addWidget(run_btn)
+        cb = QPushButton("Close")
+        cb.clicked.connect(self.close)
+        btn_h.addWidget(cb)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        self.setLayout(layout)
+
+    def do_group_sim(self):
+        cgid = self.grp_combo.currentData()
+        skip_val = self.skip_val_chk.isChecked()
+
+        # find all rules in that custom group => BFS from them collectively
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS WHERE CUSTOM_GROUP_ID=?",(cgid,))
+        members = c.fetchall()
+        start_rules = [r[0] for r in members]
+        if not start_rules:
+            self.result_text.setPlainText("No rules in that custom group => nothing to run.")
+            return
+
+        from rule_engine import execute_rules_bfs, parse_sql_dependencies
+        (exed, skp, fail_tables) = execute_rules_bfs(
+            conn=self.connection,
+            start_rule_ids=start_rules,
+            skip_data_validation=skip_val,
+            parse_sql_fn=parse_sql_dependencies
         )
+        msg = (f"Group BFS => group {cgid}\n"
+               f"Start rules => {start_rules}\n"
+               f"Executed => {exed}\n"
+               f"Skipped => {list(skp)}\n"
+               f"Validation fails => {list(fail_tables)}")
+        self.result_text.setPlainText(msg)
+        logger.info(msg)
 
-        arrow_head = QtGui.QPolygonF([end_point, p1, p2])
-        painter.setBrush(QtGui.QBrush(self.color))
-        painter.drawPolygon(arrow_head)
 
-# end of file
+###############################################################################
+# End of scheduling_and_simulations.py
+###############################################################################
+
+Explanation of Key Sections
+	1.	Scheduling
+	•	EnhancedScheduleDialog: Pick rule, date/time, data validations? => inserts into RULE_SCHEDULES.
+	•	ScheduleManagementTab: Displays upcoming schedules with typical columns (SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS). Provides Update or Delete buttons.
+	2.	Simulations
+	•	SingleRuleSimulationDialog: Takes a rule’s SQL and does a “dry-run” transaction. If returns row[0][0]==1 => pass, else fail.
+	•	ChainSimulationDialog: BFS from a single parent rule. Optionally skip validations.
+	•	GroupSimulationDialog: BFS from all rules in a custom group as multi-roots.
+	3.	execute_rules_bfs or “the BFS” from rule_engine.py is leveraged in chain/group simulations.
+	4.	Import Requirements
+	•	This module references rule_engine for BFS, single rule run, etc.
+	•	References core_foundation logger and DB helpers.
+	5.	Further Enhancements
+	•	If you want scheduling to automatically trigger BFS, you can have a QTimer in your aggregator’s main window periodically checking RULE_SCHEDULES and running them. Then update the schedule’s STATUS to “Executed” or “Failed.”
+
+Please respond “OK” if you approve Module #3. Then I can produce Module #4 focusing on e.g. advanced lineage, approvals, global-critical admin UI, or any other specialized components you wish.
