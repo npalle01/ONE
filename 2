@@ -1,0 +1,597 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: pipeline_workflow_designer.py
+Description:
+  Provides an advanced pipeline/workflow designer for the BRM Tool. 
+  Key features:
+   1. A DB structure for pipelines (BRM_PIPELINES, BRM_PIPELINE_TASKS).
+   2. A node-based UI to create/edit pipeline tasks (rule runs, BFS triggers, or external tasks).
+   3. Execution logic that respects dependencies, logs pass/fail, and integrates with BFS or data validations if desired.
+
+Assumptions for DB tables:
+  - BRM_PIPELINES:
+      PIPELINE_ID (PK int, identity),
+      NAME (varchar),
+      DESCRIPTION (varchar),
+      CREATED_BY (varchar),
+      CREATED_TIMESTAMP (datetime),
+      STATUS (varchar) => e.g. "Draft","Active","Archived", ...
+  - BRM_PIPELINE_TASKS:
+      TASK_ID (PK int, identity),
+      PIPELINE_ID (FK),
+      TASK_NAME (varchar),
+      TASK_TYPE (varchar) => e.g. "RULE_BFS","VALIDATION","EXTERNAL","WAIT","...
+      PARAMS (text or json) => e.g. { "rule_id": 123, "skip_validations": false }
+      DEPENDS_ON (text) => a list of upstream task IDs, or store in a separate table
+      STATUS (varchar) => e.g. "Draft","Active"
+      ORDER_INDEX (int) => optional for linear flows
+      CREATED_TIMESTAMP (datetime)
+  - A log table, e.g. BRM_PIPELINE_RUNS, capturing pipeline-level runs plus each task’s result.
+
+"""
+
+import sys
+import json
+import logging
+import traceback
+from datetime import datetime
+from collections import defaultdict, deque
+
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QPushButton, QMessageBox, QInputDialog, QDialog, QLineEdit, QLabel,
+    QTextEdit, QComboBox, QTreeWidget, QTreeWidgetItem, QFileDialog,
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsTextItem,
+    QPlainTextEdit, QMenu
+)
+from PyQt5.QtCore import Qt, QPointF, QRectF
+from PyQt5.QtGui import QColor, QPen, QBrush, QFont
+
+# from advanced_simulation import execute_rules_bfs
+# from data_validations import run_all_validations, run_single_data_validation
+
+
+###############################################################################
+# 1) PIPELINE DB UTILS
+###############################################################################
+def create_pipeline(conn, name, desc, created_by="System"):
+    """
+    Insert into BRM_PIPELINES => returns new pipeline_id.
+    """
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO BRM_PIPELINES(NAME,DESCRIPTION,CREATED_BY,CREATED_TIMESTAMP,STATUS)
+        OUTPUT inserted.PIPELINE_ID
+        VALUES(?,?,?,GETDATE(),'Draft')
+    """,(name, desc, created_by))
+    row = c.fetchone()
+    if row:
+        pipeline_id = row[0]
+        conn.commit()
+        return pipeline_id
+    conn.rollback()
+    raise ValueError("Failed to create pipeline.")
+
+def add_pipeline_task(conn, pipeline_id, task_name, task_type, params_json, depends_on=""):
+    """
+    Insert into BRM_PIPELINE_TASKS => returns new task_id
+    depends_on => string like "1,2" referencing other task IDs
+    """
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO BRM_PIPELINE_TASKS(
+          PIPELINE_ID,TASK_NAME,TASK_TYPE,PARAMS,DEPENDS_ON,STATUS,CREATED_TIMESTAMP
+        )
+        OUTPUT inserted.TASK_ID
+        VALUES(?,?,?,?,?,'Draft',GETDATE())
+    """,(pipeline_id, task_name, task_type, params_json, depends_on))
+    row=c.fetchone()
+    if row:
+        task_id=row[0]
+        conn.commit()
+        return task_id
+    conn.rollback()
+    raise ValueError("Failed to create pipeline task.")
+
+def load_pipeline_details(conn, pipeline_id):
+    """
+    Return pipeline record plus tasks in a structured form:
+      {
+        "pipeline": { "PIPELINE_ID":..., "NAME":..., ... },
+        "tasks": [ { "TASK_ID":..., "TASK_NAME":..., "TASK_TYPE":..., "PARAMS":..., "DEPENDS_ON":... }, ... ]
+      }
+    """
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_PIPELINES WHERE PIPELINE_ID=?",(pipeline_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    colnames = [desc[0] for desc in c.description]
+    pipeline_dict = dict(zip(colnames,row))
+
+    c2=conn.cursor()
+    c2.execute("SELECT * FROM BRM_PIPELINE_TASKS WHERE PIPELINE_ID=? ORDER BY TASK_ID",(pipeline_id,))
+    tasks = c2.fetchall()
+    tcol = [desc[0] for desc in c2.description]
+    task_list=[]
+    for t_ in tasks:
+        task_list.append(dict(zip(tcol,t_)))
+    return { "pipeline": pipeline_dict, "tasks": task_list }
+
+
+###############################################################################
+# 2) PIPELINE EXECUTION LOGIC (SIMPLE DAG)
+###############################################################################
+def execute_pipeline(conn, pipeline_id, skip_validations=False):
+    """
+    Perform a DAG-based execution of the pipeline tasks in correct order:
+      - We parse the dependencies => build adjacency => run BFS or topological sort.
+      - For each task => if "RULE_BFS" => call execute_rules_bfs with the rule_id from params.
+        If "VALIDATION" => run data validations for the specified table/column or all.
+        If "EXTERNAL" => placeholder or call a shell command, etc.
+      - If any task fails => we can either stop the pipeline or skip dependent tasks.
+
+    This is a minimal approach. Production logic can be more robust with partial commits, etc.
+    """
+    # load tasks
+    pip = load_pipeline_details(conn,pipeline_id)
+    if not pip:
+        raise ValueError(f"Pipeline {pipeline_id} not found.")
+    tasks = pip["tasks"]
+    # build adjacency from depends_on
+    adjacency = defaultdict(list)
+    task_map={}
+    in_degree=defaultdict(int)
+
+    for t_ in tasks:
+        tid=t_["TASK_ID"]
+        task_map[tid]=t_
+        dep_str = (t_["DEPENDS_ON"] or "").strip()
+        if dep_str:
+            deps = [int(x) for x in dep_str.split(",") if x.strip().isdigit()]
+            for d_ in deps:
+                adjacency[d_].append(tid)
+                in_degree[tid]+=1
+
+    # find tasks with 0 in_degree
+    queue=[]
+    for t_ in tasks:
+        tid=t_["TASK_ID"]
+        if in_degree[tid]==0:
+            queue.append(tid)
+
+    executed=[]
+    skipped=set()
+
+    while queue:
+        tid=queue.pop(0)
+        if tid in skipped:
+            continue
+        # run
+        task_data=task_map[tid]
+        success = run_pipeline_task(conn, task_data, skip_validations=skip_validations)
+        if success:
+            executed.append(tid)
+            # push children
+            for child in adjacency[tid]:
+                if child not in skipped:
+                    in_degree[child]-=1
+                    if in_degree[child]<=0:
+                        queue.append(child)
+        else:
+            # skip BFS sub tasks
+            skip_descendants(child=tid, adjacency=adjacency, skip_set=skipped)
+
+    return executed, list(skipped)
+
+def skip_descendants(child, adjacency, skip_set):
+    stack=[child]
+    while stack:
+        cur=stack.pop()
+        if cur in skip_set:
+            continue
+        skip_set.add(cur)
+        if cur in adjacency:
+            for nxt in adjacency[cur]:
+                if nxt not in skip_set:
+                    stack.append(nxt)
+
+def run_pipeline_task(conn, task_dict, skip_validations=False):
+    """
+    Based on task_type => parse params => run BFS or validations or external call.
+    Return True if success, False if fail.
+    """
+    ttype=task_dict["TASK_TYPE"].upper().strip()
+    params=task_dict.get("PARAMS","")
+    task_id=task_dict["TASK_ID"]
+
+    # Minimal approach => parse JSON from params if possible
+    try:
+        p_json=json.loads(params) if params.strip() else {}
+    except:
+        p_json={}
+
+    try:
+        if ttype=="RULE_BFS":
+            # param => { "rule_ids": [12,13], "skip_data_validation": false }
+            from advanced_simulation import execute_rules_bfs
+            rule_ids = p_json.get("rule_ids",[ ])
+            skip_val = p_json.get("skip_data_validation",False) or skip_validations
+            (exed,skp,failed) = execute_rules_bfs(conn, rule_ids, skip_val)
+            # if any fail => return false
+            # but let's just do a pass if we have no “fail.” Usually you'd interpret BFS logs
+            if len(failed)>0:
+                # mark fail
+                log_pipeline_task(conn, task_id, success=False, message=f"Validation fail => {failed}")
+                return False
+            else:
+                log_pipeline_task(conn, task_id, success=True, message=f"Executed => {exed}, skipped => {skp}")
+                return True
+
+        elif ttype=="VALIDATION":
+            # param => { "val_ids": [10,11] } or { "table": "dbo.Customers" }
+            from data_validations import run_single_data_validation, run_all_validations
+            if "val_ids" in p_json:
+                for v_id in p_json["val_ids"]:
+                    c_ = conn.cursor()
+                    c_.execute("SELECT DATA_VALIDATION_ID,TABLE_NAME,COLUMN_NAME,VALIDATION_TYPE,PARAMS FROM DATA_VALIDATIONS WHERE DATA_VALIDATION_ID=?",(v_id,))
+                    row_ = c_.fetchone()
+                    if row_:
+                        dv_dict = {
+                            "DATA_VALIDATION_ID": row_[0],
+                            "TABLE_NAME": row_[1],
+                            "COLUMN_NAME": row_[2],
+                            "VALIDATION_TYPE": row_[3],
+                            "PARAMS": row_[4]
+                        }
+                        (ok,detail)=run_single_data_validation(conn,dv_dict)
+                        if not ok:
+                            log_pipeline_task(conn,task_id,False,f"Validation {v_id} => fail => {detail}")
+                            return False
+                log_pipeline_task(conn,task_id,True,"All validations in val_ids => PASS.")
+                return True
+            else:
+                # run all
+                res=run_all_validations(conn)
+                fails = [r for r in res if r[3]=="FAIL"]
+                if fails:
+                    msg=f"{len(fails)} validation(s) failed."
+                    log_pipeline_task(conn,task_id,False,msg)
+                    return False
+                else:
+                    msg="All validations pass."
+                    log_pipeline_task(conn,task_id,True,msg)
+                    return True
+
+        elif ttype=="EXTERNAL":
+            # param => { "command": "echo Hello" } or { "url": "http://myservice" }
+            # For brevity => just log success.
+            # In reality, you'd run a subprocess or HTTP request.
+            log_pipeline_task(conn, task_id, True, "EXTERNAL task => stub pass.")
+            return True
+
+        elif ttype=="WAIT":
+            # param => { "seconds": 10 }
+            secs = p_json.get("seconds",5)
+            import time
+            time.sleep(secs)
+            log_pipeline_task(conn,task_id,True,f"WAIT {secs} seconds done.")
+            return True
+
+        else:
+            log_pipeline_task(conn,task_id,False,f"Unknown task type {ttype}")
+            return False
+
+    except Exception as ex:
+        msg=f"Runtime error => {ex}"
+        log_pipeline_task(conn,task_id,False,msg)
+        return False
+
+def log_pipeline_task(conn, task_id, success, message):
+    """
+    Insert or update a table for pipeline runs, or do an inline approach:
+    BRM_PIPELINE_TASK_RUNS( pipeline_id, task_id, success_flag, message, run_timestamp ) ...
+    For brevity, we just do a single log row. 
+    """
+    c=conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO BRM_PIPELINE_TASK_RUNS(
+              TASK_ID, SUCCESS_FLAG, MESSAGE, RUN_TIMESTAMP
+            )
+            VALUES(?,?,?,GETDATE())
+        """,(task_id, 1 if success else 0, message))
+        conn.commit()
+    except:
+        pass  # might not have that table => skip
+
+
+###############################################################################
+# 3) Pipeline Designer UI
+###############################################################################
+class PipelineDesignerTab(QWidget):
+    """
+    A QGraphicsView-based approach to visually build a pipeline:
+      - We list pipelines on the left
+      - We show tasks as nodes in the center, with edges for depends_on
+      - We let user add tasks, define depends_on, run the pipeline, etc.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.current_pipeline_id = None
+
+        layout = QVBoxLayout(self)
+
+        # top row => pipeline selection + new pipeline + run pipeline
+        top_h = QHBoxLayout()
+        self.pipeline_combo = QComboBox()
+        top_h.addWidget(QLabel("Select Pipeline:"))
+        top_h.addWidget(self.pipeline_combo)
+
+        load_btn = QPushButton("Load Pipeline")
+        load_btn.clicked.connect(self.load_pipeline)
+        top_h.addWidget(load_btn)
+
+        new_btn = QPushButton("New Pipeline")
+        new_btn.clicked.connect(self.create_new_pipeline)
+        top_h.addWidget(new_btn)
+
+        run_btn = QPushButton("Run Pipeline")
+        run_btn.clicked.connect(self.run_pipeline)
+        top_h.addWidget(run_btn)
+
+        top_h.addStretch()
+        layout.addLayout(top_h)
+
+        # graph area
+        self.scene = PipelineGraphicsScene(self.connection)
+        self.view = QGraphicsView(self.scene)
+        layout.addWidget(self.view)
+
+        # bottom row => add task, del task
+        bot_h = QHBoxLayout()
+        add_task_btn = QPushButton("Add Task")
+        add_task_btn.clicked.connect(self.add_task)
+        bot_h.addWidget(add_task_btn)
+
+        del_task_btn = QPushButton("Delete Selected Task")
+        del_task_btn.clicked.connect(self.delete_selected_task)
+        bot_h.addWidget(del_task_btn)
+
+        bot_h.addStretch()
+        layout.addLayout(bot_h)
+
+        self.setLayout(layout)
+        self.populate_pipeline_combo()
+
+    def populate_pipeline_combo(self):
+        self.pipeline_combo.clear()
+        c=self.connection.cursor()
+        c.execute("SELECT PIPELINE_ID, NAME FROM BRM_PIPELINES ORDER BY PIPELINE_ID")
+        rows=c.fetchall()
+        for (pid,pname) in rows:
+            disp=f"{pid} - {pname}"
+            self.pipeline_combo.addItem(disp, pid)
+
+    def create_new_pipeline(self):
+        name,ok=QInputDialog.getText(self,"New Pipeline","Name:")
+        if not ok or not name.strip():
+            return
+        desc,ok2=QInputDialog.getMultiLineText(self,"Description","(optional):")
+        if not ok2:
+            desc=""
+        try:
+            pid = create_pipeline(self.connection, name.strip(), desc.strip(), "PipelineDesignerUser")
+            QMessageBox.information(self,"Created",f"Pipeline {pid} created.")
+            self.populate_pipeline_combo()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
+
+    def load_pipeline(self):
+        pid = self.pipeline_combo.currentData()
+        if not pid:
+            QMessageBox.warning(self,"None","No pipeline selected.")
+            return
+        self.current_pipeline_id = pid
+        details=load_pipeline_details(self.connection,pid)
+        if not details:
+            QMessageBox.warning(self,"Not Found",f"Pipeline {pid} not found.")
+            return
+        self.scene.load_pipeline_graph(details)
+
+    def add_task(self):
+        if not self.current_pipeline_id:
+            QMessageBox.warning(self,"No Pipeline","Please load or create a pipeline first.")
+            return
+        tname,ok=QInputDialog.getText(self,"Task Name","(e.g. BFS Stage 1):")
+        if not ok or not tname.strip():
+            return
+        ttype,ok2=QInputDialog.getText(self,"Task Type","(RULE_BFS,VALIDATION,EXTERNAL,WAIT,...):")
+        if not ok2 or not ttype.strip():
+            return
+        params,ok3=QInputDialog.getMultiLineText(self,"Params JSON","(e.g. { \"rule_ids\":[12,13] }):")
+        if not ok3:
+            params="{}"
+        try:
+            tid=add_pipeline_task(self.connection, self.current_pipeline_id, tname.strip(), ttype.strip(), params.strip())
+            QMessageBox.information(self,"Added",f"Task {tid} created in pipeline {self.current_pipeline_id}.")
+            self.load_pipeline()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
+
+    def delete_selected_task(self):
+        # find selected node => get task_id => remove from DB
+        sel = self.scene.selectedItems()
+        if not sel:
+            QMessageBox.warning(self,"None","No task selected in the graph.")
+            return
+        node=sel[0]
+        if not isinstance(node, PipelineTaskNode):
+            QMessageBox.warning(self,"Wrong Selection","Please select a task node, not an edge.")
+            return
+        t_id=node.task_data["TASK_ID"]
+        confirm=QMessageBox.question(self,"Confirm",f"Delete pipeline task {t_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        try:
+            c.execute("DELETE FROM BRM_PIPELINE_TASKS WHERE TASK_ID=?",(t_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted",f"Task {t_id} removed.")
+            self.load_pipeline()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
+
+    def run_pipeline(self):
+        if not self.current_pipeline_id:
+            QMessageBox.warning(self,"No Pipeline","Load or create a pipeline first.")
+            return
+        skip_val=False
+        confirm=QMessageBox.question(self,"Validations?","Skip data validations in BFS tasks? (Yes=skip, No=run)",
+                                     QMessageBox.Yes|QMessageBox.No)
+        if confirm==QMessageBox.Yes:
+            skip_val=True
+        try:
+            (exed,skp)=execute_pipeline(self.connection,self.current_pipeline_id,skip_validations=skip_val)
+            QMessageBox.information(self,"Pipeline Execution",
+                                    f"Executed tasks => {exed}\nSkipped => {skp}")
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
+
+
+###############################################################################
+# 4) Graphics Scene / Node Classes
+###############################################################################
+class PipelineGraphicsScene(QGraphicsScene):
+    """
+    Holds the pipeline tasks as nodes, edges from depends_on.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+
+    def load_pipeline_graph(self, pipeline_details):
+        self.clear()
+        # pipeline_details => { "pipeline": {...}, "tasks": [...] }
+        tasks = pipeline_details["tasks"]
+
+        # build adjacency from depends_on
+        adjacency={}
+        task_map={}
+        for t_ in tasks:
+            tid=t_["TASK_ID"]
+            task_map[tid]=t_
+        for t_ in tasks:
+            tid=t_["TASK_ID"]
+            dep_str=(t_["DEPENDS_ON"] or "").strip()
+            if dep_str:
+                for d_ in dep_str.split(","):
+                    if d_.strip().isdigit():
+                        parent_id=int(d_.strip())
+                        adjacency.setdefault(parent_id,[]).append(tid)
+
+        # layout: BFS layering
+        in_degree={}
+        for t_ in tasks:
+            in_degree[t_["TASK_ID"]]=0
+        for parent,children in adjacency.items():
+            for c_ in children:
+                in_degree[c_]+=1
+
+        from collections import deque
+        queue = deque()
+        for tid,val in in_degree.items():
+            if val==0:
+                queue.append((tid,0))
+        visited=set()
+        level_count={}
+        while queue:
+            (tid,depth)=queue.popleft()
+            if tid in visited:
+                continue
+            visited.add(tid)
+            level_count[depth]=level_count.get(depth,0)+1
+            # create node
+            node=PipelineTaskNode(task_map[tid])
+            x=depth*250
+            y=(level_count[depth]-1)*150
+            node.setPos(x,y)
+            self.addItem(node)
+            # store reference in task_map with "node_obj"
+            task_map[tid]["node_obj"]=node
+
+            # push children
+            if tid in adjacency:
+                for ch_ in adjacency[tid]:
+                    if ch_ not in visited:
+                        queue.append((ch_, depth+1))
+
+        # draw edges
+        for t_ in tasks:
+            tid=t_["TASK_ID"]
+            dep_str=(t_["DEPENDS_ON"] or "").strip()
+            if not dep_str:
+                continue
+            for d_ in dep_str.split(","):
+                if d_.strip().isdigit():
+                    parent_id=int(d_.strip())
+                    if "node_obj" in task_map.get(parent_id,{}) and "node_obj" in task_map[tid]:
+                        parent_node=task_map[parent_id]["node_obj"]
+                        child_node=task_map[tid]["node_obj"]
+                        edge=PipelineEdge(parent_node, child_node)
+                        self.addItem(edge)
+
+
+class PipelineTaskNode(QGraphicsItem):
+    """
+    A rectangle node representing a pipeline task.
+    """
+    def __init__(self, task_data, parent=None):
+        super().__init__(parent)
+        self.task_data=task_data
+        self.rect_w=150
+        self.rect_h=70
+        self.setFlag(QGraphicsItem.ItemIsSelectable,True)
+        self.setAcceptHoverEvents(True)
+
+    def boundingRect(self):
+        return QRectF(0,0,self.rect_w,self.rect_h)
+
+    def paint(self,painter,option,widget=None):
+        painter.setPen(QPen(Qt.black,2))
+        painter.setBrush(QBrush(QColor("#FFFFCC")))  # pale yellow
+        painter.drawRect(0,0,self.rect_w,self.rect_h)
+        # text => task_name, task_type
+        txt = f"{self.task_data['TASK_ID']} - {self.task_data['TASK_NAME']}\nType={self.task_data['TASK_TYPE']}"
+        painter.drawText(0,0,self.rect_w,self.rect_h,Qt.AlignCenter,txt)
+
+
+class PipelineEdge(QGraphicsLineItem):
+    """
+    A line from parent_node to child_node center => arrow optional
+    """
+    def __init__(self, parent_node, child_node, parent=None):
+        super().__init__(parent)
+        self.parent_node = parent_node
+        self.child_node = child_node
+        self.setPen(QPen(Qt.darkBlue,2))
+        self.adjust()
+
+    def adjust(self):
+        r1=self.parent_node.sceneBoundingRect()
+        r2=self.child_node.sceneBoundingRect()
+        p1=r1.center()
+        p2=r2.center()
+        self.setLine(p1.x(),p1.y(),p2.x(),p2.y())
+
+    def paint(self,painter,option,widget=None):
+        self.adjust()
+        super().paint(painter,option,widget)
+
+
+###############################################################################
+# End of module
+###############################################################################
