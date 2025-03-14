@@ -1,0 +1,168 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: brm_performance_alerting_and_trends.py
+
+Description:
+  Provides a robust Performance Alerting and Historical Trends UI
+  for the BRM Tool. This includes:
+
+  1) Storing or reading performance data from RULE_EXECUTION_LOGS or RULE_PERF_STATS.
+  2) A tab (PerformanceAlertingTab) that:
+     • Lets the user pick a rule or "All Rules".
+     • Displays a time-series chart (line) of average execution times over days/weeks.
+     • Highlights or logs alerts if average time is above X for Y consecutive days.
+  3) Allows customizing thresholds (like 2000 ms average => alert).
+  4) Possibly triggers real-time notifications or color-coded warnings.
+
+Integration:
+  - BFS or scheduling logic logs execution_time_ms into RULE_EXECUTION_LOGS or RULE_PERF_STATS.
+  - This module queries that data to produce daily averages or rolling windows.
+  - Alerts can appear in the UI or stored in a table, e.g. RULE_ALERTS.
+"""
+
+import sys
+import math
+import logging
+from datetime import datetime, timedelta
+import pyqtgraph as pg
+
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QPushButton, QTableWidget, QTableWidgetItem, QInputDialog,
+    QMessageBox, QLineEdit
+)
+from PyQt5.QtCore import Qt
+# from brm_core_foundation import logger, fetch_all_dict, fetch_one_dict
+
+###############################################################################
+# Performance Alerting / Trends
+###############################################################################
+class PerformanceAlertingTab(QWidget):
+    """
+    A tab that shows performance trends for rule execution times.
+    1) A combo box to select a rule (or "All Rules").
+    2) A date range or a "last 30 days" approach.
+    3) A line chart with average times over each day.
+    4) A threshold input for alert detection (e.g. 2000 ms).
+    5) A small table or message showing current alerts (if any).
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.init_ui()
+        self.populate_rule_list()
+
+    def init_ui(self):
+        layout=QVBoxLayout(self)
+
+        # top row: pick rule + threshold
+        top_h=QHBoxLayout()
+        self.rule_combo=QComboBox()
+        top_h.addWidget(QLabel("Select Rule:"))
+        top_h.addWidget(self.rule_combo)
+
+        self.threshold_edit=QLineEdit()
+        self.threshold_edit.setPlaceholderText("Enter threshold ms (e.g. 2000)")
+        top_h.addWidget(QLabel("Alert Threshold:"))
+        top_h.addWidget(self.threshold_edit)
+
+        apply_btn=QPushButton("Apply")
+        apply_btn.clicked.connect(self.load_data)
+        top_h.addWidget(apply_btn)
+
+        top_h.addStretch()
+        layout.addLayout(top_h)
+
+        # line chart
+        self.chart=pg.PlotWidget(title="Performance Trend")
+        self.chart.setBackground('w')
+        layout.addWidget(self.chart)
+
+        # table or label for alerts
+        self.alerts_label=QLabel("")
+        self.alerts_label.setStyleSheet("color:red; font-weight:bold;")
+        layout.addWidget(self.alerts_label)
+
+        self.setLayout(layout)
+
+    def populate_rule_list(self):
+        self.rule_combo.clear()
+        self.rule_combo.addItem("All Rules", None)
+        c=self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        rows=c.fetchall()
+        for (rid,rn) in rows:
+            disp=f"{rid} - {rn}"
+            self.rule_combo.addItem(disp, rid)
+
+    def load_data(self):
+        # get selected rule
+        sel_rid=self.rule_combo.currentData()
+        # parse threshold
+        try:
+            threshold_ms=float(self.threshold_edit.text().strip())
+        except:
+            threshold_ms=2000.0
+
+        # query daily average from RULE_EXECUTION_LOGS (or RULE_PERF_STATS)
+        c=self.connection.cursor()
+        if sel_rid:
+            # single rule
+            c.execute("""
+                SELECT CAST(EXECUTION_TIMESTAMP as date) as d, 
+                       AVG(EXECUTION_TIME_MS) as avg_ms
+                FROM RULE_EXECUTION_LOGS
+                WHERE RULE_ID=?
+                  AND EXECUTION_TIMESTAMP>=DATEADD(day, -30, GETDATE())
+                GROUP BY CAST(EXECUTION_TIMESTAMP as date)
+                ORDER BY d
+            """,(sel_rid,))
+        else:
+            # all rules
+            c.execute("""
+                SELECT CAST(EXECUTION_TIMESTAMP as date) as d, 
+                       AVG(EXECUTION_TIME_MS) as avg_ms
+                FROM RULE_EXECUTION_LOGS
+                WHERE EXECUTION_TIMESTAMP>=DATEADD(day, -30, GETDATE())
+                GROUP BY CAST(EXECUTION_TIMESTAMP as date)
+                ORDER BY d
+            """)
+
+        rows=c.fetchall()
+        if not rows:
+            QMessageBox.information(self,"No Data","No execution data found in last 30 days.")
+            self.chart.clear()
+            self.alerts_label.setText("")
+            return
+
+        dates_x=[r[0] for r in rows]
+        avg_y=[float(r[1] or 0) for r in rows]
+        # convert dates to x-range
+        xvals=range(len(dates_x))
+        self.chart.clear()
+        self.chart.setLabel("left","Avg Exec Time (ms)")
+        # build label map
+        label_map=[(i,str(dates_x[i])) for i in range(len(dates_x))]
+        self.chart.getAxis("bottom").setTicks([label_map])
+        # plot line
+        self.chart.plot(list(xvals), avg_y, pen='b', symbol='o', symbolBrush='r')
+        self.chart.showGrid(x=True, y=True)
+
+        # check alert condition => if we have consecutive days above threshold => mention
+        consecutive_fail=0
+        max_consecutive=0
+        for val in avg_y:
+            if val>threshold_ms:
+                consecutive_fail+=1
+                if consecutive_fail>max_consecutive:
+                    max_consecutive=consecutive_fail
+            else:
+                consecutive_fail=0
+
+        if max_consecutive>1:
+            # e.g. "3 consecutive days above threshold 2000"
+            self.alerts_label.setText(f"ALERT: {max_consecutive} consecutive day(s) above {threshold_ms} ms threshold!")
+        else:
+            self.alerts_label.setText("")
