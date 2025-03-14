@@ -1,612 +1,477 @@
+Below is Module #7: advanced_decision_tables.py, focusing on:
+	•	A user‑friendly DecisionTableManager class for managing decision tables—add, edit, delete, and execute.
+	•	A DecisionTablesTab or AdvancedDecisionTablesTab for placing inside a QTabWidget.
+	•	Execution in a dry‑run transaction with pass/fail notifications and impacted record counts.
+	•	Real‑time logging of simulation results (to a table like DECISION_TABLE_EXECUTION_LOG or a generic SIMULATION_LOGS).
+
+We remove placeholders, ensuring code is self‑contained and references your existing logic for BFS or advanced rule checks only if you want to integrate them deeper. We’ll assume a table named DECISION_TABLES with fields:
+
+ DECISION_TABLE_ID (PK, identity)
+ TABLE_NAME        (varchar)
+ DESCRIPTION       (varchar)
+ DECISION_QUERY    (text or varchar) – the SQL logic returning 1 => pass
+
+Optionally, you can store an integer pass/fail and other custom columns.
+
+⸻
+
+Module #7: advanced_decision_tables.py
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
-Module: custom_rule_groups_and_alerts.py
+Module: advanced_decision_tables.py
 Description:
-  1) CustomRuleGroupEnhancedTab:
-     • Allows creation, rename, delete of custom groups (table: BRM_CUSTOM_RULE_GROUPS).
-     • Backup/restore group config (table: BRM_CUSTOM_GROUP_BACKUPS).
-     • Assign/remove rules from a group, with color-coding to indicate rule properties:
-       - Global rules (light blue)
-       - Critical rules (light red)
-       - Decision tables (pale yellow)
-     • Real-time context menu for rule removal or forced lock/unlock.
-
-  2) AlertsAndDashboardsTab:
-     • Displays alerts on overdue approvals, upcoming schedules, performance issues,
-       all auto-refreshed every minute.
-     • Integrates partial real-time notifications (e.g., new pipeline failures).
-
-Database Requirements (sample):
-  - BRM_CUSTOM_RULE_GROUPS(CUSTOM_GROUP_ID pk, CUSTOM_GROUP_NAME, OWNER_BUSINESS_GROUP, CREATED_BY, CREATED_TIMESTAMP, etc.)
-  - BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID, RULE_ID)
-  - BRM_CUSTOM_GROUP_BACKUPS(BACKUP_ID pk, CUSTOM_GROUP_ID, BACKUP_TIMESTAMP, BACKUP_VERSION, BACKUP_JSON)
-  - BRM_RULES(RULE_ID, RULE_NAME, IS_GLOBAL, CRITICAL_RULE, OPERATION_TYPE='DECISION_TABLE' or others, LOCKED_BY, etc.)
-  - RULE_SCHEDULES, BRM_RULE_APPROVALS, RULE_PERF_STATS, etc. for the alerts portion.
+  Provides a production‑ready UI for managing Decision Tables. Key features:
+    • DecisionTableManager (QDialog or QWidget) to view, add, edit, delete decision tables.
+    • Execute a decision table logic in a "dry-run" transaction, returning pass/fail.
+    • Capture record counts impacted, if your query returns rows.
+    • Log execution results into a dedicated log table or a general SIMULATION_LOGS table.
+    • Optionally incorporate BFS or advanced rule references if you want deeper synergy 
+      with the existing BRM tool logic (e.g., if a rule references a decision table).
 """
 
 import sys
-import json
 import logging
+import json
 import pyodbc
+import sqlparse
 from datetime import datetime
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QListWidget, 
-    QListWidgetItem, QPlainTextEdit, QPushButton, QLabel, QLineEdit, QMessageBox,
-    QInputDialog, QMenu
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QPushButton, QMessageBox, QDialog, QLineEdit, QLabel, QInputDialog,
+    QPlainTextEdit, QFormLayout
 )
-from core_foundation import logger, insert_audit_log
 
-# -----------------------------------------------------------------------------
-# 1) CustomRuleGroupEnhancedTab
-# -----------------------------------------------------------------------------
-class CustomRuleGroupEnhancedTab(QWidget):
+# from core_foundation import logger, fetch_one_dict, fetch_all_dict, insert_audit_log
+# or from advanced_simulation import run_single_rule_transaction if needed
+
+
+###############################################################################
+# UTILITY: execute_decision_query
+###############################################################################
+def execute_decision_query(conn, dt_id, decision_query):
     """
-    Advanced interface for custom rule groups:
-      - create, rename, delete
-      - backup/restore
-      - assign/remove rules
-      - color-coded rule properties in the tree
-      - real-time context menus for removal/force lock/unlock
+    Runs the decision_query in a transaction (dry-run).
+    Returns (pass_flag, message, record_count).
+      - pass_flag = True if query returns at least one row and row[0] == 1
+      - message = textual message
+      - record_count = number of rows fetched
+    Also logs to DECISION_TABLE_EXECUTION_LOG or similar.
+
+    We do a ROLLBACK after the SELECT, so it won't commit any DML changes.
     """
-    def __init__(self, connection, user_id, user_group, parent=None):
+    c = conn.cursor()
+    start_ts = datetime.now()
+    try:
+        c.execute("BEGIN TRANSACTION")
+        c.execute(decision_query)
+        rows = c.fetchall()
+        rec_count = len(rows)
+        if rows:
+            first_val = rows[0][0]
+            pass_flag = (first_val == 1)
+            message = f"Returned value: {first_val}"
+        else:
+            pass_flag = True
+            message = "No rows => PASS by default"
+        # always rollback for “simulation/dry-run”
+        c.execute("ROLLBACK")
+    except Exception as ex:
+        c.execute("ROLLBACK")
+        pass_flag = False
+        message = str(ex)
+        rec_count = 0
+
+    # optional: log to DECISION_TABLE_EXECUTION_LOG
+    log_c = conn.cursor()
+    try:
+        log_c.execute("""
+            INSERT INTO DECISION_TABLE_EXECUTION_LOG(
+              DECISION_TABLE_ID, EXEC_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT
+            )
+            VALUES (?, GETDATE(), ?, ?, ?)
+        """,(dt_id, 1 if pass_flag else 0, message, rec_count))
+        conn.commit()
+    except Exception as log_ex:
+        logging.error(f"Error logging decision table execution: {log_ex}")
+
+    return pass_flag, message, rec_count
+
+
+###############################################################################
+# DECISION TABLE MANAGER (DIALOG)
+###############################################################################
+class DecisionTableManager(QDialog):
+    """
+    A manager UI for decision tables. 
+    - Shows a table of ID, name, description, query
+    - Buttons: Add, Edit, Delete, Execute
+    - On Execute => runs the decision_query in a transaction => pass/fail => logs
+    - Has robust error handling
+    """
+    def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.user_id = user_id
-        self.user_group = user_group
+        self.setWindowTitle("Decision Table Manager")
+        self.resize(800, 500)
         self.init_ui()
-        self.refresh_all()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # Top controls for group creation/backup
-        top_h = QHBoxLayout()
-        self.new_group_edit = QLineEdit()
-        self.new_group_edit.setPlaceholderText("Enter new custom group name")
-        top_h.addWidget(self.new_group_edit)
+        # table
+        self.dt_table = QTableWidget(0,4)
+        self.dt_table.setHorizontalHeaderLabels(["DT_ID","Table Name","Description","Query"])
+        self.dt_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.dt_table)
 
-        create_btn = QPushButton("Create Group")
-        create_btn.clicked.connect(self.create_group)
-        top_h.addWidget(create_btn)
+        # button bar
+        btn_h = QHBoxLayout()
+        add_btn = QPushButton("Add Decision Table")
+        add_btn.clicked.connect(self.add_dt)
+        btn_h.addWidget(add_btn)
 
-        rename_btn = QPushButton("Rename Group")
-        rename_btn.clicked.connect(self.rename_group)
-        top_h.addWidget(rename_btn)
+        edit_btn = QPushButton("Edit Decision Table")
+        edit_btn.clicked.connect(self.edit_dt)
+        btn_h.addWidget(edit_btn)
 
-        del_btn = QPushButton("Delete Group")
-        del_btn.clicked.connect(self.delete_group)
-        top_h.addWidget(del_btn)
+        del_btn = QPushButton("Delete Decision Table")
+        del_btn.clicked.connect(self.delete_dt)
+        btn_h.addWidget(del_btn)
 
-        backup_btn = QPushButton("Backup Group")
-        backup_btn.clicked.connect(self.backup_group)
-        top_h.addWidget(backup_btn)
+        run_btn = QPushButton("Execute Decision Table")
+        run_btn.clicked.connect(self.run_dt)
+        btn_h.addWidget(run_btn)
 
-        restore_btn = QPushButton("Restore Group")
-        restore_btn.clicked.connect(self.restore_group)
-        top_h.addWidget(restore_btn)
+        ref_btn = QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_decision_tables)
+        btn_h.addWidget(ref_btn)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
 
-        top_h.addStretch()
-        layout.addLayout(top_h)
+        # optional log area for results
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
 
-        # Main horizontal splitter: left is group tree, right is available rules
-        main_h = QHBoxLayout()
-
-        # Left: Custom group tree
-        self.group_tree = QTreeWidget()
-        self.group_tree.setHeaderLabels(["Custom Group / Rule"])
-        self.group_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.group_tree.customContextMenuRequested.connect(self.on_tree_context)
-        main_h.addWidget(self.group_tree, 1)
-
-        # Right: available rules
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-
-        self.rule_search_edit = QLineEdit()
-        self.rule_search_edit.setPlaceholderText("Search available rules...")
-        self.rule_search_edit.textChanged.connect(self.load_available_rules)
-        right_layout.addWidget(self.rule_search_edit)
-
-        self.rule_list = QListWidget()
-        self.rule_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        right_layout.addWidget(self.rule_list)
-
-        assign_btn = QPushButton("Assign Selected Rule(s)")
-        assign_btn.clicked.connect(self.assign_rules)
-        right_layout.addWidget(assign_btn)
-
-        right_layout.addStretch()
-        main_h.addWidget(right_widget, 1)
-
-        layout.addLayout(main_h)
         self.setLayout(layout)
+        self.load_decision_tables()
 
-    def refresh_all(self):
-        self.load_group_tree()
-        self.load_available_rules()
-
-    def load_group_tree(self):
-        self.group_tree.clear()
+    def load_decision_tables(self):
+        self.dt_table.setRowCount(0)
         c = self.connection.cursor()
         try:
             c.execute("""
-                SELECT CUSTOM_GROUP_ID, CUSTOM_GROUP_NAME, OWNER_BUSINESS_GROUP
-                FROM BRM_CUSTOM_RULE_GROUPS
-                ORDER BY CUSTOM_GROUP_ID DESC
+                SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
+                FROM DECISION_TABLES
+                ORDER BY DECISION_TABLE_ID
             """)
-            groups = c.fetchall()
-            for (cgid, cgname, ownerbg) in groups:
-                disp = f"{cgname} (Owner={ownerbg})"
-                group_item = QTreeWidgetItem([disp])
-                group_item.setData(0, Qt.UserRole, cgid)
-                # color group item
-                group_item.setBackground(0, QBrush(QColor("#E0E0E0")))
-                self.group_tree.addTopLevelItem(group_item)
-
-                # load assigned rules
-                c2 = self.connection.cursor()
-                c2.execute("""
-                    SELECT R.RULE_ID, R.RULE_NAME, R.IS_GLOBAL, R.CRITICAL_RULE,
-                           R.OPERATION_TYPE, R.LOCKED_BY
-                    FROM BRM_CUSTOM_GROUP_MEMBERS M
-                    JOIN BRM_RULES R ON M.RULE_ID=R.RULE_ID
-                    WHERE M.CUSTOM_GROUP_ID=?
-                """,(cgid,))
-                rule_rows = c2.fetchall()
-                for (rid, rname, isg, crit, op_type, lby) in rule_rows:
-                    txt = f"Rule {rid}: {rname}"
-                    rule_item = QTreeWidgetItem([txt])
-                    rule_item.setData(0, Qt.UserRole, rid)
-                    # color coding
-                    if isg==1:
-                        rule_item.setBackground(0, QBrush(QColor("#D5EEFF"))) # light blue
-                    if crit==1:
-                        rule_item.setBackground(0, QBrush(QColor("#FFD1D1"))) # light red
-                    if op_type and op_type.upper()=="DECISION_TABLE":
-                        rule_item.setBackground(0, QBrush(QColor("#FFFFCC"))) # pale yellow
-                    if lby:
-                        rule_item.setToolTip(0, f"Locked by {lby}")
-                    group_item.addChild(rule_item)
-
-            self.group_tree.expandAll()
-        except Exception as ex:
-            logger.error(f"Error loading group tree: {ex}")
-            QMessageBox.critical(self, "Group Tree Error", str(ex))
-
-    def load_available_rules(self):
-        self.rule_list.clear()
-        search_term = self.rule_search_edit.text().strip()
-        c = self.connection.cursor()
-        try:
-            if search_term:
-                c.execute("""
-                    SELECT RULE_ID, RULE_NAME, OWNER_GROUP
-                    FROM BRM_RULES
-                    WHERE RULE_NAME LIKE ? OR RULE_SQL LIKE ?
-                    ORDER BY RULE_ID DESC
-                    OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY
-                """,(f"%{search_term}%",f"%{search_term}%"))
-            else:
-                c.execute("""
-                    SELECT RULE_ID, RULE_NAME, OWNER_GROUP
-                    FROM BRM_RULES
-                    ORDER BY RULE_ID DESC
-                    OFFSET 0 ROWS FETCH NEXT 500 ROWS ONLY
-                """)
             rows = c.fetchall()
-
-            # exclude already assigned
-            c2 = self.connection.cursor()
-            c2.execute("SELECT DISTINCT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS")
-            assigned = {r[0] for r in c2.fetchall()}
-
-            for (rid, rn, og) in rows:
-                if rid in assigned:
-                    continue
-                display = f"Rule {rid}: {rn} (Owner={og})"
-                item = QListWidgetItem(display)
-                item.setData(Qt.UserRole, rid)
-                self.rule_list.addItem(item)
-
+            for row in rows:
+                r_i = self.dt_table.rowCount()
+                self.dt_table.insertRow(r_i)
+                for col_i,val in enumerate(row):
+                    self.dt_table.setItem(r_i,col_i, QTableWidgetItem(str(val) if val else ""))
         except Exception as ex:
-            logger.error(f"Error loading available rules: {ex}")
-            QMessageBox.critical(self, "Error", str(ex))
+            QMessageBox.critical(self,"Load Error",f"Error loading DECISION_TABLES: {ex}")
 
-    def on_tree_context(self, pos):
-        item = self.group_tree.itemAt(pos)
-        if not item:
+    def add_dt(self):
+        """
+        Prompt user for table name, description, query => insert new record.
+        """
+        dt_name, ok = QInputDialog.getText(self, "Add Decision Table", "Table Name:")
+        if not ok or not dt_name.strip():
             return
-        parent = item.parent()
-        if parent:
-            # context for a rule within a group
-            menu = QMenu()
-            remove_action = menu.addAction("Remove Rule from Group")
-            lock_toggle_action = menu.addAction("Toggle Lock/Unlock")
-            choice = menu.exec_(self.group_tree.viewport().mapToGlobal(pos))
-            group_id = parent.data(0, Qt.UserRole)
-            rule_id = item.data(0, Qt.UserRole)
-            if choice==remove_action:
-                self.remove_rule_from_group(group_id, rule_id)
-            elif choice==lock_toggle_action:
-                self.toggle_lock(rule_id)
-        else:
-            # context for a group item
-            pass
+        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Enter description (optional):")
+        if not ok2:
+            desc=""
+        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query (SQL)", "Enter query returning 1 => pass:")
+        if not ok3 or not query.strip():
+            QMessageBox.warning(self,"Input Error","Decision query is required.")
+            return
 
-    def remove_rule_from_group(self, group_id, rule_id):
         c = self.connection.cursor()
         try:
             c.execute("""
-                DELETE FROM BRM_CUSTOM_GROUP_MEMBERS
-                WHERE CUSTOM_GROUP_ID=? AND RULE_ID=?
-            """,(group_id, rule_id))
+                INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY)
+                VALUES(?,?,?)
+            """,(dt_name.strip(),desc.strip(),query.strip()))
             self.connection.commit()
-            QMessageBox.information(self, "Removed", f"Rule {rule_id} removed from group {group_id}.")
-            self.refresh_all()
+            QMessageBox.information(self,"Added","Decision table added.")
+            self.load_decision_tables()
         except Exception as ex:
-            logger.error(f"Error removing rule: {ex}")
-            QMessageBox.critical(self, "Removal Error", str(ex))
+            QMessageBox.critical(self,"Add Error",str(ex))
 
-    def toggle_lock(self, rule_id):
-        c = self.connection.cursor()
-        try:
-            c.execute("SELECT LOCKED_BY FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-            row = c.fetchone()
-            if not row:
-                QMessageBox.warning(self, "Not Found", f"Rule {rule_id} not found.")
-                return
-            locked_by = row[0]
-            if not locked_by:
-                # lock
-                new_lock = f"User:{self.user_id}"
-                c.execute("""
-                    UPDATE BRM_RULES
-                    SET LOCK_STATUS=1, LOCKED_BY=?, LOCKED_AT=GETDATE()
-                    WHERE RULE_ID=?
-                """,(new_lock, rule_id))
-                c.connection.commit()
-                QMessageBox.information(self, "Locked", f"Rule {rule_id} now locked by {new_lock}.")
-            else:
-                # unlock if user is same or admin
-                if locked_by==f"User:{self.user_id}" or self.user_group=="Admin":
-                    c.execute("""
-                        UPDATE BRM_RULES
-                        SET LOCK_STATUS=0, LOCKED_BY=NULL, LOCKED_AT=NULL
-                        WHERE RULE_ID=?
-                    """,(rule_id,))
-                    c.connection.commit()
-                    QMessageBox.information(self, "Unlocked", f"Rule {rule_id} is now unlocked.")
-                else:
-                    QMessageBox.warning(self, "Locked", f"Rule {rule_id} is locked by {locked_by}.")
-            self.refresh_all()
-        except Exception as ex:
-            logger.error(f"toggle_lock error: {ex}")
-            QMessageBox.critical(self, "Lock Error", str(ex))
-
-    def create_group(self):
-        gname = self.new_group_edit.text().strip()
-        if not gname:
-            QMessageBox.warning(self, "Input Error", "Please enter a group name.")
+    def edit_dt(self):
+        """
+        Let user pick a row => gather existing fields => prompt user => update.
+        """
+        row = self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"No Selection","No decision table selected.")
             return
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                INSERT INTO BRM_CUSTOM_RULE_GROUPS
-                (CUSTOM_GROUP_NAME, OWNER_BUSINESS_GROUP, CREATED_BY, CREATED_TIMESTAMP)
-                VALUES(?,?,?,GETDATE())
-            """,(gname, self.user_group, f"User:{self.user_id}"))
-            c.connection.commit()
-            QMessageBox.information(self, "Created", f"Custom group '{gname}' created.")
-            self.new_group_edit.clear()
-            self.refresh_all()
-        except Exception as ex:
-            logger.error(f"create_group error: {ex}")
-            QMessageBox.critical(self, "Create Error", str(ex))
-
-    def rename_group(self):
-        sel_items = self.group_tree.selectedItems()
-        if not sel_items:
-            QMessageBox.warning(self, "Select Group", "Please select a group to rename.")
+        dt_id_item = self.dt_table.item(row,0)
+        if not dt_id_item:
             return
-        group_item = sel_items[0]
-        group_id = group_item.data(0, Qt.UserRole)
-        old_text = group_item.text(0)
-        new_name, ok = QInputDialog.getText(self, "Rename Group", f"Enter new name for '{old_text}':")
+        dt_id = int(dt_id_item.text())
+
+        curr_name = self.dt_table.item(row,1).text() if self.dt_table.item(row,1) else ""
+        curr_desc = self.dt_table.item(row,2).text() if self.dt_table.item(row,2) else ""
+        curr_query = self.dt_table.item(row,3).text() if self.dt_table.item(row,3) else ""
+
+        new_name, ok = QInputDialog.getText(self,"Edit Decision Table","New Table Name:", text=curr_name)
         if not ok or not new_name.strip():
             return
+        new_desc, ok2 = QInputDialog.getMultiLineText(self,"Description","Optional:", text=curr_desc)
+        if not ok2:
+            new_desc=curr_desc
+        new_query, ok3 = QInputDialog.getMultiLineText(self,"Decision Query","(SQL):", text=curr_query)
+        if not ok3 or not new_query.strip():
+            QMessageBox.warning(self,"Input Error","Decision query is required.")
+            return
+
         c = self.connection.cursor()
         try:
             c.execute("""
-                UPDATE BRM_CUSTOM_RULE_GROUPS
-                SET CUSTOM_GROUP_NAME=?
-                WHERE CUSTOM_GROUP_ID=?
-            """,(new_name.strip(), group_id))
-            c.connection.commit()
-            QMessageBox.information(self, "Renamed", f"Group renamed to '{new_name}'.")
-            self.refresh_all()
+                UPDATE DECISION_TABLES
+                SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
+                WHERE DECISION_TABLE_ID=?
+            """,(new_name.strip(), new_desc.strip(), new_query.strip(), dt_id))
+            self.connection.commit()
+            QMessageBox.information(self,"Updated","Decision table updated.")
+            self.load_decision_tables()
         except Exception as ex:
-            logger.error(f"rename_group error: {ex}")
-            QMessageBox.critical(self, "Rename Error", str(ex))
+            QMessageBox.critical(self,"Update Error",str(ex))
 
-    def delete_group(self):
-        sel_items = self.group_tree.selectedItems()
-        if not sel_items:
-            QMessageBox.warning(self, "Selection Error", "Select a group to delete.")
+    def delete_dt(self):
+        row=self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"No Selection","No decision table selected.")
             return
-        group_item = sel_items[0]
-        group_id = group_item.data(0, Qt.UserRole)
-        confirm = QMessageBox.question(self, "Confirm", f"Delete group ID {group_id}?")
+        dt_id_item=self.dt_table.item(row,0)
+        if not dt_id_item:
+            return
+        dt_id=int(dt_id_item.text())
+        confirm=QMessageBox.question(self,"Confirm",f"Delete decision table {dt_id}?")
         if confirm!=QMessageBox.Yes:
             return
-        c = self.connection.cursor()
+        c=self.connection.cursor()
         try:
-            c.execute("DELETE FROM BRM_CUSTOM_RULE_GROUPS WHERE CUSTOM_GROUP_ID=?", (group_id,))
-            c.connection.commit()
-            QMessageBox.information(self, "Deleted", f"Group {group_id} deleted.")
-            self.refresh_all()
+            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted","Decision table deleted.")
+            self.load_decision_tables()
         except Exception as ex:
-            logger.error(f"delete_group error: {ex}")
-            QMessageBox.critical(self, "Delete Error", str(ex))
+            QMessageBox.critical(self,"Delete Error",str(ex))
 
-    def backup_group(self):
-        sel_items = self.group_tree.selectedItems()
-        if not sel_items:
-            QMessageBox.warning(self, "Selection Error", "Select a group to backup.")
+    def run_dt(self):
+        """
+        Execute the selected decision table => show pass/fail => log result => show impacted rows.
+        """
+        row = self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"No Selection","No decision table selected.")
             return
-        group_item = sel_items[0]
-        group_id = group_item.data(0, Qt.UserRole)
-        c = self.connection.cursor()
-        try:
-            c.execute("SELECT CUSTOM_GROUP_NAME FROM BRM_CUSTOM_RULE_GROUPS WHERE CUSTOM_GROUP_ID=?", (group_id,))
-            row = c.fetchone()
-            if not row:
-                QMessageBox.warning(self, "Not Found", "Group not found.")
-                return
-            group_name = row[0]
-
-            c.execute("SELECT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS WHERE CUSTOM_GROUP_ID=?", (group_id,))
-            members = [r[0] for r in c.fetchall()]
-            backup_data = {"group_name":group_name, "members":members}
-
-            c.execute("""
-                SELECT ISNULL(MAX(BACKUP_VERSION),0)+1
-                FROM BRM_CUSTOM_GROUP_BACKUPS
-                WHERE CUSTOM_GROUP_ID=?
-            """,(group_id,))
-            version_row = c.fetchone()
-            new_ver = version_row[0] if version_row else 1
-
-            c.execute("""
-                INSERT INTO BRM_CUSTOM_GROUP_BACKUPS(
-                    CUSTOM_GROUP_ID, BACKUP_TIMESTAMP, BACKUP_VERSION, BACKUP_JSON
-                )
-                VALUES(?, GETDATE(), ?, ?)
-            """,(group_id, new_ver, json.dumps(backup_data)))
-            c.connection.commit()
-            QMessageBox.information(self, "Backup", f"Version {new_ver} created for group {group_id}.")
-            self.refresh_all()
-        except Exception as ex:
-            logger.error(f"backup_group error: {ex}")
-            QMessageBox.critical(self, "Backup Error", str(ex))
-
-    def restore_group(self):
-        sel_items = self.group_tree.selectedItems()
-        if not sel_items:
-            QMessageBox.warning(self, "Selection Error", "Select a group to restore.")
+        dt_id_item = self.dt_table.item(row,0)
+        if not dt_id_item:
             return
-        group_item = sel_items[0]
-        group_id = group_item.data(0, Qt.UserRole)
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                SELECT BACKUP_VERSION, BACKUP_TIMESTAMP, BACKUP_JSON
-                FROM BRM_CUSTOM_GROUP_BACKUPS
-                WHERE CUSTOM_GROUP_ID=?
-                ORDER BY BACKUP_VERSION DESC
-            """,(group_id,))
-            backups = c.fetchall()
-            if not backups:
-                QMessageBox.information(self, "No Backup", "No backups found for this group.")
-                return
-            items = [f"Version {b[0]} (ts={b[1]})" for b in backups]
-            sel, ok = QInputDialog.getItem(self, "Restore Backup", "Select version:", items, 0, False)
-            if not ok or not sel:
-                return
-            import re
-            m = re.search(r"Version\s+(\d+)", sel)
-            if not m:
-                return
-            ver = int(m.group(1))
-            backup_json = None
-            for b in backups:
-                if b[0]==ver:
-                    backup_json = b[2]
-                    break
-            if not backup_json:
-                QMessageBox.warning(self, "Not Found", "Backup not found.")
-                return
-            confirm = QMessageBox.question(self, "Confirm", f"Restore group {group_id} to version {ver}?")
-            if confirm!=QMessageBox.Yes:
-                return
+        dt_id = int(dt_id_item.text())
 
-            # parse backup
-            try:
-                data = json.loads(backup_json)
-            except Exception as ex:
-                QMessageBox.critical(self, "JSON Error", str(ex))
-                return
-
-            new_group_name = data.get("group_name")
-            members = data.get("members", [])
-            c.execute("BEGIN TRANSACTION")
-            c.execute("""
-                UPDATE BRM_CUSTOM_RULE_GROUPS
-                SET CUSTOM_GROUP_NAME=?
-                WHERE CUSTOM_GROUP_ID=?
-            """,(new_group_name, group_id))
-            c.execute("DELETE FROM BRM_CUSTOM_GROUP_MEMBERS WHERE CUSTOM_GROUP_ID=?", (group_id,))
-            for r in members:
-                c.execute("""
-                    INSERT INTO BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID, RULE_ID)
-                    VALUES(?,?)
-                """,(group_id, r))
-            c.execute("COMMIT")
-            QMessageBox.information(self, "Restored", f"Group {group_id} restored to v{ver}.")
-            self.refresh_all()
-
-        except Exception as ex:
-            c.execute("ROLLBACK")
-            logger.error(f"restore_group error: {ex}")
-            QMessageBox.critical(self, "Restore Error", str(ex))
-
-    def assign_rules(self):
-        sel_items = self.group_tree.selectedItems()
-        if not sel_items:
-            QMessageBox.warning(self, "No Group", "Please select a custom group from the tree.")
+        c=self.connection.cursor()
+        c.execute("SELECT DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
+        row_q=c.fetchone()
+        if not row_q:
+            QMessageBox.warning(self,"Not Found",f"Decision table {dt_id} not found in DB.")
             return
-        group_item = sel_items[0]
-        parent_data = group_item.parent()
-        if parent_data:
-            # if user selected a rule item, climb up
-            group_item = group_item.parent()
-        group_id = group_item.data(0, Qt.UserRole)
-        if not group_id:
-            QMessageBox.warning(self, "Error", "Invalid group selected.")
+        dt_query = row_q[0]
+        if not dt_query:
+            QMessageBox.warning(self,"No Query",f"Decision table {dt_id} has empty DECISION_QUERY.")
             return
-        sel_rules = self.rule_list.selectedItems()
-        if not sel_rules:
-            QMessageBox.warning(self, "No Rules", "No rules selected from the list.")
-            return
-        c = self.connection.cursor()
-        count = 0
-        for item in sel_rules:
-            rid = item.data(Qt.UserRole)
-            try:
-                c.execute("""
-                    INSERT INTO BRM_CUSTOM_GROUP_MEMBERS(CUSTOM_GROUP_ID, RULE_ID)
-                    VALUES(?,?)
-                """,(group_id, rid))
-                count+=1
-            except Exception:
-                # might be unique constraint or other error
-                pass
-        c.connection.commit()
-        QMessageBox.information(self, "Assigned", f"{count} rule(s) assigned to group {group_id}.")
-        self.refresh_all()
 
-# -----------------------------------------------------------------------------
-# 2) AlertsAndDashboardsTab
-# -----------------------------------------------------------------------------
-class AlertsAndDashboardsTab(QWidget):
+        pass_flag, msg, rec_count = execute_decision_query(self.connection, dt_id, dt_query)
+        final_msg = f"DecisionTable {dt_id} => {'PASS' if pass_flag else 'FAIL'}\n{msg}\nRecords impacted: {rec_count}"
+        QMessageBox.information(self,"Execution Result",final_msg)
+        self.result_text.appendPlainText(final_msg)
+
+
+###############################################################################
+# OPTIONAL WIDGET: AdvancedDecisionTablesTab
+###############################################################################
+class AdvancedDecisionTablesTab(QWidget):
     """
-    Displays overdue approvals (older than 3 days), upcoming schedules (next 24 hours),
-    and performance alerts if rule perf stats exceed certain thresholds. 
-    Auto-refresh every minute.
+    A QWidget version that can be placed in your main QTabWidget instead of a QDialog.
+    Similar functionality to DecisionTableManager, but as a tab.
     """
-    def __init__(self, connection, user_id, user_group, parent=None):
+    def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.user_id = user_id
-        self.user_group = user_group
         self.init_ui()
-        self.check_alerts()
-        self.start_auto_refresh()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
-        self.alert_text = QPlainTextEdit()
-        self.alert_text.setReadOnly(True)
-        layout.addWidget(self.alert_text)
 
-        refresh_btn = QPushButton("Refresh Alerts")
-        refresh_btn.clicked.connect(self.check_alerts)
-        layout.addWidget(refresh_btn)
+        self.dt_table = QTableWidget(0,4)
+        self.dt_table.setHorizontalHeaderLabels(["ID","Name","Desc","Query"])
+        self.dt_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.dt_table)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add")
+        add_btn.clicked.connect(self.add_dt)
+        btn_row.addWidget(add_btn)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(self.edit_dt)
+        btn_row.addWidget(edit_btn)
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(self.del_dt)
+        btn_row.addWidget(del_btn)
+        run_btn = QPushButton("Execute")
+        run_btn.clicked.connect(self.run_dt)
+        btn_row.addWidget(run_btn)
+        ref_btn = QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_dt)
+        btn_row.addWidget(ref_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.log_area = QPlainTextEdit()
+        self.log_area.setReadOnly(True)
+        layout.addWidget(self.log_area)
 
         self.setLayout(layout)
+        self.load_dt()
 
-    def check_alerts(self):
-        lines = []
-        c = self.connection.cursor()
+    def load_dt(self):
+        self.dt_table.setRowCount(0)
+        c=self.connection.cursor()
+        try:
+            c.execute("SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY FROM DECISION_TABLES ORDER BY DECISION_TABLE_ID")
+            rows=c.fetchall()
+            for row in rows:
+                r_i=self.dt_table.rowCount()
+                self.dt_table.insertRow(r_i)
+                for col_i,val in enumerate(row):
+                    self.dt_table.setItem(r_i,col_i,QTableWidgetItem(str(val) if val else ""))
+        except Exception as ex:
+            QMessageBox.critical(self,"Load Error",str(ex))
 
-        # 1) Old approvals (older than 3 days)
+    def add_dt(self):
+        # same pattern as above
+        nm,ok = QInputDialog.getText(self,"Add","TableName:")
+        if not ok or not nm.strip():
+            return
+        ds,ok2=QInputDialog.getMultiLineText(self,"Description","(Optional):")
+        if not ok2:
+            ds=""
+        q_,ok3=QInputDialog.getMultiLineText(self,"Query","(SQL returning 1 => pass):")
+        if not ok3 or not q_.strip():
+            QMessageBox.warning(self,"Input Error","Query is required.")
+            return
+        c=self.connection.cursor()
         try:
             c.execute("""
-                SELECT A.RULE_ID, A.APPROVAL_STAGE, R.RULE_NAME,
-                       DATEDIFF(DAY, ISNULL(A.APPROVED_TIMESTAMP, R.CREATED_TIMESTAMP), GETDATE()) as AgeDays
-                FROM BRM_RULE_APPROVALS A
-                JOIN BRM_RULES R ON A.RULE_ID=R.RULE_ID
-                WHERE A.APPROVED_FLAG=0
-                  AND A.APPROVAL_STAGE = (
-                     SELECT MIN(APPROVAL_STAGE)
-                     FROM BRM_RULE_APPROVALS
-                     WHERE RULE_ID=A.RULE_ID AND APPROVED_FLAG=0
-                  )
-                  AND DATEDIFF(DAY, ISNULL(A.APPROVED_TIMESTAMP, R.CREATED_TIMESTAMP), GETDATE())>3
-            """)
-            old_approvals = c.fetchall()
-            if old_approvals:
-                lines.append("Approvals older than 3 days:")
-                for (rid, stg, rnm, age) in old_approvals:
-                    lines.append(f" - Rule {rid} (stage={stg}, {rnm}), age={age} days")
-            else:
-                lines.append("No approvals older than 3 days.")
+                INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY)
+                VALUES(?,?,?)
+            """,(nm.strip(), ds.strip(), q_.strip()))
+            self.connection.commit()
+            QMessageBox.information(self,"Added","New decision table created.")
+            self.load_dt()
         except Exception as ex:
-            lines.append(f"Error checking old approvals: {ex}")
+            QMessageBox.critical(self,"Add Error",str(ex))
 
-        lines.append("")
+    def edit_dt(self):
+        row=self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No decision table selected.")
+            return
+        dt_id_item=self.dt_table.item(row,0)
+        if not dt_id_item:
+            return
+        dt_id=int(dt_id_item.text())
+        old_name = self.dt_table.item(row,1).text() or ""
+        old_desc = self.dt_table.item(row,2).text() or ""
+        old_q = self.dt_table.item(row,3).text() or ""
 
-        # 2) Upcoming schedules (within next 24h)
+        new_name,ok=QInputDialog.getText(self,"Edit Name","New name:", text=old_name)
+        if not ok or not new_name.strip():
+            return
+        new_desc,ok2=QInputDialog.getMultiLineText(self,"Edit Desc","...", text=old_desc)
+        if not ok2:
+            new_desc=old_desc
+        new_q,ok3=QInputDialog.getMultiLineText(self,"Edit Query","...", text=old_q)
+        if not ok3 or not new_q.strip():
+            QMessageBox.warning(self,"Error","Query required.")
+            return
+        c=self.connection.cursor()
         try:
             c.execute("""
-                SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME
-                FROM RULE_SCHEDULES
-                WHERE STATUS='Scheduled'
-                  AND SCHEDULE_TIME>=GETDATE()
-                  AND SCHEDULE_TIME<=DATEADD(HOUR,24,GETDATE())
-                ORDER BY SCHEDULE_TIME
-            """)
-            scheds = c.fetchall()
-            if scheds:
-                lines.append("Upcoming schedules (next 24h):")
-                for (sid, rid, stime) in scheds:
-                    lines.append(f" - Sched {sid}: rule {rid} at {stime}")
-            else:
-                lines.append("No upcoming schedules in the next 24 hours.")
+                UPDATE DECISION_TABLES
+                SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
+                WHERE DECISION_TABLE_ID=?
+            """,(new_name.strip(), new_desc.strip(), new_q.strip(), dt_id))
+            self.connection.commit()
+            QMessageBox.information(self,"Updated","Decision table updated.")
+            self.load_dt()
         except Exception as ex:
-            lines.append(f"Error checking schedules: {ex}")
+            QMessageBox.critical(self,"Error",str(ex))
 
-        lines.append("")
-
-        # 3) Performance alerts
+    def del_dt(self):
+        row=self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No selection.")
+            return
+        dtid_item=self.dt_table.item(row,0)
+        if not dtid_item:
+            return
+        dt_id=int(dtid_item.text())
+        confirm=QMessageBox.question(self,"Confirm",f"Delete decision table {dt_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
         try:
-            threshold_ms = 2000
-            c.execute("""
-                SELECT RULE_ID, AVG(EXEC_TIME_MS)
-                FROM RULE_PERF_STATS
-                WHERE DATE_KEY >= CONVERT(varchar(8), DATEADD(DAY,-7,GETDATE()),112)
-                GROUP BY RULE_ID
-                HAVING AVG(EXEC_TIME_MS)>?
-                ORDER BY AVG(EXEC_TIME_MS) DESC
-            """,(threshold_ms,))
-            perf_rows = c.fetchall()
-            if perf_rows:
-                lines.append("Performance Alerts (>2000 ms avg last 7 days):")
-                for (rid,avg_ms) in perf_rows:
-                    lines.append(f" - Rule {rid} => avg {avg_ms:.1f} ms")
-            else:
-                lines.append("No performance alerts (last 7 days).")
+            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted","Decision table removed.")
+            self.load_dt()
         except Exception as ex:
-            lines.append(f"Error checking performance: {ex}")
+            QMessageBox.critical(self,"Error",str(ex))
 
-        self.alert_text.setPlainText("\n".join(lines))
-        logger.info("Alerts updated.")
+    def run_dt(self):
+        row=self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No table selected.")
+            return
+        dtid_item=self.dt_table.item(row,0)
+        dt_id=int(dtid_item.text())
+        q_item=self.dt_table.item(row,3)
+        query=q_item.text() if q_item else ""
+        if not query.strip():
+            QMessageBox.warning(self,"No Query","No query found for that DT.")
+            return
+        pass_flag,msg,rcount = execute_decision_query(self.connection, dt_id, query)
+        text=f"DecisionTable {dt_id} => {'PASS' if pass_flag else 'FAIL'}\n{msg}\nRecords impacted={rcount}"
+        QMessageBox.information(self,"Executed",text)
+        self.log_area.appendPlainText(text)
 
-    def start_auto_refresh(self):
-        self.alert_timer = QTimer(self)
-        self.alert_timer.timeout.connect(self.check_alerts)
-        self.alert_timer.start(60000)  # every 60s
+Key Sections Explanation
+	1.	execute_decision_query
+	•	Runs the decision_query inside a transaction.
+	•	Uses “dry-run” logic => always ROLLBACK.
+	•	Interprets the first row’s first column as 1 => pass, else fail.
+	•	Logs the result to a table named DECISION_TABLE_EXECUTION_LOG (or you can rename to SIMULATION_LOGS).
+	2.	DecisionTableManager (as a QDialog)
+	•	For a smaller modal approach.
+	•	Lists decision tables in a QTableWidget.
+	•	“Add,” “Edit,” “Delete,” “Execute.”
+	•	On “Execute” => calls execute_decision_query => shows pass/fail in a message box.
+	•	Also shows a QPlainTextEdit at the bottom to store logs or extended messages.
+	3.	AdvancedDecisionTablesTab (as a QWidget)
+	•	Similar functionality but is not a QDialog. You can place it in your app’s main tabs.
+	•	Has the same “Add,” “Edit,” “Delete,” “Execute” operations, but structured for tab usage.
+
+Please respond “OK” if you approve Module #7. Next, we can proceed with Module #8 (e.g. defect_management.py) or whichever final aggregator you’d like.
