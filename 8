@@ -1,0 +1,311 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: unified_activity_logs.py
+Description:
+  Provides a consolidated "Activity Log" viewer that merges multiple log sources:
+    1. BRM_AUDIT_LOG (for CRUD actions, approvals, etc.)
+    2. RULE_EXECUTION_LOGS (for BFS runs or single rule execution details)
+    3. SIMULATION_LOGS (if you store dry-run logs separately)
+    4. DATA_VALIDATION_LOGS
+    5. PIPELINE_TASK_RUNS
+  ... or any other logs you want to unify in a single chronological table.
+
+Features:
+  - A single QTableWidget (or QTableView + custom model) that pulls records from each log table,
+    merges them by timestamp, and displays them in descending chronological order.
+  - Filter by user, date range, log source (checkboxes?), or rule ID, etc.
+  - Optionally export to CSV.
+
+This addresses the request for a single "unified" or "consolidated" log viewer
+where one can see everything that happened in the system in chronological order.
+"""
+
+import sys
+import logging
+import csv
+from datetime import datetime, timedelta
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QPushButton, QLabel, QLineEdit, QComboBox, QCheckBox, QDateTimeEdit,
+    QFileDialog, QMessageBox
+)
+from PyQt5.QtCore import Qt, QDateTime
+
+
+class UnifiedActivityLogTab(QWidget):
+    """
+    A tab that queries multiple tables (BRM_AUDIT_LOG, RULE_EXECUTION_LOGS, SIMULATION_LOGS, 
+    DATA_VALIDATION_LOGS, PIPELINE_TASK_RUNS, etc.) merges them by timestamp descending,
+    and displays in one table. User can filter by date range, user, or source type if desired.
+    """
+    def __init__(self, connection, user_group="User", parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_group = user_group
+
+        layout = QVBoxLayout(self)
+
+        # Filter row
+        filter_layout = QHBoxLayout()
+        self.start_dt = QDateTimeEdit()
+        self.start_dt.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.start_dt.setCalendarPopup(True)
+        self.start_dt.setDateTime(QDateTime.currentDateTime().addDays(-7))  # default last 7 days
+        filter_layout.addWidget(QLabel("Start:"))
+        filter_layout.addWidget(self.start_dt)
+
+        self.end_dt = QDateTimeEdit()
+        self.end_dt.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.end_dt.setCalendarPopup(True)
+        self.end_dt.setDateTime(QDateTime.currentDateTime())
+        filter_layout.addWidget(QLabel("End:"))
+        filter_layout.addWidget(self.end_dt)
+
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("Filter by user/actor (optional)")
+        filter_layout.addWidget(self.user_edit)
+
+        # Source checkboxes
+        self.cb_audit = QCheckBox("Audit")
+        self.cb_audit.setChecked(True)
+        filter_layout.addWidget(self.cb_audit)
+        self.cb_exec = QCheckBox("ExecLogs")
+        self.cb_exec.setChecked(True)
+        filter_layout.addWidget(self.cb_exec)
+        self.cb_sim = QCheckBox("Simulations")
+        self.cb_sim.setChecked(True)
+        filter_layout.addWidget(self.cb_sim)
+        self.cb_data_val = QCheckBox("DataVal")
+        self.cb_data_val.setChecked(True)
+        filter_layout.addWidget(self.cb_data_val)
+        self.cb_pipeline = QCheckBox("Pipeline")
+        self.cb_pipeline.setChecked(True)
+        filter_layout.addWidget(self.cb_pipeline)
+
+        load_btn = QPushButton("Load Logs")
+        load_btn.clicked.connect(self.load_logs)
+        filter_layout.addWidget(load_btn)
+
+        filter_layout.addStretch()
+        layout.addLayout(filter_layout)
+
+        # Table
+        self.log_table = QTableWidget(0, 6)
+        self.log_table.setHorizontalHeaderLabels(["Timestamp","Source","User/Actor","Rule/Context","Action","Details"])
+        self.log_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.log_table)
+
+        # Export
+        export_btn = QPushButton("Export CSV")
+        export_btn.clicked.connect(self.export_csv)
+        layout.addWidget(export_btn)
+
+        self.setLayout(layout)
+
+    def load_logs(self):
+        """
+        1) Build a list of log rows from each table if the user has that checkbox checked.
+        2) Merge them in memory by timestamp descending.
+        3) Show in table.
+        """
+        start_ts = self.start_dt.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        end_ts = self.end_dt.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+        actor_filter = self.user_edit.text().strip().lower()
+
+        rows=[]
+        # 1) from BRM_AUDIT_LOG (if cb_audit checked)
+        if self.cb_audit.isChecked():
+            rows.extend(self.fetch_audit_logs(start_ts, end_ts, actor_filter))
+        # 2) from RULE_EXECUTION_LOGS (if cb_exec)
+        if self.cb_exec.isChecked():
+            rows.extend(self.fetch_exec_logs(start_ts, end_ts, actor_filter))
+        # 3) from SIMULATION_LOGS (if cb_sim)
+        if self.cb_sim.isChecked():
+            rows.extend(self.fetch_sim_logs(start_ts, end_ts, actor_filter))
+        # 4) from DATA_VALIDATION_LOGS (if cb_data_val)
+        if self.cb_data_val.isChecked():
+            rows.extend(self.fetch_data_val_logs(start_ts, end_ts, actor_filter))
+        # 5) from PIPELINE_TASK_RUNS (if cb_pipeline)
+        if self.cb_pipeline.isChecked():
+            rows.extend(self.fetch_pipeline_logs(start_ts, end_ts, actor_filter))
+
+        # sort by timestamp desc
+        rows.sort(key=lambda x:x[0], reverse=True)
+        # load into table
+        self.log_table.setRowCount(0)
+        for row_ in rows:
+            # row_ => (timestamp_str, source, user, context, action, details)
+            r_i = self.log_table.rowCount()
+            self.log_table.insertRow(r_i)
+            for col_i,val in enumerate(row_):
+                it = QTableWidgetItem(str(val) if val!=None else "")
+                self.log_table.setItem(r_i, col_i, it)
+
+        self.log_table.resizeColumnsToContents()
+
+    def fetch_audit_logs(self, start_ts, end_ts, actor_filter):
+        """
+        Return list of (timestamp, "AUDIT", user, record_id, action, details)
+        from BRM_AUDIT_LOG
+        """
+        rows=[]
+        c = self.connection.cursor()
+        # build filter
+        f = "ACTION_TIMESTAMP BETWEEN ? AND ?"
+        pars = [start_ts,end_ts]
+        if actor_filter:
+            f += " AND LOWER(ACTION_BY) LIKE ?"
+            pars.append(f"%{actor_filter}%")
+        q=f"""
+            SELECT CONVERT(varchar(19), ACTION_TIMESTAMP, 120) as ts,
+                   ACTION, ACTION_BY, RECORD_ID, TABLE_NAME, OLD_DATA, NEW_DATA
+            FROM BRM_AUDIT_LOG
+            WHERE {f}
+        """
+        c.execute(q, tuple(pars))
+        results=c.fetchall()
+        for r_ in results:
+            ts,act,actor,rid,tbl,oldd,newd = r_
+            # build details
+            det = f"Table={tbl}, Old={oldd}, New={newd}"
+            rowtuple = (ts, "AUDIT", actor, str(rid), act, det)
+            rows.append(rowtuple)
+        return rows
+
+    def fetch_exec_logs(self, start_ts, end_ts, actor_filter):
+        """
+        RULE_EXECUTION_LOGS => (RULE_ID, EXEC_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT, ...)
+        We may not have a direct 'actor' => skip or store unknown.
+        Return (ts, "EXEC", unknown, rid, pass/fail, message)
+        """
+        rows=[]
+        c=self.connection.cursor()
+        f="EXECUTION_TIMESTAMP BETWEEN ? AND ?"
+        pars=[start_ts, end_ts]
+        # no direct actor => skip
+        q=f"""
+            SELECT CONVERT(varchar(19), EXECUTION_TIMESTAMP, 120) as ts,
+                   RULE_ID, PASS_FLAG, MESSAGE, RECORD_COUNT
+            FROM RULE_EXECUTION_LOGS
+            WHERE {f}
+        """
+        c.execute(q, tuple(pars))
+        results=c.fetchall()
+        for r_ in results:
+            ts, rid, passf, msg, rc = r_
+            actstr = "PASS" if passf==1 else "FAIL"
+            rowtuple=(ts,"EXEC","(system)",str(rid), actstr, f"{msg}, rec={rc}")
+            rows.append(rowtuple)
+        return rows
+
+    def fetch_sim_logs(self, start_ts, end_ts, actor_filter):
+        """
+        If you store simulation logs in SIMULATION_LOGS or so:
+         (SIMULATION_ID, RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT)
+        Return (ts, "SIM", unknown, rid, pass/fail, message)
+        """
+        # Adjust table/columns as needed
+        rows=[]
+        c=self.connection.cursor()
+        f="EXEC_TIMESTAMP BETWEEN ? AND ?"
+        pars=[start_ts,end_ts]
+        q=f"""
+            SELECT CONVERT(varchar(19), EXEC_TIMESTAMP, 120) as ts,
+                   RULE_ID, SUCCESS_FLAG, MESSAGE, RECORD_COUNT
+            FROM SIMULATION_LOGS
+            WHERE {f}
+        """
+        c.execute(q, tuple(pars))
+        results=c.fetchall()
+        for r_ in results:
+            ts, rid, sflag, msg, rc = r_
+            actstr = "PASS" if sflag==1 else "FAIL"
+            rowtuple=(ts,"SIM","(sim-user?)",str(rid), actstr, f"{msg}, rec={rc}")
+            rows.append(rowtuple)
+        return rows
+
+    def fetch_data_val_logs(self, start_ts, end_ts, actor_filter):
+        """
+        DATA_VALIDATION_LOGS => (VALIDATION_LOG_ID,DATA_VALIDATION_ID,TABLE_NAME,COLUMN_NAME,VALIDATION_TYPE,PARAMS,RESULT_FLAG,DETAILS,VALIDATION_TIMESTAMP)
+        Return (ts, "DATAVAL", user?, table.col, pass/fail, details)
+        """
+        rows=[]
+        c=self.connection.cursor()
+        f="VALIDATION_TIMESTAMP BETWEEN ? AND ?"
+        pars=[start_ts,end_ts]
+        q=f"""
+            SELECT CONVERT(varchar(19), VALIDATION_TIMESTAMP, 120) as ts,
+                   DATA_VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE,
+                   RESULT_FLAG, DETAILS
+            FROM DATA_VALIDATION_LOGS
+            WHERE {f}
+        """
+        c.execute(q, tuple(pars))
+        results=c.fetchall()
+        for r_ in results:
+            ts, vid, tbn, coln, vtype, res, det = r_
+            rowtuple=(ts,"DATAVAL","(validator?)",f"{tbn}.{coln}",res, f"{vtype} => {det}")
+            rows.append(rowtuple)
+        return rows
+
+    def fetch_pipeline_logs(self, start_ts, end_ts, actor_filter):
+        """
+        Pipeline logs => BRM_PIPELINE_TASK_RUNS => (TASK_ID, SUCCESS_FLAG, MESSAGE, RUN_TIMESTAMP).
+        We join BRM_PIPELINE_TASKS to get the pipeline_id and name?
+        Return (ts,"PIPELINE",?), "task??", success/fail, message
+        """
+        rows=[]
+        c=self.connection.cursor()
+        f="RUN_TIMESTAMP BETWEEN ? AND ?"
+        pars=[start_ts,end_ts]
+        q=f"""
+            SELECT 
+              CONVERT(varchar(19), RUN_TIMESTAMP, 120) as ts,
+              t.TASK_ID, t2.TASK_NAME, t2.PIPELINE_ID, SUCCESS_FLAG, MESSAGE
+            FROM BRM_PIPELINE_TASK_RUNS t
+            JOIN BRM_PIPELINE_TASKS t2 ON t.TASK_ID=t2.TASK_ID
+            WHERE {f}
+        """
+        c.execute(q, tuple(pars))
+        results=c.fetchall()
+        for r_ in results:
+            ts,tid,tname,pid,sf,msg = r_
+            actstr="PASS" if sf==1 else "FAIL"
+            rowtuple=(ts,"PIPELINE","(pipeline-runner)",f"Pipe{pid}-Task{tid}:{tname}",actstr,msg)
+            rows.append(rowtuple)
+        return rows
+
+    def export_csv(self):
+        path,_=QFileDialog.getSaveFileName(self,"Export Logs to CSV","","CSV Files (*.csv)")
+        if not path:
+            return
+        rowc=self.log_table.rowCount()
+        colc=self.log_table.columnCount()
+        with open(path,"w",newline="",encoding="utf-8") as f:
+            writer=csv.writer(f)
+            headers=[self.log_table.horizontalHeaderItem(i).text() for i in range(colc)]
+            writer.writerow(headers)
+            for r_ in range(rowc):
+                rowdata=[]
+                for c_ in range(colc):
+                    it=self.log_table.item(r_,c_)
+                    rowdata.append(it.text() if it else "")
+                writer.writerow(rowdata)
+        QMessageBox.information(self,"Exported",f"Activity logs exported to {path}.")
+
+
+# if standalone test
+if __name__=="__main__":
+    from PyQt5.QtWidgets import QApplication
+    import pyodbc
+    app=QApplication(sys.argv)
+    try:
+        conn=pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as e:
+        print("DB Error:",e)
+        sys.exit(1)
+    win=UnifiedActivityLogTab(conn,"Admin")
+    win.show()
+    sys.exit(app.exec_())
