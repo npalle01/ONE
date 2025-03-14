@@ -1,429 +1,328 @@
-Below is Module #8: defect_management.py, which completes the set by providing a Defect Logging and Management system that integrates with your BRM Tool. Key features:
-	•	A DefectManagementTab to view all defect logs in a table (with auto-refresh).
-	•	Buttons to Add, Edit, and Delete defects.
-	•	A status label or real‑time notification when new defects appear (optional).
-	•	Ability to search or filter by rule, severity, status, or reporter (the example includes a text search).
-	•	For each defect:
-	•	A link to RULE_ID if the defect pertains to a particular rule.
-	•	Possibly a severity (“Low,” “Medium,” “High,” “Critical”).
-	•	A status (“Open,” “In Progress,” “Resolved,” “Closed”).
-	•	A resolution text or code if resolved.
-	•	Full logging (like an audit or record in BRM_DEFECT_LOGS).
-
-We remove placeholders, ensuring code is functional. This references:
-	•	A table BRM_DEFECT_LOGS with columns, for example:
-
-  DEFECT_ID (PK, identity),
-  RULE_ID (nullable),
-  DESCRIPTION (text),
-  SEVERITY (varchar),
-  REPORTER (varchar),
-  STATUS (varchar),
-  RESOLUTION (text, nullable),
-  TIMESTAMP (datetime)
-
-
-	•	Optionally references a typical function like insert_audit_log(...) if you want deeper auditing.
-
-⸻
-
-Module #8: defect_management.py
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
-Module: defect_management.py
+Module: brm_data_validations.py
+Description:
+  Provides a comprehensive data validation manager for the BRM Tool. 
+  It includes:
+   • A `DataValidationManagerTab` UI widget for CRUD on validation rules.
+   • Functions to run validations for a single table or all tables, returning pass/fail.
+   • Logging of results into DATA_VALIDATION_LOGS with timestamp, pass/fail, details.
+   • Integration hooks so BFS or scheduling can call `run_validations_for_rule` or `run_all_validations`.
 
-Defect Logging and Management Module for the BRM Tool.
-This module integrates seamlessly with the rest and provides:
-  - A DefectManagementTab for logging/tracking defects.
-  - Add, edit, delete defects.
-  - Searching by description, severity, status, etc.
-  - Real-time notifications or auto-refresh to detect new defects.
-  
-Dependencies:
-  - PyQt5 for the UI
-  - Some DB helpers from your core module (e.g. fetch_one_dict, fetch_all_dict)
-  - Possibly an "audit log" or BFS logic if you want synergy with the rule engine
+This module is designed to integrate seamlessly with:
+ - brm_core_foundation (for logger, fetch helpers, etc.)
+ - brm_rule_engine or scheduling modules if you want to incorporate validations into BFS.
 """
 
 import sys
-import logging
 import json
+import logging
+import re
 from datetime import datetime
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QMessageBox, QDialog, QLineEdit, QTextEdit, QComboBox,
-    QPlainTextEdit, QInputDialog, QLabel
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
+    QLineEdit, QInputDialog, QMessageBox, QComboBox, QLabel
+)
+from PyQt5.QtCore import Qt
+
+# Suppose from brm_core_foundation we import:
+from brm_core_foundation import (
+    logger, fetch_all_dict, fetch_one_dict
 )
 
-# from core_foundation import logger, fetch_one_dict, fetch_all_dict, insert_audit_log
-
-
-###############################################################################
-# 1) Utility: add_defect_log
-###############################################################################
-def add_defect_log(conn, rule_id, description, severity, reporter, status="Open", resolution=None):
+# ---------------------------------------------------------------------------
+# Core Validation Runner Functions
+# ---------------------------------------------------------------------------
+def run_single_validation(conn, validation_id):
     """
-    Insert a record into BRM_DEFECT_LOGS:
-      - RULE_ID can be None if it's not tied to a specific rule
-      - severity => "Low","Medium","High","Critical"
-      - status => "Open","In Progress","Resolved","Closed"
-      - resolution => optional text if resolved
+    Fetch the validation rule from DATA_VALIDATIONS by ID,
+    interpret the type (NOT NULL, RANGE, REGEX, etc.), run an appropriate check,
+    log the result to DATA_VALIDATION_LOGS.
+
+    Returns a tuple: (pass_flag, details_string)
     """
-    c = conn.cursor()
+    c=conn.cursor()
+    c.execute("""
+        SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
+        FROM DATA_VALIDATIONS
+        WHERE VALIDATION_ID=?
+    """,(validation_id,))
+    row=c.fetchone()
+    if not row:
+        logger.error(f"Validation ID {validation_id} not found.")
+        return (False,f"Validation rule not found (ID={validation_id}).")
+
+    (vid, table_, col_, vtype, params_) = row
+    pass_flag=True
+    details=""
+
     try:
-        c.execute("""
-            INSERT INTO BRM_DEFECT_LOGS(
-                RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION, TIMESTAMP
-            )
-            VALUES (?, ?, ?, ?, ?, ?, GETDATE())
-        """,(rule_id, description, severity, reporter, status, resolution))
-        conn.commit()
-        logging.info(f"Defect log added => rule={rule_id}, desc='{description}' by {reporter}.")
-    except Exception as ex:
-        logging.error(f"Error adding defect log => rule={rule_id}: {ex}")
-        raise
-
-
-###############################################################################
-# 2) DefectDialog for Add/Edit
-###############################################################################
-class DefectDialog(QDialog):
-    """
-    Dialog for adding or editing a defect record. 
-    If `defect_data` is provided => editing; otherwise => new defect.
-    """
-    def __init__(self, connection, defect_data=None, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.defect_data = defect_data
-        self.is_edit = (defect_data is not None)
-        title = "Edit Defect" if self.is_edit else "Add New Defect"
-        self.setWindowTitle(title)
-        self.resize(500,400)
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        form_h = QHBoxLayout()
-        form = QVBoxLayout()
-        # or QFormLayout
-        # We'll do a simpler approach with labels.
-
-        # RULE_ID
-        rule_h = QHBoxLayout()
-        rule_lbl = QLabel("Rule ID (optional):")
-        self.rule_edit = QLineEdit()
-        rule_h.addWidget(rule_lbl)
-        rule_h.addWidget(self.rule_edit)
-        form.addLayout(rule_h)
-
-        # Description
-        desc_lbl = QLabel("Description:")
-        self.desc_edit = QTextEdit()
-        form.addWidget(desc_lbl)
-        form.addWidget(self.desc_edit)
-
-        # Severity
-        sev_lbl = QLabel("Severity:")
-        self.sev_combo = QComboBox()
-        self.sev_combo.addItems(["Low","Medium","High","Critical"])
-        form.addWidget(sev_lbl)
-        form.addWidget(self.sev_combo)
-
-        # Reporter
-        reporter_lbl = QLabel("Reporter:")
-        self.reporter_edit = QLineEdit()
-        form.addWidget(reporter_lbl)
-        form.addWidget(self.reporter_edit)
-
-        # Status
-        status_lbl = QLabel("Status:")
-        self.status_combo = QComboBox()
-        self.status_combo.addItems(["Open","In Progress","Resolved","Closed"])
-        form.addWidget(status_lbl)
-        form.addWidget(self.status_combo)
-
-        # Resolution
-        res_lbl = QLabel("Resolution (if any):")
-        self.res_edit = QTextEdit()
-        form.addWidget(res_lbl)
-        form.addWidget(self.res_edit)
-
-        form_h.addLayout(form)
-        layout.addLayout(form_h)
-
-        # button row
-        btn_h = QHBoxLayout()
-        save_btn = QPushButton("Save")
-        save_btn.clicked.connect(self.save_defect)
-        btn_h.addWidget(save_btn)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_h.addWidget(cancel_btn)
-        btn_h.addStretch()
-        layout.addLayout(btn_h)
-
-        if self.is_edit and self.defect_data:
-            self.load_existing_data()
-
-    def load_existing_data(self):
-        # fill in fields from defect_data
-        d = self.defect_data
-        if d.get("RULE_ID"):
-            self.rule_edit.setText(str(d["RULE_ID"]))
-        if d.get("DESCRIPTION"):
-            self.desc_edit.setPlainText(d["DESCRIPTION"])
-        if d.get("SEVERITY"):
-            ix = self.sev_combo.findText(d["SEVERITY"], Qt.MatchFixedString)
-            if ix>=0:
-                self.sev_combo.setCurrentIndex(ix)
-        if d.get("REPORTER"):
-            self.reporter_edit.setText(d["REPORTER"])
-        if d.get("STATUS"):
-            ix2 = self.status_combo.findText(d["STATUS"], Qt.MatchFixedString)
-            if ix2>=0:
-                self.status_combo.setCurrentIndex(ix2)
-        if d.get("RESOLUTION"):
-            self.res_edit.setPlainText(d["RESOLUTION"])
-
-    def save_defect(self):
-        # gather
-        rule_id_text = self.rule_edit.text().strip()
-        rule_id = None
-        if rule_id_text:
-            try:
-                rule_id = int(rule_id_text)
-            except:
-                QMessageBox.warning(self,"Input Error","Rule ID must be an integer or blank.")
-                return
-        description = self.desc_edit.toPlainText().strip()
-        if not description:
-            QMessageBox.warning(self,"Input Error","Description is required.")
-            return
-        severity = self.sev_combo.currentText()
-        reporter = self.reporter_edit.text().strip()
-        if not reporter:
-            QMessageBox.warning(self,"Input Error","Reporter is required.")
-            return
-        status = self.status_combo.currentText()
-        resolution = self.res_edit.toPlainText().strip() or None
-
-        c = self.connection.cursor()
-        if self.is_edit and self.defect_data:
-            defect_id = self.defect_data.get("DEFECT_ID")
-            if not defect_id:
-                QMessageBox.critical(self,"Error","Missing DEFECT_ID for editing.")
-                return
-            try:
-                c.execute("""
-                    UPDATE BRM_DEFECT_LOGS
-                    SET RULE_ID=?, DESCRIPTION=?, SEVERITY=?, REPORTER=?,
-                        STATUS=?, RESOLUTION=?, TIMESTAMP=GETDATE()
-                    WHERE DEFECT_ID=?
-                """,(rule_id, description, severity, reporter, status, resolution, defect_id))
-                self.connection.commit()
-                logging.info(f"Defect {defect_id} updated => status={status}.")
-                QMessageBox.information(self,"Updated","Defect updated successfully.")
-                self.accept()
-            except Exception as ex:
-                QMessageBox.critical(self,"Error",str(ex))
+        if not table_ or not col_:
+            pass_flag=False
+            details="Invalid table/column."
         else:
-            # new
-            try:
-                add_defect_log(self.connection, rule_id, description, severity, reporter, status, resolution)
-                QMessageBox.information(self,"Added","New defect logged.")
-                self.accept()
-            except Exception as ex:
-                QMessageBox.critical(self,"Error",str(ex))
+            pass_flag, details = _execute_validation_check(conn, table_, col_, vtype, params_)
 
+    except Exception as ex:
+        pass_flag=False
+        details=str(ex)
 
-###############################################################################
-# 3) DefectManagementTab
-###############################################################################
-class DefectManagementTab(QWidget):
+    # Log result
+    c2=conn.cursor()
+    res_flag="PASS" if pass_flag else "FAIL"
+    c2.execute("""
+        INSERT INTO DATA_VALIDATION_LOGS(
+          VALIDATION_ID, RESULT_FLAG, DETAILS, VALIDATION_TIMESTAMP, TABLE_NAME, COLUMN_NAME
+        )
+        VALUES(?,?,?,?,?,?)
+    """,(vid, res_flag, details, datetime.now(), table_, col_))
+    conn.commit()
+
+    return (pass_flag, details)
+
+def _execute_validation_check(conn, table_name, column_name, validation_type, params_):
     """
-    A tab to manage defects:
-      - A QTableWidget listing up to 1000 defects
-      - Option to search/filter via a QLineEdit
-      - Auto-refresh every 30s or manual refresh
-      - Buttons: Add, Edit, Delete
-      - Possibly a status label if new defects appear
+    The actual logic for each validation type. 
+    Return (bool_pass, detail_message).
+    """
+    vtype=validation_type.upper().strip()
+    c=conn.cursor()
+    if vtype=="NOT NULL":
+        qry=f"SELECT COUNT(*) FROM {table_name} WHERE {column_name} IS NULL"
+        c.execute(qry)
+        row=c.fetchone()
+        cnt=row[0] if row else 0
+        if cnt>0:
+            return (False, f"{cnt} NULL values found in {table_name}.{column_name}")
+        else:
+            return (True,"No NULL found => PASS")
+    elif vtype=="RANGE":
+        # interpret params as "MIN,MAX"
+        parts=(params_ or "").split(",")
+        if len(parts)!=2:
+            return (False,"Invalid range params => expecting 'min,max'")
+        try:
+            minv=float(parts[0])
+            maxv=float(parts[1])
+            qry=f"SELECT COUNT(*) FROM {table_name} WHERE {column_name} < {minv} OR {column_name} > {maxv}"
+            c.execute(qry)
+            row=c.fetchone()
+            out_of_range=row[0] if row else 0
+            if out_of_range>0:
+                return (False, f"{out_of_range} row(s) out of [{minv},{maxv}] in {table_name}.{column_name}")
+            else:
+                return (True,"All values in range => PASS")
+        except:
+            return (False,"Failed to parse range params => e.g. '0,100'")
+    elif vtype=="REGEX":
+        # Implementation approach depends on T-SQL or Python usage. We'll do naive approach:
+        pat_text=params_ or ".*"
+        # we fetch up to X rows? This might be large. For demonstration, let's do a small approach:
+        # We'll do a naive approach: 
+        c.execute(f"SELECT {column_name} FROM {table_name}")
+        rows=c.fetchall()
+        pattern=re.compile(pat_text)
+        mismatch_count=0
+        for (val,) in rows:
+            if val is None:
+                mismatch_count+=1
+            else:
+                sval=str(val)
+                if not pattern.match(sval):
+                    mismatch_count+=1
+        if mismatch_count>0:
+            return (False,f"{mismatch_count} row(s) did not match regex '{pat_text}' in {table_name}.{column_name}")
+        else:
+            return (True,f"All rows matched regex => PASS")
+    else:
+        return (False,f"Unknown validation type '{validation_type}'")
+
+def run_validations_for_table(conn, table_name):
+    """
+    Load all validations for `table_name` from DATA_VALIDATIONS, run them, 
+    return a list of (validation_id, pass_flag, details).
+    """
+    c=conn.cursor()
+    c.execute("""
+        SELECT VALIDATION_ID
+        FROM DATA_VALIDATIONS
+        WHERE LOWER(TABLE_NAME)=LOWER(?)
+    """,(table_name,))
+    vrows=c.fetchall()
+    results=[]
+    for (vid,) in vrows:
+        (pf, dt)=run_single_validation(conn, vid)
+        results.append((vid,pf,dt))
+    return results
+
+def run_all_validations(conn):
+    """
+    Run every validation in DATA_VALIDATIONS => returns an array of 
+    (validation_id, table_name, column_name, pass_flag, details).
+    """
+    c=conn.cursor()
+    c.execute("""
+        SELECT VALIDATION_ID
+        FROM DATA_VALIDATIONS
+        ORDER BY VALIDATION_ID
+    """)
+    allvids=[r[0] for r in c.fetchall()]
+    results=[]
+    for vid in allvids:
+        (pf, dt)=run_single_validation(conn, vid)
+        c2=conn.cursor()
+        c2.execute("SELECT TABLE_NAME, COLUMN_NAME FROM DATA_VALIDATIONS WHERE VALIDATION_ID=?",(vid,))
+        row2=c2.fetchone()
+        tb="?"
+        col="?"
+        if row2:
+            tb=row2[0]
+            col=row2[1]
+        results.append((vid, tb, col, pf, dt))
+    return results
+
+def run_validations_for_rule(conn, rule_id):
+    """
+    If you want to run validations for all tables used by a rule => parse dependencies => 
+    run for each table. Return pass/fail, plus details on any failure.
+    """
+    # we assume there's a table BRM_RULE_TABLE_DEPENDENCIES => (RULE_ID,DATABASE_NAME,TABLE_NAME,...)
+    c=conn.cursor()
+    c.execute("""
+        SELECT DISTINCT DATABASE_NAME, TABLE_NAME
+        FROM BRM_RULE_TABLE_DEPENDENCIES
+        WHERE RULE_ID=?
+    """,(rule_id,))
+    deps=c.fetchall()
+    all_pass=True
+    fail_details=[]
+    for (dbn, tbn) in deps:
+        if not tbn:
+            continue
+        fulltbl=f"{dbn}.{tbn}".lower()
+        table_results=run_validations_for_table(conn, fulltbl)
+        for (vid,pf,dt) in table_results:
+            if not pf:
+                all_pass=False
+                fail_details.append((vid,dt))
+    return (all_pass, fail_details)
+
+
+# ---------------------------------------------------------------------------
+# UI Tab for Data Validations
+# ---------------------------------------------------------------------------
+class DataValidationManagerTab(QWidget):
+    """
+    A tab that lists data validations from DATA_VALIDATIONS, allows add/edit/delete, 
+    and a "Run Validations" button (for all or for a chosen table).
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
-        self.connection = connection
-        self.last_defect_count = 0
+        self.connection=connection
+        self.init_ui()
+        self.load_validations()
 
-        layout = QVBoxLayout(self)
+    def init_ui(self):
+        layout=QVBoxLayout(self)
 
-        # optional notification label
-        self.notification_label = QLabel("")
-        self.notification_label.setStyleSheet("color: green; font-weight: bold;")
-        layout.addWidget(self.notification_label)
+        self.val_table=QTableWidget(0,5)
+        self.val_table.setHorizontalHeaderLabels(["ValidationID","TableName","ColumnName","Type","Params"])
+        self.val_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.val_table)
 
-        # search row
-        search_h = QHBoxLayout()
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search defects by description, severity, reporter, status...")
-        self.search_edit.textChanged.connect(self.search_defects)
-        search_h.addWidget(QLabel("Search:"))
-        search_h.addWidget(self.search_edit)
-        layout.addLayout(search_h)
-
-        # defect table
-        self.defect_table = QTableWidget(0,7)
-        self.defect_table.setHorizontalHeaderLabels(["DefectID","RuleID","Description","Severity","Reporter","Status","Timestamp"])
-        self.defect_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.defect_table)
-
-        # buttons
-        btn_h = QHBoxLayout()
-        add_btn = QPushButton("Add Defect")
-        add_btn.clicked.connect(self.add_defect)
+        btn_h=QHBoxLayout()
+        add_btn=QPushButton("Add Validation")
+        add_btn.clicked.connect(self.add_validation)
         btn_h.addWidget(add_btn)
 
-        edit_btn = QPushButton("Edit Defect")
-        edit_btn.clicked.connect(self.edit_defect)
-        btn_h.addWidget(edit_btn)
-
-        del_btn = QPushButton("Delete Defect")
-        del_btn.clicked.connect(self.delete_defect)
+        del_btn=QPushButton("Remove Validation")
+        del_btn.clicked.connect(self.remove_validation)
         btn_h.addWidget(del_btn)
 
-        ref_btn = QPushButton("Refresh")
-        ref_btn.clicked.connect(self.load_defects)
+        run_btn=QPushButton("Run All Validations")
+        run_btn.clicked.connect(self.run_all)
+        btn_h.addWidget(run_btn)
+
+        ref_btn=QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_validations)
         btn_h.addWidget(ref_btn)
 
         btn_h.addStretch()
         layout.addLayout(btn_h)
-
         self.setLayout(layout)
 
-        # auto-refresh timer
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.auto_refresh)
-        self.refresh_timer.start(30000)  # every 30s
+    def load_validations(self):
+        self.val_table.setRowCount(0)
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
+            FROM DATA_VALIDATIONS
+            ORDER BY VALIDATION_ID
+        """)
+        rows=c.fetchall()
+        for row in rows:
+            r_i=self.val_table.rowCount()
+            self.val_table.insertRow(r_i)
+            for col_i,val in enumerate(row):
+                it=QTableWidgetItem(str(val) if val is not None else "")
+                self.val_table.setItem(r_i,col_i,it)
 
-        self.load_defects()
-
-    def load_defects(self):
-        self.defect_table.setRowCount(0)
-        c = self.connection.cursor()
+    def add_validation(self):
+        tbl,ok=QInputDialog.getText(self,"Add Validation","Table name (e.g. 'dbo.Customers'):")
+        if not ok or not tbl.strip():
+            return
+        col,ok2=QInputDialog.getText(self,"Column","Column name:")
+        if not ok2 or not col.strip():
+            return
+        vtype,ok3=QInputDialog.getText(self,"Validation Type","(NOT NULL,RANGE,REGEX,...)")
+        if not ok3 or not vtype.strip():
+            return
+        params_,ok4=QInputDialog.getText(self,"Params","(Example for RANGE:'0,100' / for REGEX:'^[A-Z]+$')")
+        if not ok4:
+            params_=""
+        c=self.connection.cursor()
         try:
             c.execute("""
-                SELECT TOP 1000
-                    DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP
-                FROM BRM_DEFECT_LOGS
-                ORDER BY TIMESTAMP DESC
-            """)
-            rows = c.fetchall()
-            current_count = len(rows)
-            for row in rows:
-                r_i = self.defect_table.rowCount()
-                self.defect_table.insertRow(r_i)
-                for col_i,val in enumerate(row):
-                    self.defect_table.setItem(r_i,col_i,QTableWidgetItem(str(val) if val else ""))
-            # check new
-            if self.last_defect_count and current_count>self.last_defect_count:
-                new_ct = current_count - self.last_defect_count
-                self.notification_label.setText(f"{new_ct} new defect(s) logged.")
-                # clear after 5 seconds
-                QtCore.QTimer.singleShot(5000, lambda: self.notification_label.setText(""))
-            self.last_defect_count = current_count
-
+                INSERT INTO DATA_VALIDATIONS(
+                  TABLE_NAME,COLUMN_NAME,VALIDATION_TYPE,PARAMS,CREATED_TIMESTAMP
+                )
+                VALUES(?,?,?,?,GETDATE())
+            """,(tbl.strip(), col.strip(), vtype.strip(), params_.strip()))
+            self.connection.commit()
+            QMessageBox.information(self,"Added","Validation rule added.")
+            self.load_validations()
         except Exception as ex:
-            logging.error(f"Error loading defects: {ex}")
-            QMessageBox.critical(self,"Error",f"Error loading defects: {ex}")
+            QMessageBox.critical(self,"Error",str(ex))
 
-    def search_defects(self, text):
-        txt = text.lower().strip()
-        for row in range(self.defect_table.rowCount()):
-            visible=False
-            for col in range(self.defect_table.columnCount()):
-                it=self.defect_table.item(row,col)
-                if it and txt in it.text().lower():
-                    visible=True
-                    break
-            self.defect_table.setRowHidden(row, not visible)
-
-    def auto_refresh(self):
-        self.load_defects()
-
-    def get_selected_defect_data(self):
-        row=self.defect_table.currentRow()
+    def remove_validation(self):
+        row=self.val_table.currentRow()
         if row<0:
-            return None
-        d_id_item=self.defect_table.item(row,0)
-        if not d_id_item:
-            return None
-        defect_id=int(d_id_item.text())
-        # gather row data
-        rule_id_item=self.defect_table.item(row,1)
-        desc_item=self.defect_table.item(row,2)
-        sev_item=self.defect_table.item(row,3)
-        rep_item=self.defect_table.item(row,4)
-        stat_item=self.defect_table.item(row,5)
-        ts_item=self.defect_table.item(row,6)
-        data={
-            "DEFECT_ID":defect_id,
-            "RULE_ID":int(rule_id_item.text()) if rule_id_item.text() else None,
-            "DESCRIPTION": desc_item.text() if desc_item else "",
-            "SEVERITY": sev_item.text() if sev_item else "Low",
-            "REPORTER": rep_item.text() if rep_item else "",
-            "STATUS": stat_item.text() if stat_item else "Open",
-            "TIMESTAMP": ts_item.text() if ts_item else None
-        }
-        return data
-
-    def add_defect(self):
-        dlg = DefectDialog(self.connection, None, self)
-        if dlg.exec_()==QDialog.Accepted:
-            self.load_defects()
-
-    def edit_defect(self):
-        data=self.get_selected_defect_data()
-        if not data:
-            QMessageBox.warning(self,"None","No defect selected.")
+            QMessageBox.warning(self,"None","No validation selected.")
             return
-        dlg=DefectDialog(self.connection, data, self)
-        if dlg.exec_()==QDialog.Accepted:
-            self.load_defects()
-
-    def delete_defect(self):
-        data=self.get_selected_defect_data()
-        if not data:
-            QMessageBox.warning(self,"None","No defect selected.")
+        val_id_item=self.val_table.item(row,0)
+        if not val_id_item:
             return
-        defect_id=data["DEFECT_ID"]
-        confirm=QMessageBox.question(self,"Confirm",f"Delete defect {defect_id}?")
+        vid=int(val_id_item.text())
+        confirm=QMessageBox.question(self,"Confirm",f"Remove validation ID={vid}?")
         if confirm!=QMessageBox.Yes:
             return
         c=self.connection.cursor()
         try:
-            c.execute("DELETE FROM BRM_DEFECT_LOGS WHERE DEFECT_ID=?",(defect_id,))
+            c.execute("DELETE FROM DATA_VALIDATIONS WHERE VALIDATION_ID=?",(vid,))
             self.connection.commit()
-            QMessageBox.information(self,"Deleted",f"Defect {defect_id} deleted.")
-            self.load_defects()
+            QMessageBox.information(self,"Removed","Validation rule removed.")
+            self.load_validations()
         except Exception as ex:
             QMessageBox.critical(self,"Error",str(ex))
 
-Explanation of Key Sections
-	1.	add_defect_log()
-	•	A helper that inserts a record into BRM_DEFECT_LOGS, capturing the typical fields: RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION, plus a timestamp.
-	•	Logs to logger.info.
-	2.	DefectDialog
-	•	Reused for both Add and Edit. If defect_data is provided, we load existing fields. Otherwise, we default them.
-	•	Has fields for RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION.
-	•	On “Save,” we either update the existing or create a new row, then call accept() so the parent tab can refresh.
-	3.	DefectManagementTab
-	•	A tab with a QTableWidget listing up to 1000 defects (SELECT TOP 1000).
-	•	A line for searching text among columns.
-	•	Add/Edit/Delete, each opening a DefectDialog.
-	•	Auto‑refresh via a QTimer every 30 seconds to detect new defects.
-	•	Optionally sets a “notification_label” if new defects appear since the last load (like N new defect(s) logged.).
-
-Please respond “OK” if you approve Module #8. Next, we can provide the final aggregator that ties all modules into your main BRM Tool window.
+    def run_all(self):
+        results=run_all_validations(self.connection)
+        fails=[r for r in results if not r[3]]
+        if fails:
+            fail_str="\n".join([f"ID={f[0]} => {f[4]}" for f in fails])
+            QMessageBox.warning(self,"Validation Results",f"Some validations failed:\n{fail_str}")
+        else:
+            QMessageBox.information(self,"Validation Results","All validations passed.")
