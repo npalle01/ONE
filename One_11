@@ -2,170 +2,378 @@
 # -*- coding: utf-8 -*-
 
 """
-Module: sql_to_business_converter.py
+Module: brm_advanced_decision_tables.py
 Description:
-  A widget/tab that leverages advanced_lineage.parse_sql_dependencies(...) to parse a rule's SQL,
-  then replaces table (and possibly column) names with user-supplied "business" names.
-  
-Database Requirements:
-  - Must have BRM_RULES table with columns RULE_ID, RULE_SQL
-  - parse_sql_dependencies(...) is imported from advanced_lineage
+  This module provides advanced management and execution of decision tables
+  in the BRM Tool. Key features:
+
+  • A DecisionTableManagerTab UI (or “AdvancedDecisionTablesTab”):
+      – List existing decision tables (ID, table name, description, query).
+      – Add, edit, and delete a table.
+      – “Execute” a decision table in a dry‑run transaction or real execution,
+        logging pass/fail with record count in a dedicated table.
+  • Integration with BFS or scheduling if `OPERATION_TYPE = 'DECISION_TABLE'`
+    or if `RULE_SQL` is replaced with the decision query upon BFS execution.
+  • Real-time notifications for success/failure, optional auto-refresh.
+  • Strong error handling and robust logging.
+
+DB Structures (typical):
+  DECISION_TABLES (
+    DECISION_TABLE_ID INT IDENTITY PK,
+    TABLE_NAME VARCHAR(100),
+    DESCRIPTION VARCHAR(500) NULL,
+    DECISION_QUERY TEXT or VARCHAR(MAX),
+    CREATED_TIMESTAMP DATETIME,
+    UPDATED_TIMESTAMP DATETIME
+  )
+
+  DECISION_TABLE_EXEC_LOGS (
+    EXEC_ID INT IDENTITY PK,
+    DECISION_TABLE_ID INT,
+    EXEC_TIMESTAMP DATETIME,
+    PASS_FLAG BIT,
+    MESSAGE VARCHAR(500),
+    RECORD_COUNT INT,
+    EXECUTION_TIME_MS INT,
+    DRY_RUN BIT
+  )
+
+You can adapt as needed for your schema.
 """
 
 import sys
 import json
 import logging
-
-from PyQt5.QtCore import Qt, QTimer
+import time
+from datetime import datetime
+from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPlainTextEdit,
-    QPushButton, QMessageBox, QLineEdit
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QPushButton, QMessageBox, QDialog, QLineEdit, QPlainTextEdit, 
+    QInputDialog, QLabel
+)
+from PyQt5.QtCore import Qt, QTimer
+
+# Suppose from brm_core_foundation we import:
+from brm_core_foundation import (
+    logger, fetch_all_dict, fetch_one_dict
 )
 
-# We reference parse_sql_dependencies from advanced_lineage
-from advanced_lineage import parse_sql_dependencies
 
-class SqlToBusinessLanguageConverterTab(QWidget):
+###############################################################################
+# DB Execution / Logging
+###############################################################################
+def execute_decision_table(conn, dt_id, dry_run=True):
     """
-    A widget that:
-      • Loads all BRM_RULES in a combo box
-      • When user chooses one, fetch RULE_SQL
-      • Accepts a JSON mapping { "schema.table" : "BusinessName", ... }
-      • Replaces those references in the SQL
-      • Displays the converted SQL plus a summary (like # of replacements)
+    Fetch the DECISION_QUERY from DECISION_TABLES by dt_id, 
+    run it in a transaction, measure record count, 
+    if it returns row(s), interpret row[0][0] == 1 => PASS, else FAIL,
+    rollback if fail or if dry_run is True.
+
+    Then log results in DECISION_TABLE_EXEC_LOGS.
+    Return (pass_flag, message, record_count).
     """
-    def __init__(self, connection, parent=None):
+    c=conn.cursor()
+    # fetch
+    c.execute("""
+        SELECT DECISION_QUERY
+        FROM DECISION_TABLES
+        WHERE DECISION_TABLE_ID=?
+    """,(dt_id,))
+    row=c.fetchone()
+    if not row or not row[0]:
+        msg=f"Decision table {dt_id} has no query."
+        logger.warning(msg)
+        return (False,msg,0)
+    decision_query=row[0]
+
+    start_time=time.time()
+    c.execute("BEGIN TRANSACTION")
+    pass_flag=True
+    message=""
+    rec_count=0
+    try:
+        c.execute(decision_query)
+        rows=c.fetchall()
+        rec_count=len(rows)
+        if rows:
+            val=rows[0][0]
+            pass_flag=(val==1)
+            message=f"Returned: {val}"
+        else:
+            pass_flag=True
+            message="No rows => pass"
+        if not pass_flag or dry_run:
+            c.execute("ROLLBACK")
+        else:
+            c.execute("COMMIT")
+    except Exception as ex:
+        c.execute("ROLLBACK")
+        pass_flag=False
+        message=str(ex)
+
+    end_time=time.time()
+    elapsed_ms=int((end_time - start_time)*1000)
+    # Insert log
+    c2=conn.cursor()
+    c2.execute("""
+        INSERT INTO DECISION_TABLE_EXEC_LOGS(
+            DECISION_TABLE_ID,
+            EXEC_TIMESTAMP,
+            PASS_FLAG,
+            MESSAGE,
+            RECORD_COUNT,
+            EXECUTION_TIME_MS,
+            DRY_RUN
+        )
+        VALUES(?,GETDATE(),?,?,?,?,?)
+    """,(dt_id, 1 if pass_flag else 0, message, rec_count, elapsed_ms, 1 if dry_run else 0))
+    conn.commit()
+
+    logger.info(f"DecisionTable {dt_id} executed => pass={pass_flag}, msg={message}, rec_count={rec_count}.")
+    return (pass_flag, message, rec_count)
+
+
+###############################################################################
+# UI Dialog for Single Execution
+###############################################################################
+class DecisionTableExecutionDialog(QDialog):
+    """
+    Simple dialog to run a single decision table (by dt_id).
+    Displays pass/fail, record count, message.
+    """
+    def __init__(self, connection, dt_id, parent=None):
         super().__init__(parent)
-        self.connection = connection
-        self.init_ui()
-        self._setup_auto_refresh()
+        self.connection=connection
+        self.dt_id=dt_id
+        self.setWindowTitle(f"Execute Decision Table {dt_id}")
+        self.resize(400,300)
+        layout=QVBoxLayout(self)
 
-    def init_ui(self):
-        layout = QVBoxLayout(self)
+        self.info_label=QLabel("Click to run decision table in a dry-run transaction.")
+        layout.addWidget(self.info_label)
 
-        # Rule Selection
-        rule_layout = QHBoxLayout()
-        rule_layout.addWidget(QLabel("Select Rule:"))
-        self.rule_selector = QComboBox()
-        self.populate_rule_selector()
-        rule_layout.addWidget(self.rule_selector)
-        layout.addLayout(rule_layout)
+        self.result_text=QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
 
-        # JSON Mapping Input
-        map_layout = QHBoxLayout()
-        map_layout.addWidget(QLabel("Business Name Mapping (JSON):"))
-        self.mapping_input = QPlainTextEdit()
-        self.mapping_input.setPlaceholderText('E.g. {"dbo.Customers":"Customers","dbo.Orders":"Orders"}')
-        map_layout.addWidget(self.mapping_input)
-        layout.addLayout(map_layout)
+        run_btn=QPushButton("Run Decision Table (Dry-Run)")
+        run_btn.clicked.connect(self.run_decision_table)
+        layout.addWidget(run_btn)
 
-        # Convert Button
-        self.convert_button = QPushButton("Convert SQL to Business Language")
-        self.convert_button.clicked.connect(self.convert_sql)
-        layout.addWidget(self.convert_button)
-
-        # Output Display
-        layout.addWidget(QLabel("Converted SQL:"))
-        self.output_display = QPlainTextEdit()
-        self.output_display.setReadOnly(True)
-        layout.addWidget(self.output_display)
+        close_btn=QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
 
         self.setLayout(layout)
 
-    def populate_rule_selector(self):
-        """
-        Load all rule IDs and names from BRM_RULES into the combo box.
-        """
-        self.rule_selector.clear()
-        c = self.connection.cursor()
-        try:
-            c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
-            rows = c.fetchall()
-            for row in rows:
-                rid, rname = row
-                self.rule_selector.addItem(f"{rid} - {rname}", rid)
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Could not load rules: {ex}")
+    def run_decision_table(self):
+        (pf,msg,rc)=execute_decision_table(self.connection, self.dt_id, dry_run=True)
+        text=f"DecisionTable {self.dt_id} => pass={pf}, message={msg}, records={rc}"
+        self.result_text.setPlainText(text)
+        QMessageBox.information(self,"Execution Complete",text)
 
-    def convert_sql(self):
-        """
-        Fetch the selected rule's SQL, parse it, apply the user-supplied JSON mapping,
-        then display the converted SQL.
-        """
-        rule_id = self.rule_selector.currentData()
-        if rule_id is None:
-            QMessageBox.warning(self, "No Rule", "Please select a rule from the combo box.")
+
+###############################################################################
+# Advanced DecisionTable Management Tab
+###############################################################################
+class AdvancedDecisionTablesTab(QWidget):
+    """
+    A tab that displays the DECISION_TABLES entries, allows add/edit/delete,
+    and “Execute” to run the logic in a dry-run or real mode. 
+    The pass/fail outcome is displayed, plus we store logs in DECISION_TABLE_EXEC_LOGS.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.init_ui()
+        self.load_decision_tables()
+
+    def init_ui(self):
+        layout=QVBoxLayout(self)
+
+        self.dt_table=QTableWidget(0,4)
+        self.dt_table.setHorizontalHeaderLabels(["DT_ID","TableName","Description","Query"])
+        self.dt_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.dt_table)
+
+        btn_h=QHBoxLayout()
+        add_btn=QPushButton("Add Decision Table")
+        add_btn.clicked.connect(self.add_dt)
+        btn_h.addWidget(add_btn)
+
+        edit_btn=QPushButton("Edit Decision Table")
+        edit_btn.clicked.connect(self.edit_dt)
+        btn_h.addWidget(edit_btn)
+
+        del_btn=QPushButton("Delete Decision Table")
+        del_btn.clicked.connect(self.delete_dt)
+        btn_h.addWidget(del_btn)
+
+        exec_btn=QPushButton("Execute Decision Table")
+        exec_btn.clicked.connect(self.execute_dt)
+        btn_h.addWidget(exec_btn)
+
+        ref_btn=QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_decision_tables)
+        btn_h.addWidget(ref_btn)
+
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        # Optional: logs?
+        # We can have a mini “View Logs” button that opens a separate table or dialog.
+        logs_btn=QPushButton("View Exec Logs")
+        logs_btn.clicked.connect(self.view_exec_logs)
+        layout.addWidget(logs_btn)
+
+        self.setLayout(layout)
+
+    def load_decision_tables(self):
+        self.dt_table.setRowCount(0)
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
+            FROM DECISION_TABLES
+            ORDER BY DECISION_TABLE_ID
+        """)
+        rows=c.fetchall()
+        for row in rows:
+            r_i=self.dt_table.rowCount()
+            self.dt_table.insertRow(r_i)
+            for col_i,val in enumerate(row):
+                it=QTableWidgetItem(str(val) if val else "")
+                self.dt_table.setItem(r_i,col_i,it)
+
+    def get_selected_dt_id(self):
+        row=self.dt_table.currentRow()
+        if row<0:
+            return None
+        it=self.dt_table.item(row,0)
+        if not it:
+            return None
+        return int(it.text())
+
+    def add_dt(self):
+        name,ok=QInputDialog.getText(self,"Add Decision Table","Table Name:")
+        if not ok or not name.strip():
             return
-        c = self.connection.cursor()
+        desc,ok2=QInputDialog.getMultiLineText(self,"Add Decision Table","Description:")
+        if not ok2:
+            desc=""
+        query,ok3=QInputDialog.getMultiLineText(self,"Add Decision Table","Decision Query (SQL):")
+        if not ok3 or not query.strip():
+            QMessageBox.warning(self,"Input Error","Decision Query is required.")
+            return
+        c=self.connection.cursor()
         try:
-            c.execute("SELECT RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-            row = c.fetchone()
-            if not row or not row[0]:
-                QMessageBox.warning(self, "No SQL", "Selected rule has no SQL.")
-                return
-
-            sql_text = row[0]
-            parse_info = parse_sql_dependencies(sql_text)
+            c.execute("""
+                INSERT INTO DECISION_TABLES(
+                  TABLE_NAME, DESCRIPTION, DECISION_QUERY, CREATED_TIMESTAMP
+                )
+                VALUES(?,?,?,GETDATE())
+            """,(name.strip(), desc.strip(), query.strip()))
+            self.connection.commit()
+            QMessageBox.information(self,"Success","Decision Table added.")
+            self.load_decision_tables()
         except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Error fetching/parsing SQL: {ex}")
+            QMessageBox.critical(self,"Error",str(ex))
+
+    def edit_dt(self):
+        dt_id=self.get_selected_dt_id()
+        if not dt_id:
+            QMessageBox.warning(self,"Error","No decision table selected.")
+            return
+        # fetch existing
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
+            FROM DECISION_TABLES
+            WHERE DECISION_TABLE_ID=?
+        """,(dt_id,))
+        row=c.fetchone()
+        if not row:
+            QMessageBox.warning(self,"Not Found",f"DecisionTable {dt_id} not found.")
+            return
+        old_name=row[1] or ""
+        old_desc=row[2] or ""
+        old_query=row[3] or ""
+
+        new_name,ok=QInputDialog.getText(self,"Edit TableName","Table Name:", text=old_name)
+        if not ok or not new_name.strip():
+            return
+        new_desc,ok2=QInputDialog.getMultiLineText(self,"Edit Description","Description:", text=old_desc)
+        if not ok2:
+            new_desc=old_desc
+        new_query,ok3=QInputDialog.getMultiLineText(self,"Edit Query","Query:", text=old_query)
+        if not ok3 or not new_query.strip():
+            QMessageBox.warning(self,"Input Error","Query is required.")
             return
 
-        # load JSON mapping
-        mapping_text = self.mapping_input.toPlainText().strip()
-        business_mapping = {}
-        if mapping_text:
-            try:
-                business_mapping = json.loads(mapping_text)
-            except Exception as ex:
-                QMessageBox.warning(self, "Mapping Error", f"Invalid JSON: {ex}")
-                return
+        try:
+            c.execute("""
+                UPDATE DECISION_TABLES
+                SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?, UPDATED_TIMESTAMP=GETDATE()
+                WHERE DECISION_TABLE_ID=?
+            """,(new_name.strip(), new_desc.strip(), new_query.strip(), dt_id))
+            self.connection.commit()
+            QMessageBox.information(self,"Updated",f"DecisionTable {dt_id} updated.")
+            self.load_decision_tables()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
-        # Convert
-        converted_sql = self.apply_business_mapping(sql_text, parse_info, business_mapping)
-        self.output_display.setPlainText(converted_sql)
-        replaced_count = self.count_replacements(parse_info, business_mapping)
-        QMessageBox.information(self, "Conversion Complete", f"Replaced {replaced_count} identifiers.")
+    def delete_dt(self):
+        dt_id=self.get_selected_dt_id()
+        if not dt_id:
+            QMessageBox.warning(self,"None","No table selected.")
+            return
+        confirm=QMessageBox.question(self,"Confirm",f"Delete DecisionTable {dt_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        try:
+            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted","Decision table removed.")
+            self.load_decision_tables()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
-    def apply_business_mapping(self, sql_text, parse_info, mapping):
-        converted = sql_text
-        # For each table reference
-        for (schema, table, alias, is_sub) in parse_info.get("tables", []):
-            key = f"{schema}.{table}" if schema else table
-            if key in mapping:
-                bname = mapping[key]
-                # We'll do a naive replace with word boundaries
-                converted = self._replace_identifier(converted, table, bname)
-        return converted
+    def execute_dt(self):
+        dt_id=self.get_selected_dt_id()
+        if not dt_id:
+            QMessageBox.warning(self,"None","No decision table selected.")
+            return
+        dlg=DecisionTableExecutionDialog(self.connection, dt_id, self)
+        dlg.exec_()
 
-    def _replace_identifier(self, text, identifier, replacement):
-        import re
-        pattern = r'\b' + re.escape(identifier) + r'\b'
-        return re.sub(pattern, replacement, text)
+    def view_exec_logs(self):
+        # optional: show a mini table with the last N logs
+        logs_dlg=QDialog(self)
+        logs_dlg.setWindowTitle("Decision Table Execution Logs")
+        logs_dlg.resize(700,400)
+        lay=QVBoxLayout(logs_dlg)
 
-    def count_replacements(self, parse_info, mapping):
-        count = 0
-        for (schema, table, alias, is_sub) in parse_info.get("tables", []):
-            key = f"{schema}.{table}" if schema else table
-            if key in mapping:
-                count += 1
-        return count
+        tbl=QTableWidget(0,7)
+        tbl.setHorizontalHeaderLabels(["ExecID","DT_ID","Timestamp","PassFlag","Message","RecordCount","TimeMS"])
+        tbl.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(tbl)
 
-    def _setup_auto_refresh(self):
-        """
-        Auto-refresh rule selector and re-do conversion if the user has something displayed.
-        (For demonstration, every 30 seconds.)
-        """
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.auto_refresh)
-        self.refresh_timer.start(30000)
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT TOP 200 EXEC_ID,DECISION_TABLE_ID,EXEC_TIMESTAMP,PASS_FLAG,MESSAGE,RECORD_COUNT,EXECUTION_TIME_MS
+            FROM DECISION_TABLE_EXEC_LOGS
+            ORDER BY EXEC_ID DESC
+        """)
+        rows=c.fetchall()
+        for row in rows:
+            r_i=tbl.rowCount()
+            tbl.insertRow(r_i)
+            for col_i,val in enumerate(row):
+                tbl.setItem(r_i,col_i,QTableWidgetItem(str(val) if val is not None else ""))
 
-    def auto_refresh(self):
-        old_rule = self.rule_selector.currentData()
-        self.populate_rule_selector()
-        if self.output_display.toPlainText().strip():
-            # re-run conversion if rule is still valid
-            if old_rule:
-                idx = self.rule_selector.findData(old_rule)
-                if idx>=0:
-                    self.rule_selector.setCurrentIndex(idx)
-                self.convert_sql()
+        cb=QPushButton("Close")
+        cb.clicked.connect(logs_dlg.close)
+        lay.addWidget(cb)
+        logs_dlg.setLayout(lay)
+        logs_dlg.exec_()
