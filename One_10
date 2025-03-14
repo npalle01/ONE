@@ -24,384 +24,223 @@ This module integrates with:
   - brm_simulation_scheduler or scheduling logic for pipeline triggers.
   - brm_advanced_approvals_and_lineage for multi-step approvals (we add forking).
 """
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
-import sys
-import logging
-import json
-import re
-from datetime import datetime
+import sys, json, re, logging, time
+from datetime import datetime, timedelta
+from collections import deque
+import pyodbc
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QPointF
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QDialog, 
-    QLineEdit, QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QComboBox, 
-    QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsItem, QFileDialog
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QMessageBox,
+    QDialog, QGraphicsView, QGraphicsScene, QGraphicsItem, QInputDialog
 )
-from PyQt5.QtGui import QPen, QBrush, QColor, QFont
 
-# from brm_core_foundation import logger, fetch_one_dict, fetch_all_dict, insert_audit_log
-# from brm_rule_engine import gather_all_related_rule_ids, lock_rule_for_edit, unlock_rule_for_edit
+logger = logging.getLogger("brm_enhanced_workflow_pipeline")
 
-###############################################################################
-# 1) Rule Change Impact Analysis
-###############################################################################
 def find_downstream_impact_on_update(conn, rule_id):
-    """
-    When rule_id is updated, run BFS to find impacted child rules or schedules.
-    Return a dictionary like {
-      "child_rules": [list_of_rule_ids],
-      "schedules": [list_of_schedule_ids_that_reference_these_rules]
-    }
-    """
-    impacted_rules = gather_all_related_rule_ids(conn, rule_id)
-    # exclude the rule_id itself if you only want children
-    if rule_id in impacted_rules:
-        impacted_rules.remove(rule_id)
-
-    # find schedules that reference any of these impacted rules
+    # Using BFS to find all child rules affected by the update.
     c = conn.cursor()
-    placeholders=','.join('?' for _ in impacted_rules) if impacted_rules else ''
-    schedules=[]
-    if placeholders:
-        q=f"""
-           SELECT SCHEDULE_ID
-           FROM RULE_SCHEDULES
-           WHERE RULE_ID IN ({placeholders})
-        """
-        c.execute(q, tuple(impacted_rules))
-        rows=c.fetchall()
-        schedules=[r[0] for r in rows]
-
-    return {
-        "child_rules": list(impacted_rules),
-        "schedules": schedules
-    }
+    c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
+    rows = c.fetchall()
+    adjacency = {}
+    for rid, pid in rows:
+        if pid:
+            adjacency.setdefault(pid, set()).add(rid)
+    visited = set()
+    queue = [rule_id]
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        if current in adjacency:
+            queue.extend(adjacency[current])
+    # Exclude the updated rule itself.
+    visited.discard(rule_id)
+    # Get schedules referencing any of these rules.
+    schedules = []
+    if visited:
+        placeholders = ",".join("?" for _ in visited)
+        c.execute(f"SELECT SCHEDULE_ID FROM RULE_SCHEDULES WHERE RULE_ID IN ({placeholders})", tuple(visited))
+        schedules = [r[0] for r in c.fetchall()]
+    return {"child_rules": list(visited), "schedules": schedules}
 
 def display_impact_warning_if_any(conn, rule_id):
-    """
-    Example function: after an update, we show a dialog listing impacted child rules or schedules,
-    asking user to proceed or not.
-    """
-    impact=find_downstream_impact_on_update(conn, rule_id)
-    child_count=len(impact["child_rules"])
-    sched_count=len(impact["schedules"])
-    if child_count==0 and sched_count==0:
-        return True  # no impact => proceed
-    msg=f"Rule {rule_id} update will impact {child_count} child rule(s) and {sched_count} schedule(s)."
-    msg+="\nContinue anyway?"
-    confirm=QMessageBox.question(None, "Impact Analysis", msg)
-    return (confirm==QMessageBox.Yes)
+    impact = find_downstream_impact_on_update(conn, rule_id)
+    child_count = len(impact["child_rules"])
+    sched_count = len(impact["schedules"])
+    if child_count == 0 and sched_count == 0:
+        return True
+    msg = f"Updating rule {rule_id} will impact {child_count} child rule(s) and {sched_count} schedule(s). Continue?"
+    return (QMessageBox.question(None, "Impact Analysis", msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes)
 
-###############################################################################
-# 2) Branching / Forking Approvals
-###############################################################################
 def fork_rule_approvals(conn, rule_id, fork_labels):
-    """
-    If a rule fails at stage X, we can fork it into multiple variants 
-    (A, B, C...) each with separate approvals. This requires:
-      - Creating new entries in BRM_RULES for each fork or 
-      - Storing a 'FORK_LABEL' in BRM_RULE_APPROVALS
-    Below, we store them in a hypothetical BRM_RULE_FORKS table or
-    extend BRM_RULE_APPROVALS with a FORK_LABEL. 
-    We'll do a minimal approach: store them in a new table.
-
-    fork_labels => list of strings, e.g. ["ReworkA","ReworkB","SecurityVariant"]
-    """
-    c=conn.cursor()
+    c = conn.cursor()
     for label in fork_labels:
-        c.execute("""
-            INSERT INTO BRM_RULE_FORKS(
-              RULE_ID, FORK_LABEL, CREATED_TIMESTAMP
-            )
-            VALUES(?,?,GETDATE())
-        """,(rule_id, label))
-        # Also potentially create new approval lines for each fork, etc.
+        c.execute("INSERT INTO BRM_RULE_FORKS(RULE_ID, FORK_LABEL, CREATED_TIMESTAMP) VALUES(?, ?, GETDATE())", (rule_id, label))
     conn.commit()
 
 def mark_rule_fork_failed(conn, rule_id, fork_label):
-    """
-    If a particular fork fails, mark it or remove it. 
-    This is a placeholder for more advanced logic.
-    """
-    c=conn.cursor()
-    c.execute("""
-        UPDATE BRM_RULE_FORKS
-        SET FORK_STATUS='FAILED'
-        WHERE RULE_ID=? AND FORK_LABEL=?
-    """,(rule_id, fork_label))
+    c = conn.cursor()
+    c.execute("UPDATE BRM_RULE_FORKS SET FORK_STATUS='FAILED' WHERE RULE_ID=? AND FORK_LABEL=?", (rule_id, fork_label))
     conn.commit()
 
-###############################################################################
-# 3) Automated ETL / Data Pipeline
-###############################################################################
-class PipelineDesignerTab(QWidget):
-    """
-    A tab that provides a node-based interface for defining pipelines:
-      - Each node represents a BFS run or a rule set.
-      - Edges represent the sequence or condition checks.
-    For demonstration, we store pipeline definitions in memory or a small table.
-    """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.pipeline_id=None
-        self.init_ui()
-        self.load_pipeline_list()
-
-    def init_ui(self):
-        layout=QVBoxLayout(self)
-        top_h=QHBoxLayout()
-
-        self.pipeline_combo=QComboBox()
-        top_h.addWidget(QLabel("Select Pipeline:"))
-        top_h.addWidget(self.pipeline_combo)
-
-        load_btn=QPushButton("Load Pipeline")
-        load_btn.clicked.connect(self.load_pipeline)
-        top_h.addWidget(load_btn)
-
-        new_btn=QPushButton("New Pipeline")
-        new_btn.clicked.connect(self.create_pipeline)
-        top_h.addWidget(new_btn)
-
-        del_btn=QPushButton("Delete Pipeline")
-        del_btn.clicked.connect(self.delete_pipeline)
-        top_h.addWidget(del_btn)
-
-        top_h.addStretch()
-        layout.addLayout(top_h)
-
-        # The node-based scene
-        self.scene=QtWidgets.QGraphicsScene(self)
-        self.view=QtWidgets.QGraphicsView(self.scene)
-        self.view.setRenderHint(QtGui.QPainter.Antialiasing)
-        self.view.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
-        layout.addWidget(self.view)
-
-        # bottom row => add node, run pipeline
-        bot_h=QHBoxLayout()
-        node_btn=QPushButton("Add BFS Node")
-        node_btn.clicked.connect(self.add_bfs_node)
-        bot_h.addWidget(node_btn)
-
-        run_btn=QPushButton("Run Pipeline")
-        run_btn.clicked.connect(self.run_pipeline)
-        bot_h.addWidget(run_btn)
-
-        bot_h.addStretch()
-        layout.addLayout(bot_h)
-        self.setLayout(layout)
-
-    def load_pipeline_list(self):
-        self.pipeline_combo.clear()
-        c=self.connection.cursor()
-        c.execute("SELECT PIPELINE_ID, PIPELINE_NAME FROM BRM_PIPELINES ORDER BY PIPELINE_ID")
-        rows=c.fetchall()
-        for (pid,pnm) in rows:
-            self.pipeline_combo.addItem(f"{pnm} (ID={pid})", pid)
-
-    def load_pipeline(self):
-        pid=self.pipeline_combo.currentData()
-        if not pid:
-            return
-        self.pipeline_id=pid
-        self.scene.clear()
-        # load pipeline nodes
-        c=self.connection.cursor()
-        c.execute("""
-            SELECT NODE_ID, NODE_TYPE, NODE_LABEL, POS_X, POS_Y
-            FROM BRM_PIPELINE_NODES
-            WHERE PIPELINE_ID=?
-        """,(pid,))
-        nodes=c.fetchall()
-        node_map={}
-        for (nid,ntype,nlabel,px,py) in nodes:
-            item=PipelineNodeItem(nid, ntype, nlabel)
-            item.setPos(px or 50, py or 50)
-            self.scene.addItem(item)
-            node_map[nid]=item
-
-        # load edges
-        c.execute("""
-            SELECT EDGE_ID, SOURCE_NODE_ID, TARGET_NODE_ID, CONDITION_LABEL
-            FROM BRM_PIPELINE_EDGES
-            WHERE PIPELINE_ID=?
-        """,(pid,))
-        edges=c.fetchall()
-        for (eid,snid,tnid,cond) in edges:
-            if snid in node_map and tnid in node_map:
-                src=node_map[snid]
-                tgt=node_map[tnid]
-                edge=PipelineEdgeItem(src,tgt,cond)
-                self.scene.addItem(edge)
-
-    def create_pipeline(self):
-        name,ok=QInputDialog.getText(self,"New Pipeline","Pipeline name:")
-        if not ok or not name.strip():
-            return
-        c=self.connection.cursor()
-        c.execute("""
-            INSERT INTO BRM_PIPELINES(PIPELINE_NAME,CREATED_TIMESTAMP)
-            VALUES(?,GETDATE())
-        """,(name.strip(),))
-        self.connection.commit()
-        QMessageBox.information(self,"Created",f"Pipeline '{name.strip()}' created.")
-        self.load_pipeline_list()
-
-    def delete_pipeline(self):
-        pid=self.pipeline_combo.currentData()
-        if not pid:
-            return
-        confirm=QMessageBox.question(self,"Confirm",f"Delete pipeline ID={pid}?")
-        if confirm!=QMessageBox.Yes:
-            return
-        c=self.connection.cursor()
-        c.execute("DELETE FROM BRM_PIPELINE_EDGES WHERE PIPELINE_ID=?",(pid,))
-        c.execute("DELETE FROM BRM_PIPELINE_NODES WHERE PIPELINE_ID=?",(pid,))
-        c.execute("DELETE FROM BRM_PIPELINES WHERE PIPELINE_ID=?",(pid,))
-        self.connection.commit()
-        QMessageBox.information(self,"Deleted",f"Pipeline {pid} removed.")
-        self.load_pipeline_list()
-        self.scene.clear()
-        self.pipeline_id=None
-
-    def add_bfs_node(self):
-        if not self.pipeline_id:
-            QMessageBox.warning(self,"None","No pipeline loaded.")
-            return
-        node_type="BFS"
-        node_label,ok=QInputDialog.getText(self,"Node Label","Enter BFS node label:")
-        if not ok or not node_label.strip():
-            return
-        c=self.connection.cursor()
-        c.execute("""
-            INSERT INTO BRM_PIPELINE_NODES(PIPELINE_ID, NODE_TYPE, NODE_LABEL, POS_X, POS_Y)
-            OUTPUT inserted.NODE_ID
-            VALUES(?,?,?,?,?)
-        """,(self.pipeline_id,node_type,node_label,100,100))
-        row=c.fetchone()
-        nid=row[0]
-        self.connection.commit()
-
-        item=PipelineNodeItem(nid,node_type,node_label)
-        item.setPos(100,100)
-        self.scene.addItem(item)
-
-    def run_pipeline(self):
-        # naive approach => gather BFS nodes in pipeline => run them in topological order
-        # or we do a graph approach with BFS. For demonstration, we'll just message.
-        if not self.pipeline_id:
-            QMessageBox.warning(self,"None","No pipeline loaded.")
-            return
-        QMessageBox.information(self,"Pipeline","Pipeline run started... (stub)")
-
-###############################################################################
-# 4) Modern / Flat / Material Theme
-###############################################################################
-def apply_modern_theme(app):
-    """
-    Apply a QSS or QStyle to make the app more modern, e.g. a Material-like or Fusion-based style.
-    """
-    # We'll do a simple QSS snippet:
-    qss="""
-    QWidget {
-       font-family: "Segoe UI", Arial;
-       font-size: 10pt;
-       background-color: #F0F0F0;
-    }
-    QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QTableWidget, QTreeWidget {
-       background-color: #FFFFFF; 
-       border: 1px solid #C8C8C8;
-       border-radius: 4px;
-    }
-    QPushButton {
-       background-color: #007ACC;
-       color: white;
-       border: none;
-       padding: 5px 12px;
-       border-radius: 4px;
-    }
-    QPushButton:hover {
-       background-color: #005A9E;
-    }
-    QTabWidget::pane {
-       border: 1px solid #CCCCCC;
-    }
-    QTabBar::tab:selected {
-       background-color: #FFFFFF;
-       font-weight: bold;
-    }
-    """
-    app.setStyleSheet(qss)
-
-
-###############################################################################
-# QGraphics Items for Pipeline Designer
-###############################################################################
 class PipelineNodeItem(QtWidgets.QGraphicsItem):
-    """
-    Represents a BFS or scheduling node in the pipeline graph.
-    """
     def __init__(self, node_id, node_type, label):
         super().__init__()
-        self.node_id=node_id
-        self.node_type=node_type
-        self.label=label
-        self.rect_w=120
-        self.rect_h=60
-        self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
-        self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, True)
-
+        self.node_id = node_id
+        self.node_type = node_type
+        self.label = label
+        self.rect = QtCore.QRectF(0, 0, 120, 60)
+        self.setFlags(QtWidgets.QGraphicsItem.ItemIsMovable | QtWidgets.QGraphicsItem.ItemIsSelectable)
     def boundingRect(self):
-        return self.shape().boundingRect()
-
-    def shape(self):
-        from PyQt5.QtGui import QPainterPath
-        path=QPainterPath()
-        path.addRoundedRect(0,0,self.rect_w,self.rect_h,8,8)
-        return path
-
+        return self.rect.adjusted(-2, -2, 2, 2)
     def paint(self, painter, option, widget=None):
-        pen=QPen(Qt.black, 2)
-        fill=QColor("#E0E0E0")
-        if self.isSelected():
-            pen=QPen(Qt.blue,3)
-        painter.setPen(pen)
-        painter.setBrush(QBrush(fill))
-        painter.drawRoundedRect(0,0,self.rect_w,self.rect_h,8,8)
-
-        text=f"{self.node_type}\n{self.label}"
-        painter.drawText(0,0,self.rect_w,self.rect_h,Qt.AlignCenter,text)
-
+        painter.setPen(QtGui.QPen(Qt.black, 2))
+        painter.setBrush(QtGui.QBrush(QtGui.QColor("#E0E0E0")))
+        painter.drawRoundedRect(self.rect, 8, 8)
+        painter.drawText(self.rect, Qt.AlignCenter, f"{self.node_type}\n{self.label}")
 
 class PipelineEdgeItem(QtWidgets.QGraphicsLineItem):
-    """
-    An edge connecting two PipelineNodeItem(s) with an optional label.
-    """
-    def __init__(self, source_node, target_node, label=None):
+    def __init__(self, source, target, condition=None):
         super().__init__()
-        self.source=source_node
-        self.target=target_node
-        self.label=label
-        self.setPen(QPen(Qt.darkGray,2))
+        self.source = source
+        self.target = target
+        self.condition = condition
+        self.setPen(QtGui.QPen(Qt.darkGray, 2))
         self.adjust()
-
     def adjust(self):
-        sr=self.source.sceneBoundingRect()
-        tr=self.target.sceneBoundingRect()
-        sp=sr.center()
-        tp=tr.center()
+        sp = self.source.sceneBoundingRect().center()
+        tp = self.target.sceneBoundingRect().center()
         self.setLine(sp.x(), sp.y(), tp.x(), tp.y())
-
     def paint(self, painter, option, widget=None):
         self.adjust()
         super().paint(painter, option, widget)
-        # optionally draw label in the middle
-        if self.label:
-            mid_x=(self.line().x1()+self.line().x2())/2
-            mid_y=(self.line().y1()+self.line().y2())/2
-            painter.setPen(QPen(Qt.darkGray,1))
-            painter.drawText(mid_x, mid_y, self.label)
+        if self.condition:
+            mid_x = (self.line().x1() + self.line().x2()) / 2
+            mid_y = (self.line().y1() + self.line().y2()) / 2
+            painter.setPen(QtGui.QPen(Qt.darkGray, 1))
+            painter.drawText(mid_x, mid_y, self.condition)
 
-    def boundingRect(self):
-        return super().boundingRect()
+class PipelineDesignerTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.pipeline_id = None
+        self.init_ui()
+        self.load_pipeline_list()
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        top_h = QHBoxLayout()
+        self.pipeline_combo = QComboBox()
+        top_h.addWidget(QLabel("Select Pipeline:"))
+        top_h.addWidget(self.pipeline_combo)
+        load_btn = QPushButton("Load Pipeline")
+        load_btn.clicked.connect(self.load_pipeline)
+        top_h.addWidget(load_btn)
+        new_btn = QPushButton("New Pipeline")
+        new_btn.clicked.connect(self.create_pipeline)
+        top_h.addWidget(new_btn)
+        del_btn = QPushButton("Delete Pipeline")
+        del_btn.clicked.connect(self.delete_pipeline)
+        top_h.addWidget(del_btn)
+        top_h.addStretch()
+        layout.addLayout(top_h)
+        self.scene = QtWidgets.QGraphicsScene(self)
+        self.view = QtWidgets.QGraphicsView(self.scene)
+        self.view.setRenderHint(QtGui.QPainter.Antialiasing)
+        self.view.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+        layout.addWidget(self.view)
+        bot_h = QHBoxLayout()
+        node_btn = QPushButton("Add BFS Node")
+        node_btn.clicked.connect(self.add_bfs_node)
+        bot_h.addWidget(node_btn)
+        run_btn = QPushButton("Run Pipeline")
+        run_btn.clicked.connect(self.run_pipeline)
+        bot_h.addWidget(run_btn)
+        bot_h.addStretch()
+        layout.addLayout(bot_h)
+        self.setLayout(layout)
+    def load_pipeline_list(self):
+        self.pipeline_combo.clear()
+        c = self.connection.cursor()
+        c.execute("SELECT PIPELINE_ID, PIPELINE_NAME FROM BRM_PIPELINES ORDER BY PIPELINE_ID")
+        for pid, pnm in c.fetchall():
+            self.pipeline_combo.addItem(f"{pnm} (ID={pid})", pid)
+    def load_pipeline(self):
+        pid = self.pipeline_combo.currentData()
+        if not pid:
+            return
+        self.pipeline_id = pid
+        self.scene.clear()
+        c = self.connection.cursor()
+        c.execute("SELECT NODE_ID, NODE_TYPE, NODE_LABEL, POS_X, POS_Y FROM BRM_PIPELINE_NODES WHERE PIPELINE_ID=?", (pid,))
+        node_map = {}
+        for nid, ntype, nlabel, px, py in c.fetchall():
+            item = PipelineNodeItem(nid, ntype, nlabel)
+            item.setPos(px or 50, py or 50)
+            self.scene.addItem(item)
+            node_map[nid] = item
+        c.execute("SELECT EDGE_ID, SOURCE_NODE_ID, TARGET_NODE_ID, CONDITION_LABEL FROM BRM_PIPELINE_EDGES WHERE PIPELINE_ID=?", (pid,))
+        for eid, snid, tnid, cond in c.fetchall():
+            if snid in node_map and tnid in node_map:
+                edge = PipelineEdgeItem(node_map[snid], node_map[tnid], cond)
+                self.scene.addItem(edge)
+        self.scene.setSceneRect(self.scene.itemsBoundingRect())
+        self.view.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
+    def create_pipeline(self):
+        name, ok = QInputDialog.getText(self, "New Pipeline", "Pipeline name:")
+        if not ok or not name.strip():
+            return
+        c = self.connection.cursor()
+        c.execute("INSERT INTO BRM_PIPELINES(PIPELINE_NAME, CREATED_TIMESTAMP) VALUES(?, GETDATE())", (name.strip(),))
+        self.connection.commit()
+        QMessageBox.information(self, "Created", f"Pipeline '{name.strip()}' created.")
+        self.load_pipeline_list()
+    def delete_pipeline(self):
+        pid = self.pipeline_combo.currentData()
+        if not pid:
+            return
+        if QMessageBox.question(self, "Confirm", f"Delete pipeline ID={pid}?") != QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        c.execute("DELETE FROM BRM_PIPELINE_EDGES WHERE PIPELINE_ID=?", (pid,))
+        c.execute("DELETE FROM BRM_PIPELINE_NODES WHERE PIPELINE_ID=?", (pid,))
+        c.execute("DELETE FROM BRM_PIPELINES WHERE PIPELINE_ID=?", (pid,))
+        self.connection.commit()
+        QMessageBox.information(self, "Deleted", f"Pipeline {pid} removed.")
+        self.load_pipeline_list()
+        self.scene.clear()
+        self.pipeline_id = None
+    def add_bfs_node(self):
+        if not self.pipeline_id:
+            QMessageBox.warning(self, "None", "No pipeline loaded.")
+            return
+        node_type = "BFS"
+        node_label, ok = QInputDialog.getText(self, "Node Label", "Enter BFS node label:")
+        if not ok or not node_label.strip():
+            return
+        c = self.connection.cursor()
+        c.execute("INSERT INTO BRM_PIPELINE_NODES(PIPELINE_ID, NODE_TYPE, NODE_LABEL, POS_X, POS_Y) OUTPUT INSERTED.NODE_ID VALUES(?,?,?,?,?)",
+                  (self.pipeline_id, node_type, node_label, 100, 100))
+        nid = c.fetchone()[0]
+        self.connection.commit()
+        item = PipelineNodeItem(nid, node_type, node_label)
+        item.setPos(100, 100)
+        self.scene.addItem(item)
+    def run_pipeline(self):
+        QMessageBox.information(self, "Pipeline", "Pipeline run initiated. (Stub)")
+
+def apply_modern_theme(app):
+    qss = """
+    QWidget { font-family: "Segoe UI", Arial; font-size: 10pt; background-color: #F0F0F0; }
+    QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QTableWidget, QTreeWidget { background-color: #FFFFFF; border: 1px solid #C8C8C8; border-radius: 4px; }
+    QPushButton { background-color: #007ACC; color: white; border: none; padding: 5px 12px; border-radius: 4px; }
+    QPushButton:hover { background-color: #005A9E; }
+    QTabWidget::pane { border: 1px solid #CCCCCC; }
+    QTabBar::tab:selected { background-color: #FFFFFF; font-weight: bold; }
+    """
+    app.setStyleSheet(qss)
