@@ -1,0 +1,226 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: live_collaboration.py
+Description:
+  Adds basic 'live collaboration' features so multiple users can see each other’s presence
+  on the same rule or region. Includes:
+   1. A 'presence' table (BRM_COLLAB_PRESENCE) that tracks which user is currently viewing/editing a rule.
+   2. Minimal 'notification' or 'signal' system so if a second user opens the same rule, the first sees “User X is also editing.”
+   3. Optional in-app chat or message to coordinate.
+
+Full real-time merges or concurrency might require a separate server with websockets.
+This module provides a simpler approach:
+   • On rule open, we call `set_user_presence(...)`.
+   • On rule close, we call `clear_user_presence(...)`.
+   • A QTimer can periodically refresh presence and display user icons in the UI.
+   
+DB Table Suggestion: BRM_COLLAB_PRESENCE
+  - RULE_ID (int)
+  - USER_ID (int)
+  - USERNAME (varchar)
+  - START_TIMESTAMP (datetime)
+  - LAST_HEARTBEAT (datetime)
+  - Possibly a 'STATE' or 'REGION' if you want to track which part of the rule or editor.
+
+Usage:
+   1. Whenever a user opens a rule editor, call set_user_presence(conn, rule_id, user_id, username).
+   2. Start a QTimer that every 30s calls refresh_presence(...) to update LAST_HEARTBEAT.
+   3. In the same timer, also read presence from the DB to see which other users are on the same rule, then display in the UI.
+
+"""
+
+import sys
+import logging
+from datetime import datetime, timedelta
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTimer, QListWidget,
+    QListWidgetItem, QMessageBox
+)
+from PyQt5.QtCore import Qt
+
+###############################################################################
+# 1) DB presence manipulation
+###############################################################################
+def set_user_presence(conn, rule_id, user_id, username):
+    """
+    Insert or update presence row => RULE_ID, user_id => set START_TIMESTAMP if new,
+    update LAST_HEARTBEAT. 
+    If this user is already in the table, just update the heartbeat.
+    """
+    c = conn.cursor()
+    now = datetime.now()
+    # check if existing
+    c.execute("""
+        SELECT 1
+        FROM BRM_COLLAB_PRESENCE
+        WHERE RULE_ID=? AND USER_ID=?
+    """,(rule_id, user_id))
+    row = c.fetchone()
+    if row:
+        # update
+        c.execute("""
+            UPDATE BRM_COLLAB_PRESENCE
+            SET LAST_HEARTBEAT=?
+            WHERE RULE_ID=? AND USER_ID=?
+        """,(now, rule_id, user_id))
+    else:
+        # insert
+        c.execute("""
+            INSERT INTO BRM_COLLAB_PRESENCE(
+              RULE_ID, USER_ID, USERNAME, START_TIMESTAMP, LAST_HEARTBEAT
+            )
+            VALUES(?,?,?,?,?)
+        """,(rule_id, user_id, username, now, now))
+    conn.commit()
+
+
+def clear_user_presence(conn, rule_id, user_id):
+    """
+    Remove row from presence table => user is no longer collaborating on that rule.
+    """
+    c = conn.cursor()
+    c.execute("""
+        DELETE FROM BRM_COLLAB_PRESENCE
+        WHERE RULE_ID=? AND USER_ID=?
+    """,(rule_id, user_id))
+    conn.commit()
+
+
+def heartbeat_user_presence(conn, rule_id, user_id):
+    """
+    Just update the LAST_HEARTBEAT to keep presence alive. 
+    Typically called every X seconds by a timer.
+    """
+    c = conn.cursor()
+    c.execute("""
+        UPDATE BRM_COLLAB_PRESENCE
+        SET LAST_HEARTBEAT=?
+        WHERE RULE_ID=? AND USER_ID=?
+    """,(datetime.now(), rule_id, user_id))
+    conn.commit()
+
+
+def cleanup_stale_presence(conn, max_inactive_minutes=5):
+    """
+    Periodically remove presence rows where LAST_HEARTBEAT is older than max_inactive_minutes,
+    indicating the user closed the rule or crashed. 
+    Call from an app-wide or server-wide timer.
+    """
+    cutoff = datetime.now() - timedelta(minutes=max_inactive_minutes)
+    c = conn.cursor()
+    c.execute("""
+        DELETE FROM BRM_COLLAB_PRESENCE
+        WHERE LAST_HEARTBEAT < ?
+    """,(cutoff,))
+    rc = c.rowcount
+    conn.commit()
+    if rc>0:
+        logging.info(f"Removed {rc} stale presence rows.")
+
+
+def get_current_collaborators(conn, rule_id):
+    """
+    Return a list of (user_id, username, last_heartbeat) for all users on this rule_id,
+    ignoring staleness (assuming external cleanup).
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT USER_ID, USERNAME, LAST_HEARTBEAT
+        FROM BRM_COLLAB_PRESENCE
+        WHERE RULE_ID=?
+        ORDER BY USERNAME
+    """,(rule_id,))
+    rows = c.fetchall()
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
+###############################################################################
+# 2) UI Collaboration Panel
+###############################################################################
+class LiveCollabPanel(QWidget):
+    """
+    A small panel that shows other users present on the same rule. 
+    Refreshes every X seconds to display an updated list. 
+    Also has a "Leave" button to clear presence.
+    
+    This would typically be embedded in your RuleEditorDialog or some side widget.
+    """
+    def __init__(self, connection, rule_id, user_id, username, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.rule_id = rule_id
+        self.user_id = user_id
+        self.username = username
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("<b>Collaboration Presence</b>"))
+
+        self.collab_list = QListWidget()
+        layout.addWidget(self.collab_list)
+
+        btn_h = QHBoxLayout()
+        self.leave_btn = QPushButton("Leave Collaboration")
+        self.leave_btn.clicked.connect(self.leave_collab)
+        btn_h.addWidget(self.leave_btn)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        self.setLayout(layout)
+
+        # 1) set presence
+        set_user_presence(self.connection, self.rule_id, self.user_id, self.username)
+
+        # 2) start a heartbeat timer => every 30s
+        self.heartbeat_timer = QTimer(self)
+        self.heartbeat_timer.timeout.connect(self.do_heartbeat)
+        self.heartbeat_timer.start(30000)  # 30,000 ms
+
+        # 3) refresh presence list immediately
+        self.refresh_collab_list()
+
+    def refresh_collab_list(self):
+        # get list
+        collaborators = get_current_collaborators(self.connection, self.rule_id)
+        self.collab_list.clear()
+        for (uid, uname, hb) in collaborators:
+            # if it’s me, label differently
+            label = f"{uname} (You)" if uid==self.user_id else f"{uname}   (last hb: {hb.strftime('%H:%M:%S')})"
+            it = QListWidgetItem(label)
+            self.collab_list.addItem(it)
+
+    def do_heartbeat(self):
+        # update my presence, then refresh the list
+        heartbeat_user_presence(self.connection, self.rule_id, self.user_id)
+        self.refresh_collab_list()
+
+    def leave_collab(self):
+        # call clear presence, stop timer, hide or disable panel
+        clear_user_presence(self.connection, self.rule_id, self.user_id)
+        QMessageBox.information(self, "Left Collaboration", "You have left the collaboration presence.")
+        self.heartbeat_timer.stop()
+        self.collab_list.clear()
+
+
+###############################################################################
+# Example usage
+###############################################################################
+if __name__=="__main__":
+    from PyQt5.QtWidgets import QApplication
+    import pyodbc
+
+    app = QApplication(sys.argv)
+    try:
+        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as e:
+        print("DB connection error:", e)
+        sys.exit(1)
+
+    # We pick a test rule_id=1, user_id=100, username="TestUser"
+    # Also run cleanup_stale_presence(conn) occasionally in the aggregator.
+    w = LiveCollabPanel(conn, rule_id=1, user_id=100, username="TestUser")
+    w.show()
+
+    sys.exit(app.exec_())
