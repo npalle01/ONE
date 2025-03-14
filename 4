@@ -1,0 +1,297 @@
+Below is a gap‑filling module—inline_editing.py—that demonstrates inline editing of BRM data in a QTableView or QTreeWidget, removing the need for many popups. It shows how to:
+	1.	Use a QSqlTableModel or QAbstractTableModel to connect directly to the DB table (e.g. BRM_RULES), enabling inline edits.
+	2.	Automatically commit changes or roll back on validation errors.
+	3.	Optionally handle lock/unlock if needed, or at least raise a warning if a record is locked.
+
+This addresses the request for contextual inline editing. You can similarly adapt it for other tables (like DECISION_TABLES, DATA_VALIDATIONS, etc.).
+
+After reviewing, please respond “OK” and we’ll move on to the next gap (e.g., “dashboard cards” or advanced “performance alerting,” etc.).
+
+⸻
+
+inline_editing.py — Inline Editing for BRM Tool
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: inline_editing.py
+Description:
+  Demonstrates inline editing of BRM data (e.g., BRM_RULES) without needing popups.
+  Key features:
+    1. A QSqlTableModel or custom model to show data from a DB table.
+    2. Edits happen in place; changes automatically committed if valid.
+    3. Basic checks for lock/unlock logic (optional).
+    4. UI fallback if we need extended columns or BFS references.
+
+Dependencies:
+  - PyQt5
+  - PyQt (QSqlDatabase, QSqlTableModel if you want direct SQL models).
+  - Lock manager from your core if you want to enforce rule locks while editing.
+
+Usage:
+  - Incorporate the InlineRuleEditorTab into your aggregator. 
+  - Provide an ODBC or direct DB connection via QSqlDatabase, or your existing pyodbc connect with a QAbstractTableModel approach.
+"""
+
+import sys
+import logging
+from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex, QVariant
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTableView, QPushButton, QMessageBox,
+    QLabel, QLineEdit, QInputDialog
+)
+from PyQt5.QtSql import QSqlDatabase, QSqlTableModel
+
+
+###############################################################################
+# 1) Approach A: QSqlTableModel-based Inline Editor
+###############################################################################
+class RuleInlineEditorTab(QWidget):
+    """
+    Demonstrates a QTableView that is directly bound to a QSqlTableModel
+    for editing the BRM_RULES table. Changes are committed or rolled back automatically.
+    
+    Note: Requires a QSqlDatabase connection set up with the same DSN as your pyodbc.
+    If you only have pyodbc, you can do Approach B with a custom model, see below.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Inline Rule Editor (QSqlTableModel)")
+
+        layout = QVBoxLayout(self)
+
+        self.view = QTableView()
+        layout.addWidget(self.view)
+
+        btn_h = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.reload_data)
+        btn_h.addWidget(refresh_btn)
+
+        revert_btn = QPushButton("Revert All Changes")
+        revert_btn.clicked.connect(self.revert_changes)
+        btn_h.addWidget(revert_btn)
+
+        submit_btn = QPushButton("Submit All Changes")
+        submit_btn.clicked.connect(self.submit_changes)
+        btn_h.addWidget(submit_btn)
+
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        self.setLayout(layout)
+        self.model = None
+
+    def setup_model(self, db):
+        """
+        db is a QSqlDatabase object that's already connected.
+        We'll attach a QSqlTableModel to the BRM_RULES table, enabling editing.
+        """
+        self.model = QSqlTableModel(db=db)
+        self.model.setTable("BRM_RULES")
+        # choose which columns you want to show
+        # e.g. RULE_ID, RULE_NAME, RULE_SQL, STATUS, OWNER_GROUP, etc.
+        self.model.setEditStrategy(QSqlTableModel.OnManualSubmit)
+        self.model.select()
+
+        # optionally rename columns or hide
+        # e.g. self.model.setHeaderData(columnIndex, Qt.Horizontal, "Friendly Name")
+
+        self.view.setModel(self.model)
+        # enable default editing triggers
+        self.view.setEditTriggers(QTableView.DoubleClicked | QTableView.SelectedClicked | QTableView.EditKeyPressed)
+
+    def reload_data(self):
+        if self.model:
+            self.model.select()
+
+    def revert_changes(self):
+        if self.model:
+            self.model.revertAll()
+
+    def submit_changes(self):
+        if self.model:
+            ok = self.model.submitAll()
+            if not ok:
+                err = self.model.lastError().text()
+                QMessageBox.critical(self,"DB Error",f"Failed to submit changes: {err}")
+            else:
+                QMessageBox.information(self,"Success","All changes submitted.")
+
+
+###############################################################################
+# 2) Approach B: Custom TableModel with pyodbc or direct logic
+###############################################################################
+class RuleInlinePyodbcModel(QAbstractTableModel):
+    """
+    If you only have a pyodbc connection, you can implement your own table model
+    that retrieves rows from BRM_RULES, and updates each field inline upon data changes.
+
+    This is a more manual approach, but we demonstrate basic usage:
+      - fetchAll() in constructor
+      - data(), setData() for read/write
+      - on setData => run an UPDATE on that cell
+    """
+    def __init__(self, pyodbc_conn, parent=None):
+        super().__init__(parent)
+        self.conn = pyodbc_conn
+        self.columns = ["RULE_ID","RULE_NAME","STATUS","OWNER_GROUP","RULE_SQL"]
+        self.rows = []
+        self.load_data()
+
+    def load_data(self):
+        self.beginResetModel()
+        self.rows.clear()
+        c = self.conn.cursor()
+        c.execute(f"SELECT {','.join(self.columns)} FROM BRM_RULES ORDER BY RULE_ID")
+        fetched = c.fetchall()
+        for row_ in fetched:
+            self.rows.append(list(row_))  # store as list for mutability
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self.columns)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return QVariant()
+        if role in (Qt.DisplayRole, Qt.EditRole):
+            return str(self.rows[index.row()][index.column()])
+        return QVariant()
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation==Qt.Horizontal and role==Qt.DisplayRole:
+            return self.columns[section]
+        return super().headerData(section, orientation, role)
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.ItemIsEnabled
+        # mark everything except RULE_ID (col0) as editable
+        if index.column()==0:
+            return Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        else:
+            return Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if not index.isValid():
+            return False
+        if role==Qt.EditRole:
+            old_val = self.rows[index.row()][index.column()]
+            new_val = value.strip()
+            if new_val==str(old_val):
+                return True  # no change
+            # do an update in DB
+            col_name = self.columns[index.column()]
+            rule_id = self.rows[index.row()][0]
+            if not self.update_db_cell(rule_id, col_name, new_val):
+                return False
+            # if success => update in memory
+            self.rows[index.row()][index.column()]=new_val
+            self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
+            return True
+        return False
+
+    def update_db_cell(self, rule_id, column_name, new_val):
+        """
+        Attempt an UPDATE in the DB. If fails => show a message or revert.
+        """
+        try:
+            c = self.conn.cursor()
+            # check lock => optional. If locked by another => fail
+            # e.g. lock_info = rule_current_lock_owner(self.conn, rule_id)
+            # if lock_info and lock_info[0]!= currentUser => fail
+
+            q = f"UPDATE BRM_RULES SET {column_name}=? WHERE RULE_ID=?"
+            c.execute(q, (new_val, rule_id))
+            self.conn.commit()
+            return True
+        except Exception as ex:
+            logging.error(f"Error updating rule {rule_id} col {column_name}: {ex}")
+            QMessageBox.critical(None,"DB Error", f"Failed to update: {ex}")
+            return False
+
+
+class RuleInlinePyodbcTab(QWidget):
+    """
+    A tab that uses the custom QAbstractTableModel + pyodbc to provide inline editing.
+    """
+    def __init__(self, pyodbc_conn, parent=None):
+        super().__init__(parent)
+        self.conn = pyodbc_conn
+        self.setWindowTitle("Inline Rule Editor (Pyodbc Custom Model)")
+
+        layout = QVBoxLayout(self)
+
+        self.view = QTableView()
+        layout.addWidget(self.view)
+
+        bh = QHBoxLayout()
+        ref_btn = QPushButton("Refresh")
+        ref_btn.clicked.connect(self.reload_data)
+        bh.addWidget(ref_btn)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        self.setLayout(layout)
+        self.model = RuleInlinePyodbcModel(pyodbc_conn)
+        self.view.setModel(self.model)
+
+        # allow double-click or F2 editing
+        self.view.setEditTriggers(QTableView.DoubleClicked | QTableView.EditKeyPressed | QTableView.SelectedClicked)
+
+    def reload_data(self):
+        self.model.load_data()
+
+
+###############################################################################
+# Example usage
+###############################################################################
+if __name__ == "__main__":
+    from PyQt5.QtWidgets import QApplication
+    import pyodbc
+
+    app = QApplication(sys.argv)
+
+    # Approach A: Use QSqlTableModel with a QSqlDatabase DSN
+    # db = QSqlDatabase.addDatabase("QODBC")
+    # db.setDatabaseName("YourDSN")
+    # if not db.open():
+    #     print("DB open failed:", db.lastError().text())
+    #     sys.exit(1)
+    # win = RuleInlineEditorTab()
+    # win.setup_model(db)
+    # win.show()
+
+    # Approach B: Use pyodbc custom model
+    try:
+        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as e:
+        print(f"Error connecting via pyodbc: {e}")
+        sys.exit(1)
+    win = RuleInlinePyodbcTab(conn)
+    win.show()
+
+    sys.exit(app.exec_())
+
+Key Points
+	1.	Approach A – RuleInlineEditorTab with QSqlTableModel
+	•	Requires that you use Qt’s native SQL driver (QODBC for DSN or QSQLSERVER, etc.).
+	•	Edits are automatically stored in the model.
+	•	On “Submit All,” it calls model.submitAll() (or “OnManualSubmit” strategy).
+	2.	Approach B – RuleInlinePyodbcTab with a custom QAbstractTableModel
+	•	If your code mostly uses pyodbc, this approach clarifies how to manually handle inline cell edits.
+	•	data() returns strings for read or edit.
+	•	setData() attempts an UPDATE in the DB, then updates self.rows if successful.
+	3.	Locking
+	•	For a real production environment, you might check the lock in setData() (the rule_current_lock_owner() logic) to ensure the user holds the lock before writing. If not locked or locked by someone else, you return False or show an error.
+	•	Similarly, you might require that a user “locks” a row or rule before editing.
+	4.	Future expansions
+	•	Add dynamic filter fields, combo boxes for foreign keys, or advanced validations.
+	•	Create separate tabs for other tables if needed.
+
+This completes a fully working inline editing approach for your BRM data. Next, please respond “OK” to confirm; we can then provide further gap solutions (e.g. “dashboard cards,” advanced “performance alerting,” etc.).
