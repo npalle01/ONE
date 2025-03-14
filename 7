@@ -1,0 +1,233 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: performance_alerts.py
+Description:
+  Provides advanced performance monitoring for BRM:
+   1. A UI tab that lets users select one or more rules, pick a date range, and plot
+      the average/median execution time per day from RULE_PERF_STATS or RULE_EXECUTION_LOGS.
+   2. A threshold-based alert system: if average time is above T for N consecutive days,
+      show a popup or optionally send email notifications.
+   3. Automatic data aggregator: merges RULE_EXECUTION_LOGS into a daily RULE_PERF_STATS
+      table if you want. Or do direct queries on logs for a given date range.
+
+Assumptions:
+  - You have a table RULE_EXECUTION_LOGS or RULE_PERF_STATS storing:
+       RULE_ID, EXECUTION_TIMESTAMP, EXECUTION_TIME_MS, PASS_FLAG, ...
+  - Possibly a daily aggregator table RULE_PERF_STATS with columns:
+       RULE_ID, DATE_KEY (YYYYMMDD), AVG_TIME_MS, MAX_TIME_MS, MIN_TIME_MS, SAMPLES
+  - Integration with your email system if you want to notify certain groups or users.
+"""
+
+import sys
+import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+import pyodbc
+import pyqtgraph as pg
+
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
+    QDateEdit, QCheckBox, QSpinBox, QMessageBox
+)
+from PyQt5.QtCore import Qt, QDate
+
+# If needed, from core_foundation import send_email_notification
+
+
+class PerformanceAlertsTab(QWidget):
+    """
+    A Qt tab that allows:
+      - Rule selection (combo or multi-combo).
+      - Date range selection.
+      - A threshold spin box.
+      - A consecutive-days spin box.
+      - "Plot" button => show line chart of average exec time in the chosen date range.
+      - "Check Alerts" button => if the average time is above threshold for N consecutive days,
+        we display a popup or email an alert.
+
+    Data can come from RULE_PERF_STATS or from RULE_EXECUTION_LOGS aggregated on the fly.
+    We'll show an example with direct queries from RULE_EXECUTION_LOGS, grouping by date.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+
+        self.setWindowTitle("Advanced Performance Alerts & Trends")
+        layout = QVBoxLayout(self)
+
+        # top row => rule selection, date range
+        top_h = QHBoxLayout()
+        top_h.addWidget(QLabel("Select Rule:"))
+        self.rule_combo = QComboBox()
+        self.load_rule_list()
+        top_h.addWidget(self.rule_combo)
+
+        top_h.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit(QDate.currentDate().addMonths(-1))
+        self.from_date.setCalendarPopup(True)
+        self.from_date.setDisplayFormat("yyyy-MM-dd")
+        top_h.addWidget(self.from_date)
+
+        top_h.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit(QDate.currentDate())
+        self.to_date.setCalendarPopup(True)
+        self.to_date.setDisplayFormat("yyyy-MM-dd")
+        top_h.addWidget(self.to_date)
+
+        layout.addLayout(top_h)
+
+        # threshold row => e.g. "above X ms for N consecutive days"
+        thresh_h = QHBoxLayout()
+        thresh_h.addWidget(QLabel("Alert Threshold (ms):"))
+        self.threshold_spin = QSpinBox()
+        self.threshold_spin.setRange(0, 999999)
+        self.threshold_spin.setValue(2000)  # default 2s
+        thresh_h.addWidget(self.threshold_spin)
+
+        thresh_h.addWidget(QLabel("Consecutive Days:"))
+        self.consec_spin = QSpinBox()
+        self.consec_spin.setRange(1, 30)
+        self.consec_spin.setValue(3)
+        thresh_h.addWidget(self.consec_spin)
+
+        # check alert button
+        check_btn = QPushButton("Check Alerts")
+        check_btn.clicked.connect(self.check_alerts)
+        thresh_h.addWidget(check_btn)
+        thresh_h.addStretch()
+        layout.addLayout(thresh_h)
+
+        # a plot from pyqtgraph
+        self.plot_widget = pg.PlotWidget(title="Execution Time (ms) Over Time")
+        self.plot_widget.setBackground('w')
+        layout.addWidget(self.plot_widget)
+
+        # button row => "Plot" => queries data, plots line
+        btn_h = QHBoxLayout()
+        plot_btn = QPushButton("Plot Trend")
+        plot_btn.clicked.connect(self.plot_trend)
+        btn_h.addWidget(plot_btn)
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        self.setLayout(layout)
+
+    def load_rule_list(self):
+        """Load rules into self.rule_combo."""
+        self.rule_combo.clear()
+        c=self.connection.cursor()
+        try:
+            c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+            rows=c.fetchall()
+            for (rid,rn) in rows:
+                disp=f"{rid} - {rn}"
+                self.rule_combo.addItem(disp, rid)
+        except Exception as ex:
+            logging.error(f"Error loading rules: {ex}")
+
+    def plot_trend(self):
+        """Query RULE_EXECUTION_LOGS for the chosen rule in the date range => group by date => plot average."""
+        rid=self.rule_combo.currentData()
+        from_dt=self.from_date.date().toString("yyyy-MM-dd")
+        to_dt=self.to_date.date().toString("yyyy-MM-dd")
+
+        # gather daily averages from RULE_EXECUTION_LOGS
+        data = self.fetch_daily_averages(rid, from_dt, to_dt)
+        if not data:
+            QMessageBox.information(self,"No Data","No execution logs found in that range.")
+            return
+        # data => list of (date_str, avg_ms)
+        # plot => x axis is day index, or store them in a map
+        xvals = list(range(len(data)))
+        yvals = [row[1] for row in data]
+        date_labels = [row[0] for row in data]
+
+        self.plot_widget.clear()
+        self.plot_widget.setLabel("left","Avg Execution Time (ms)")
+        self.plot_widget.setLabel("bottom","Date")
+        # build axis ticks
+        axis_ticks = [(i, date_labels[i]) for i in range(len(date_labels))]
+        self.plot_widget.getAxis("bottom").setTicks([axis_ticks])
+        self.plot_widget.plot(xvals, yvals, pen=pg.mkPen('b', width=2), symbol='o', symbolBrush='b')
+
+    def fetch_daily_averages(self, rule_id, from_str, to_str):
+        """
+        SELECT CAST(EXECUTION_TIMESTAMP as date) as d, AVG(EXECUTION_TIME_MS)
+        FROM RULE_EXECUTION_LOGS
+        WHERE RULE_ID=? AND EXECUTION_TIMESTAMP BETWEEN ? AND ?
+        GROUP BY CAST(EXECUTION_TIMESTAMP as date)
+        ORDER BY d
+        """
+        c=self.connection.cursor()
+        query = """
+            SELECT CONVERT(varchar(10), EXECUTION_TIMESTAMP, 120) as d, 
+                   AVG(EXECUTION_TIME_MS) as avg_ms
+            FROM RULE_EXECUTION_LOGS
+            WHERE RULE_ID=? 
+              AND EXECUTION_TIMESTAMP >= ? 
+              AND EXECUTION_TIMESTAMP < DATEADD(day,1,?)
+            GROUP BY CONVERT(varchar(10), EXECUTION_TIMESTAMP, 120)
+            ORDER BY d
+        """
+        c.execute(query,(rule_id, from_str, to_str))
+        rows=c.fetchall()
+        # rows => list of (d_str, avg_ms)
+        return [(r[0], float(r[1])) for r in rows]
+
+    def check_alerts(self):
+        """
+        For the selected rule, date range, threshold, consecutive days => see if average is above threshold for that many consecutive days.
+        If so => popup (and optional email).
+        """
+        rid=self.rule_combo.currentData()
+        from_dt=self.from_date.date().toString("yyyy-MM-dd")
+        to_dt=self.to_date.date().toString("yyyy-MM-dd")
+        threshold=self.threshold_spin.value()
+        needed_consec=self.consec_spin.value()
+
+        data = self.fetch_daily_averages(rid, from_dt, to_dt)
+        if not data:
+            QMessageBox.information(self,"No Data","No logs => no alerts.")
+            return
+
+        # check consecutive
+        current_streak=0
+        max_streak=0
+        for (d_str,avg_ms) in data:
+            if avg_ms>threshold:
+                current_streak+=1
+                max_streak=max(max_streak, current_streak)
+            else:
+                current_streak=0
+
+        if max_streak>=needed_consec:
+            msg=(f"ALERT: For rule {rid}, the avg exec time exceeded {threshold} ms "
+                 f"for at least {needed_consec} consecutive day(s). "
+                 f"Max streak was {max_streak}.")
+            QMessageBox.warning(self,"Performance Alert",msg)
+            # optional: send email
+            # recipients = ["perfalerts@mycompany.com"]
+            # send_email_notification("BRM Perf Alert", msg, recipients)
+        else:
+            QMessageBox.information(self,"No Alert",
+                                    f"No consecutive streak >= {needed_consec} days above {threshold} ms. "
+                                    f"Max streak was {max_streak}.")
+
+
+if __name__=="__main__":
+    from PyQt5.QtWidgets import QApplication
+    import pyodbc
+
+    app = QApplication(sys.argv)
+    try:
+        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as ex:
+        print(f"DB connection error: {ex}")
+        sys.exit(1)
+
+    win = PerformanceAlertsTab(conn)
+    win.show()
+    sys.exit(app.exec_())
