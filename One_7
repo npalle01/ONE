@@ -1,163 +1,100 @@
-Below is Module #7: advanced_decision_tables.py, focusing on:
-	•	A user‑friendly DecisionTableManager class for managing decision tables—add, edit, delete, and execute.
-	•	A DecisionTablesTab or AdvancedDecisionTablesTab for placing inside a QTabWidget.
-	•	Execution in a dry‑run transaction with pass/fail notifications and impacted record counts.
-	•	Real‑time logging of simulation results (to a table like DECISION_TABLE_EXECUTION_LOG or a generic SIMULATION_LOGS).
-
-We remove placeholders, ensuring code is self‑contained and references your existing logic for BFS or advanced rule checks only if you want to integrate them deeper. We’ll assume a table named DECISION_TABLES with fields:
-
- DECISION_TABLE_ID (PK, identity)
- TABLE_NAME        (varchar)
- DESCRIPTION       (varchar)
- DECISION_QUERY    (text or varchar) – the SQL logic returning 1 => pass
-
-Optionally, you can store an integer pass/fail and other custom columns.
-
-⸻
-
-Module #7: advanced_decision_tables.py
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
-Module: advanced_decision_tables.py
+Module: brm_decision_tables.py
 Description:
-  Provides a production‑ready UI for managing Decision Tables. Key features:
-    • DecisionTableManager (QDialog or QWidget) to view, add, edit, delete decision tables.
-    • Execute a decision table logic in a "dry-run" transaction, returning pass/fail.
-    • Capture record counts impacted, if your query returns rows.
-    • Log execution results into a dedicated log table or a general SIMULATION_LOGS table.
-    • Optionally incorporate BFS or advanced rule references if you want deeper synergy 
-      with the existing BRM tool logic (e.g., if a rule references a decision table).
+  Provides comprehensive decision table management:
+    • DecisionTableManager QDialog for listing/adding/updating/deleting
+    • Execution method to “run” a decision table’s query
+      – Could be integrated with BFS rule engine or called standalone
+    • Logging results (optional) to DECISION_TABLE_EXEC_LOG or similar
+    • Real-time UI updates for pass/fail, impacted records, etc.
 """
 
 import sys
 import logging
 import json
-import pyodbc
-import sqlparse
 from datetime import datetime
+from collections import defaultdict
 
-from PyQt5 import QtCore, QtGui, QtWidgets
+# PyQt5
+from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QMessageBox, QDialog, QLineEdit, QLabel, QInputDialog,
-    QPlainTextEdit, QFormLayout
+    QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QPushButton, QMessageBox, QInputDialog, QLabel, QLineEdit, QTextEdit
 )
 
-# from core_foundation import logger, fetch_one_dict, fetch_all_dict, insert_audit_log
-# or from advanced_simulation import run_single_rule_transaction if needed
+import pyodbc
+
+# from brm_core_foundation
+from brm_core_foundation import logger
 
 
 ###############################################################################
-# UTILITY: execute_decision_query
-###############################################################################
-def execute_decision_query(conn, dt_id, decision_query):
-    """
-    Runs the decision_query in a transaction (dry-run).
-    Returns (pass_flag, message, record_count).
-      - pass_flag = True if query returns at least one row and row[0] == 1
-      - message = textual message
-      - record_count = number of rows fetched
-    Also logs to DECISION_TABLE_EXECUTION_LOG or similar.
-
-    We do a ROLLBACK after the SELECT, so it won't commit any DML changes.
-    """
-    c = conn.cursor()
-    start_ts = datetime.now()
-    try:
-        c.execute("BEGIN TRANSACTION")
-        c.execute(decision_query)
-        rows = c.fetchall()
-        rec_count = len(rows)
-        if rows:
-            first_val = rows[0][0]
-            pass_flag = (first_val == 1)
-            message = f"Returned value: {first_val}"
-        else:
-            pass_flag = True
-            message = "No rows => PASS by default"
-        # always rollback for “simulation/dry-run”
-        c.execute("ROLLBACK")
-    except Exception as ex:
-        c.execute("ROLLBACK")
-        pass_flag = False
-        message = str(ex)
-        rec_count = 0
-
-    # optional: log to DECISION_TABLE_EXECUTION_LOG
-    log_c = conn.cursor()
-    try:
-        log_c.execute("""
-            INSERT INTO DECISION_TABLE_EXECUTION_LOG(
-              DECISION_TABLE_ID, EXEC_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT
-            )
-            VALUES (?, GETDATE(), ?, ?, ?)
-        """,(dt_id, 1 if pass_flag else 0, message, rec_count))
-        conn.commit()
-    except Exception as log_ex:
-        logging.error(f"Error logging decision table execution: {log_ex}")
-
-    return pass_flag, message, rec_count
-
-
-###############################################################################
-# DECISION TABLE MANAGER (DIALOG)
+# DecisionTableManager
 ###############################################################################
 class DecisionTableManager(QDialog):
     """
-    A manager UI for decision tables. 
-    - Shows a table of ID, name, description, query
-    - Buttons: Add, Edit, Delete, Execute
-    - On Execute => runs the decision_query in a transaction => pass/fail => logs
-    - Has robust error handling
+    A dialog that manages a DECISION_TABLES table with columns:
+      - DECISION_TABLE_ID (PK)
+      - TABLE_NAME (string)
+      - DESCRIPTION (string)
+      - DECISION_QUERY (SQL to run, typically returning row[0]==1 => PASS)
+    
+    Features:
+      - Add a new decision table (table name, desc, query).
+      - Edit an existing decision table.
+      - Delete a decision table.
+      - Run (execute) it in a dry-run style => pass/fail => #records => store logs if desired.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.setWindowTitle("Decision Table Manager")
-        self.resize(800, 500)
+        self.setWindowTitle("Decision Table Manager (brm_decision_tables)")
+        self.resize(700, 500)
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # table
+        # Table display
         self.dt_table = QTableWidget(0,4)
-        self.dt_table.setHorizontalHeaderLabels(["DT_ID","Table Name","Description","Query"])
+        self.dt_table.setHorizontalHeaderLabels(["DT_ID","Table Name","Description","Query (DECISION_QUERY)"])
         self.dt_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.dt_table)
 
-        # button bar
+        # Buttons
         btn_h = QHBoxLayout()
         add_btn = QPushButton("Add Decision Table")
-        add_btn.clicked.connect(self.add_dt)
+        add_btn.clicked.connect(self.add_decision_table)
         btn_h.addWidget(add_btn)
 
         edit_btn = QPushButton("Edit Decision Table")
-        edit_btn.clicked.connect(self.edit_dt)
+        edit_btn.clicked.connect(self.edit_decision_table)
         btn_h.addWidget(edit_btn)
 
         del_btn = QPushButton("Delete Decision Table")
-        del_btn.clicked.connect(self.delete_dt)
+        del_btn.clicked.connect(self.delete_decision_table)
         btn_h.addWidget(del_btn)
 
-        run_btn = QPushButton("Execute Decision Table")
-        run_btn.clicked.connect(self.run_dt)
+        run_btn = QPushButton("Run Decision Table")
+        run_btn.clicked.connect(self.run_decision_table)
         btn_h.addWidget(run_btn)
 
         ref_btn = QPushButton("Refresh")
         ref_btn.clicked.connect(self.load_decision_tables)
         btn_h.addWidget(ref_btn)
+
         btn_h.addStretch()
         layout.addLayout(btn_h)
 
-        # optional log area for results
-        self.result_text = QPlainTextEdit()
-        self.result_text.setReadOnly(True)
-        layout.addWidget(self.result_text)
+        # Execution log area (optional)
+        self.exec_log = QTextEdit()
+        self.exec_log.setReadOnly(True)
+        self.exec_log.setPlaceholderText("Execution Log...")
+        layout.addWidget(self.exec_log)
 
         self.setLayout(layout)
         self.load_decision_tables()
@@ -176,302 +113,149 @@ class DecisionTableManager(QDialog):
                 r_i = self.dt_table.rowCount()
                 self.dt_table.insertRow(r_i)
                 for col_i,val in enumerate(row):
-                    self.dt_table.setItem(r_i,col_i, QTableWidgetItem(str(val) if val else ""))
+                    it = QTableWidgetItem(str(val) if val else "")
+                    self.dt_table.setItem(r_i, col_i, it)
         except Exception as ex:
-            QMessageBox.critical(self,"Load Error",f"Error loading DECISION_TABLES: {ex}")
+            QMessageBox.critical(self, "Error", f"Error loading decision tables: {ex}")
 
-    def add_dt(self):
-        """
-        Prompt user for table name, description, query => insert new record.
-        """
-        dt_name, ok = QInputDialog.getText(self, "Add Decision Table", "Table Name:")
-        if not ok or not dt_name.strip():
+    def add_decision_table(self):
+        table_name, ok = QInputDialog.getText(self, "Add Decision Table", "Enter table name:")
+        if not ok or not table_name.strip():
             return
-        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Enter description (optional):")
+        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Optional description:")
         if not ok2:
             desc=""
-        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query (SQL)", "Enter query returning 1 => pass:")
+        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query (SQL)", "SELECT 1 AS RESULT")
         if not ok3 or not query.strip():
-            QMessageBox.warning(self,"Input Error","Decision query is required.")
             return
 
         c = self.connection.cursor()
         try:
             c.execute("""
-                INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY)
+                INSERT INTO DECISION_TABLES(TABLE_NAME, DESCRIPTION, DECISION_QUERY)
                 VALUES(?,?,?)
-            """,(dt_name.strip(),desc.strip(),query.strip()))
+            """,(table_name.strip(), desc.strip(), query.strip()))
             self.connection.commit()
-            QMessageBox.information(self,"Added","Decision table added.")
+            QMessageBox.information(self,"Added","Decision table created.")
             self.load_decision_tables()
         except Exception as ex:
-            QMessageBox.critical(self,"Add Error",str(ex))
+            QMessageBox.critical(self,"Error",f"Add error: {ex}")
 
-    def edit_dt(self):
-        """
-        Let user pick a row => gather existing fields => prompt user => update.
-        """
+    def edit_decision_table(self):
         row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self,"No Selection","No decision table selected.")
-            return
-        dt_id_item = self.dt_table.item(row,0)
-        if not dt_id_item:
-            return
-        dt_id = int(dt_id_item.text())
-
-        curr_name = self.dt_table.item(row,1).text() if self.dt_table.item(row,1) else ""
-        curr_desc = self.dt_table.item(row,2).text() if self.dt_table.item(row,2) else ""
-        curr_query = self.dt_table.item(row,3).text() if self.dt_table.item(row,3) else ""
-
-        new_name, ok = QInputDialog.getText(self,"Edit Decision Table","New Table Name:", text=curr_name)
-        if not ok or not new_name.strip():
-            return
-        new_desc, ok2 = QInputDialog.getMultiLineText(self,"Description","Optional:", text=curr_desc)
-        if not ok2:
-            new_desc=curr_desc
-        new_query, ok3 = QInputDialog.getMultiLineText(self,"Decision Query","(SQL):", text=curr_query)
-        if not ok3 or not new_query.strip():
-            QMessageBox.warning(self,"Input Error","Decision query is required.")
-            return
-
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                UPDATE DECISION_TABLES
-                SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
-                WHERE DECISION_TABLE_ID=?
-            """,(new_name.strip(), new_desc.strip(), new_query.strip(), dt_id))
-            self.connection.commit()
-            QMessageBox.information(self,"Updated","Decision table updated.")
-            self.load_decision_tables()
-        except Exception as ex:
-            QMessageBox.critical(self,"Update Error",str(ex))
-
-    def delete_dt(self):
-        row=self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self,"No Selection","No decision table selected.")
-            return
-        dt_id_item=self.dt_table.item(row,0)
-        if not dt_id_item:
-            return
-        dt_id=int(dt_id_item.text())
-        confirm=QMessageBox.question(self,"Confirm",f"Delete decision table {dt_id}?")
-        if confirm!=QMessageBox.Yes:
-            return
-        c=self.connection.cursor()
-        try:
-            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
-            self.connection.commit()
-            QMessageBox.information(self,"Deleted","Decision table deleted.")
-            self.load_decision_tables()
-        except Exception as ex:
-            QMessageBox.critical(self,"Delete Error",str(ex))
-
-    def run_dt(self):
-        """
-        Execute the selected decision table => show pass/fail => log result => show impacted rows.
-        """
-        row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self,"No Selection","No decision table selected.")
-            return
-        dt_id_item = self.dt_table.item(row,0)
-        if not dt_id_item:
-            return
-        dt_id = int(dt_id_item.text())
-
-        c=self.connection.cursor()
-        c.execute("SELECT DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
-        row_q=c.fetchone()
-        if not row_q:
-            QMessageBox.warning(self,"Not Found",f"Decision table {dt_id} not found in DB.")
-            return
-        dt_query = row_q[0]
-        if not dt_query:
-            QMessageBox.warning(self,"No Query",f"Decision table {dt_id} has empty DECISION_QUERY.")
-            return
-
-        pass_flag, msg, rec_count = execute_decision_query(self.connection, dt_id, dt_query)
-        final_msg = f"DecisionTable {dt_id} => {'PASS' if pass_flag else 'FAIL'}\n{msg}\nRecords impacted: {rec_count}"
-        QMessageBox.information(self,"Execution Result",final_msg)
-        self.result_text.appendPlainText(final_msg)
-
-
-###############################################################################
-# OPTIONAL WIDGET: AdvancedDecisionTablesTab
-###############################################################################
-class AdvancedDecisionTablesTab(QWidget):
-    """
-    A QWidget version that can be placed in your main QTabWidget instead of a QDialog.
-    Similar functionality to DecisionTableManager, but as a tab.
-    """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-
-        self.dt_table = QTableWidget(0,4)
-        self.dt_table.setHorizontalHeaderLabels(["ID","Name","Desc","Query"])
-        self.dt_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.dt_table)
-
-        btn_row = QHBoxLayout()
-        add_btn = QPushButton("Add")
-        add_btn.clicked.connect(self.add_dt)
-        btn_row.addWidget(add_btn)
-        edit_btn = QPushButton("Edit")
-        edit_btn.clicked.connect(self.edit_dt)
-        btn_row.addWidget(edit_btn)
-        del_btn = QPushButton("Delete")
-        del_btn.clicked.connect(self.del_dt)
-        btn_row.addWidget(del_btn)
-        run_btn = QPushButton("Execute")
-        run_btn.clicked.connect(self.run_dt)
-        btn_row.addWidget(run_btn)
-        ref_btn = QPushButton("Refresh")
-        ref_btn.clicked.connect(self.load_dt)
-        btn_row.addWidget(ref_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self.log_area = QPlainTextEdit()
-        self.log_area.setReadOnly(True)
-        layout.addWidget(self.log_area)
-
-        self.setLayout(layout)
-        self.load_dt()
-
-    def load_dt(self):
-        self.dt_table.setRowCount(0)
-        c=self.connection.cursor()
-        try:
-            c.execute("SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY FROM DECISION_TABLES ORDER BY DECISION_TABLE_ID")
-            rows=c.fetchall()
-            for row in rows:
-                r_i=self.dt_table.rowCount()
-                self.dt_table.insertRow(r_i)
-                for col_i,val in enumerate(row):
-                    self.dt_table.setItem(r_i,col_i,QTableWidgetItem(str(val) if val else ""))
-        except Exception as ex:
-            QMessageBox.critical(self,"Load Error",str(ex))
-
-    def add_dt(self):
-        # same pattern as above
-        nm,ok = QInputDialog.getText(self,"Add","TableName:")
-        if not ok or not nm.strip():
-            return
-        ds,ok2=QInputDialog.getMultiLineText(self,"Description","(Optional):")
-        if not ok2:
-            ds=""
-        q_,ok3=QInputDialog.getMultiLineText(self,"Query","(SQL returning 1 => pass):")
-        if not ok3 or not q_.strip():
-            QMessageBox.warning(self,"Input Error","Query is required.")
-            return
-        c=self.connection.cursor()
-        try:
-            c.execute("""
-                INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY)
-                VALUES(?,?,?)
-            """,(nm.strip(), ds.strip(), q_.strip()))
-            self.connection.commit()
-            QMessageBox.information(self,"Added","New decision table created.")
-            self.load_dt()
-        except Exception as ex:
-            QMessageBox.critical(self,"Add Error",str(ex))
-
-    def edit_dt(self):
-        row=self.dt_table.currentRow()
         if row<0:
             QMessageBox.warning(self,"None","No decision table selected.")
             return
-        dt_id_item=self.dt_table.item(row,0)
-        if not dt_id_item:
+        dt_id_it = self.dt_table.item(row,0)
+        if not dt_id_it:
             return
-        dt_id=int(dt_id_item.text())
-        old_name = self.dt_table.item(row,1).text() or ""
-        old_desc = self.dt_table.item(row,2).text() or ""
-        old_q = self.dt_table.item(row,3).text() or ""
+        dt_id = int(dt_id_it.text())
+        # fetch current
+        c = self.connection.cursor()
+        c.execute("SELECT TABLE_NAME, DESCRIPTION, DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
+        row_ = c.fetchone()
+        if not row_:
+            QMessageBox.warning(self,"Not Found",f"DT ID {dt_id} not found.")
+            return
+        old_table, old_desc, old_qry = row_
 
-        new_name,ok=QInputDialog.getText(self,"Edit Name","New name:", text=old_name)
-        if not ok or not new_name.strip():
+        new_table,ok = QInputDialog.getText(self,"Edit Table Name","", text=old_table if old_table else "")
+        if not ok or not new_table.strip():
             return
-        new_desc,ok2=QInputDialog.getMultiLineText(self,"Edit Desc","...", text=old_desc)
+        new_desc,ok2 = QInputDialog.getMultiLineText(self,"Edit Description","", text=old_desc if old_desc else "")
         if not ok2:
             new_desc=old_desc
-        new_q,ok3=QInputDialog.getMultiLineText(self,"Edit Query","...", text=old_q)
-        if not ok3 or not new_q.strip():
-            QMessageBox.warning(self,"Error","Query required.")
+        new_qry,ok3 = QInputDialog.getMultiLineText(self,"Edit SQL Query","", text=old_qry if old_qry else "")
+        if not ok3 or not new_qry.strip():
             return
-        c=self.connection.cursor()
+
         try:
             c.execute("""
                 UPDATE DECISION_TABLES
                 SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
                 WHERE DECISION_TABLE_ID=?
-            """,(new_name.strip(), new_desc.strip(), new_q.strip(), dt_id))
+            """,(new_table.strip(), new_desc.strip(), new_qry.strip(), dt_id))
             self.connection.commit()
-            QMessageBox.information(self,"Updated","Decision table updated.")
-            self.load_dt()
+            QMessageBox.information(self,"Updated",f"Decision table {dt_id} updated.")
+            self.load_decision_tables()
         except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
+            QMessageBox.critical(self,"Error",f"Update error: {ex}")
 
-    def del_dt(self):
-        row=self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self,"None","No selection.")
-            return
-        dtid_item=self.dt_table.item(row,0)
-        if not dtid_item:
-            return
-        dt_id=int(dtid_item.text())
-        confirm=QMessageBox.question(self,"Confirm",f"Delete decision table {dt_id}?")
-        if confirm!=QMessageBox.Yes:
-            return
-        c=self.connection.cursor()
-        try:
-            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
-            self.connection.commit()
-            QMessageBox.information(self,"Deleted","Decision table removed.")
-            self.load_dt()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def run_dt(self):
+    def delete_decision_table(self):
         row=self.dt_table.currentRow()
         if row<0:
             QMessageBox.warning(self,"None","No table selected.")
             return
-        dtid_item=self.dt_table.item(row,0)
-        dt_id=int(dtid_item.text())
-        q_item=self.dt_table.item(row,3)
-        query=q_item.text() if q_item else ""
-        if not query.strip():
-            QMessageBox.warning(self,"No Query","No query found for that DT.")
+        dt_id_item=self.dt_table.item(row,0)
+        dt_id=int(dt_id_item.text())
+        confirm=QMessageBox.question(self,"Confirm",f"Delete decision table {dt_id}?")
+        if confirm!=QMessageBox.Yes:
             return
-        pass_flag,msg,rcount = execute_decision_query(self.connection, dt_id, query)
-        text=f"DecisionTable {dt_id} => {'PASS' if pass_flag else 'FAIL'}\n{msg}\nRecords impacted={rcount}"
-        QMessageBox.information(self,"Executed",text)
-        self.log_area.appendPlainText(text)
+        c=self.connection.cursor()
+        try:
+            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted",f"Decision table {dt_id} removed.")
+            self.load_decision_tables()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",f"Delete error: {ex}")
 
-Key Sections Explanation
-	1.	execute_decision_query
-	•	Runs the decision_query inside a transaction.
-	•	Uses “dry-run” logic => always ROLLBACK.
-	•	Interprets the first row’s first column as 1 => pass, else fail.
-	•	Logs the result to a table named DECISION_TABLE_EXECUTION_LOG (or you can rename to SIMULATION_LOGS).
-	2.	DecisionTableManager (as a QDialog)
-	•	For a smaller modal approach.
-	•	Lists decision tables in a QTableWidget.
-	•	“Add,” “Edit,” “Delete,” “Execute.”
-	•	On “Execute” => calls execute_decision_query => shows pass/fail in a message box.
-	•	Also shows a QPlainTextEdit at the bottom to store logs or extended messages.
-	3.	AdvancedDecisionTablesTab (as a QWidget)
-	•	Similar functionality but is not a QDialog. You can place it in your app’s main tabs.
-	•	Has the same “Add,” “Edit,” “Delete,” “Execute” operations, but structured for tab usage.
+    def run_decision_table(self):
+        """
+        Dry-run execution => if the query returns row[0]==1 => PASS, else FAIL.
+        Logs # of records impacted, message, etc. Could be extended to BFS or partial commit.
+        """
+        row=self.dt_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No table selected.")
+            return
+        dt_id_it=self.dt_table.item(row,0)
+        if not dt_id_it:
+            return
+        dt_id=int(dt_id_it.text())
+        c=self.connection.cursor()
+        c.execute("SELECT TABLE_NAME, DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
+        r_=c.fetchone()
+        if not r_:
+            QMessageBox.warning(self,"Not Found",f"No record for DT ID {dt_id}")
+            return
+        table_n, dec_qry = r_
+        if not dec_qry or not dec_qry.strip():
+            QMessageBox.warning(self,"No Query","That table has no DECISION_QUERY.")
+            return
 
-Please respond “OK” if you approve Module #7. Next, we can proceed with Module #8 (e.g. defect_management.py) or whichever final aggregator you’d like.
+        c.execute("BEGIN TRANSACTION")
+        success=False
+        message=""
+        rec_count=0
+        try:
+            c.execute(dec_qry)
+            rows = c.fetchall()
+            rec_count=len(rows)
+            if rows and rows[0]:
+                val = rows[0][0]
+                success=(val==1)
+                message=f"Returned: {val}"
+            else:
+                success=True
+                message="No rows => PASS"
+            # always rollback => it's a dry run
+            c.execute("ROLLBACK")
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            success=False
+            message=str(ex)
+
+        # display
+        final_msg=(f"DecisionTable {dt_id}: {'PASS' if success else 'FAIL'}\n"
+                   f"Records: {rec_count}\nMessage: {message}\n")
+        self.exec_log.append(final_msg)
+        if success:
+            QMessageBox.information(self,"Run DT",final_msg)
+        else:
+            QMessageBox.warning(self,"Run DT",final_msg)
+
+
+###############################################################################
+# End of brm_decision_tables
+###############################################################################
