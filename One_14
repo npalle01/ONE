@@ -1,0 +1,181 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: brm_audit_activity_tracking.py
+
+Description:
+  Provides a comprehensive Activity / Audit logging system for the BRM Tool:
+    1) record_activity_event: a function to log various events (login, BFS, schedule, etc.)
+    2) ActivityTrackingTab: a UI to display these logs with advanced filters 
+       (user, date range, event type, text search).
+    3) Integration with BFS or scheduling so calls to record_activity_event can log
+       each BFS run or schedule trigger.
+
+You can unify or keep separate from the older brm_audit_log approach; 
+this module aims to track a broader set of events beyond just rule CRUD.
+"""
+
+import sys
+import json
+import logging
+from datetime import datetime
+from PyQt5 import QtWidgets
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTableWidget,
+    QTableWidgetItem, QLabel, QComboBox, QFileDialog, QMessageBox
+)
+from PyQt5.QtCore import Qt
+
+# from brm_core_foundation import logger, fetch_all_dict, fetch_one_dict
+# Alternatively, if you prefer the older brm_audit_log approach, rename or merge.
+
+###############################################################################
+# 1) record_activity_event
+###############################################################################
+def record_activity_event(conn, event_type, user_id_or_name, details=None, rule_id=None):
+    """
+    Insert a row into BRM_ACTIVITY_LOG or your chosen table, e.g.:
+
+    CREATE TABLE BRM_ACTIVITY_LOG (
+      ACTIVITY_ID INT IDENTITY PRIMARY KEY,
+      EVENT_TYPE VARCHAR(50),
+      USERNAME VARCHAR(100),
+      TIMESTAMP DATETIME,
+      DETAILS VARCHAR(MAX),
+      RULE_ID INT NULL
+    );
+
+    details can be JSON or a short string describing context.
+    """
+    if not details:
+        details=""
+
+    try:
+        c=conn.cursor()
+        c.execute("""
+            INSERT INTO BRM_ACTIVITY_LOG(
+              EVENT_TYPE,
+              USERNAME,
+              TIMESTAMP,
+              DETAILS,
+              RULE_ID
+            )
+            VALUES(?,?,?,?,?)
+        """,(event_type, str(user_id_or_name), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), details, rule_id))
+        conn.commit()
+        logger.debug(f"Activity event recorded: {event_type}, user={user_id_or_name}, rule={rule_id}")
+    except Exception as ex:
+        logger.error(f"Error recording activity event {event_type}: {ex}")
+
+###############################################################################
+# 2) ActivityTrackingTab
+###############################################################################
+class ActivityTrackingTab(QWidget):
+    """
+    A Qt tab that displays the BRM_ACTIVITY_LOG entries with advanced filters:
+      - user search
+      - event_type search
+      - date range (optional)
+      - text search in details
+    Also allows CSV export or refresh. 
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection=connection
+        self.init_ui()
+        self.load_logs()
+
+    def init_ui(self):
+        layout=QVBoxLayout(self)
+
+        # top row: user search, event type search, text search, refresh
+        top_h=QHBoxLayout()
+        self.user_search=QLineEdit()
+        self.user_search.setPlaceholderText("Filter by Username (optional)")
+        top_h.addWidget(QLabel("User:"))
+        top_h.addWidget(self.user_search)
+
+        self.event_combo=QComboBox()
+        self.event_combo.addItem("All Events", "")
+        # You can populate from known events or from DB distinct
+        known_events=["LOGIN","LOGOFF","BFS_RUN","SCHEDULE_TRIGGER","RULE_SIM","DEFECT","ETC"]
+        for ev in known_events:
+            self.event_combo.addItem(ev, ev)
+        top_h.addWidget(QLabel("Event Type:"))
+        top_h.addWidget(self.event_combo)
+
+        self.text_search=QLineEdit()
+        self.text_search.setPlaceholderText("Search in details...")
+        top_h.addWidget(self.text_search)
+
+        ref_btn=QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_logs)
+        top_h.addWidget(ref_btn)
+
+        exp_btn=QPushButton("Export CSV")
+        exp_btn.clicked.connect(self.export_csv)
+        top_h.addWidget(exp_btn)
+
+        top_h.addStretch()
+        layout.addLayout(top_h)
+
+        self.log_table=QTableWidget(0,5)
+        self.log_table.setHorizontalHeaderLabels(["ActivityID","EventType","Username","Timestamp","Details"])
+        self.log_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.log_table)
+
+        self.setLayout(layout)
+
+    def load_logs(self):
+        # gather filter
+        userf=self.user_search.text().strip()
+        evtf=self.event_combo.currentData()
+        txtf=self.text_search.text().strip().lower()
+
+        # naive approach => get top 1000 then filter in python
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT TOP 1000 
+              ACTIVITY_ID, EVENT_TYPE, USERNAME, TIMESTAMP, DETAILS
+            FROM BRM_ACTIVITY_LOG
+            ORDER BY ACTIVITY_ID DESC
+        """)
+        rows=c.fetchall()
+
+        self.log_table.setRowCount(0)
+        for row in rows:
+            # filter logic
+            if userf and userf.lower() not in (row[2] or "").lower():
+                continue
+            if evtf and evtf.lower() not in (row[1] or "").lower():
+                continue
+            if txtf and txtf not in (row[4] or "").lower():
+                continue
+
+            r_i=self.log_table.rowCount()
+            self.log_table.insertRow(r_i)
+            for col_i,val in enumerate(row):
+                it=QTableWidgetItem(str(val) if val else "")
+                self.log_table.setItem(r_i,col_i,it)
+
+        self.log_table.resizeColumnsToContents()
+
+    def export_csv(self):
+        path, _=QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Activity Logs CSV","","CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        import csv
+        with open(path,"w",newline="",encoding="utf-8") as f:
+            writer=csv.writer(f)
+            headers=[self.log_table.horizontalHeaderItem(i).text() for i in range(self.log_table.columnCount())]
+            writer.writerow(headers)
+            for row_i in range(self.log_table.rowCount()):
+                rowdata=[]
+                for col_i in range(self.log_table.columnCount()):
+                    it=self.log_table.item(row_i,col_i)
+                    rowdata.append(it.text() if it else "")
+                writer.writerow(rowdata)
+        QMessageBox.information(self,"Exported",f"Activity logs exported to {path}.")
