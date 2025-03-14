@@ -2,301 +2,406 @@
 # -*- coding: utf-8 -*-
 
 """
-Module: advanced_decision_tables.py
-Description:
-  Provides an advanced module for managing decision tables, separate from 
-  the basic one in advanced_lineage. This version includes:
-    • A DecisionTableEngine that logs each execution in a DECISION_TABLE_LOGS table (if present).
-    • AdvancedDecisionTablesTab, a QWidget with:
-        - QTableWidget for listing decision tables
-        - add/edit/delete
-        - an “Execute” button that runs the decision query in a dry-run transaction
-          and logs results (impacted records, pass/fail, etc.)
-    • Extended searching, plus an optional “Export to CSV” feature for the list.
+Module: brm_enhanced_workflow_pipeline.py
 
-Assumptions:
-  - DECISION_TABLES table with columns:
-      DECISION_TABLE_ID int PK,
-      TABLE_NAME varchar(...),
-      DESCRIPTION varchar(...),
-      DECISION_QUERY text,
-      ...
-  - DECISION_TABLE_LOGS (optional):
-      LOG_ID int PK IDENTITY,
-      DECISION_TABLE_ID int,
-      EXEC_TIMESTAMP datetime,
-      SUCCESS_FLAG bit,
-      RECORD_COUNT int,
-      MESSAGE varchar(...)
+Description:
+  Provides advanced workflow and pipeline features for the BRM Tool:
+    • Rule Change Impact Analysis:
+       - BFS/DFS to find all children or dependent schedules; display them on rule update.
+       - Optionally log or block if critical.
+    • Branching / Forking Approvals:
+       - If rule fails at stage X, fork into variants (A, B, C), each with separate approvals.
+       - Extended data model: BRM_RULE_APPROVALS might store a 'FORK_PARENT' or 'FORK_LABEL'.
+    • Automated ETL / Data Pipeline Integrations:
+       - A PipelineDesignerTab to create sequences of BFS runs or schedule triggers.
+       - Node-based UI that allows user to drag rules, link them, set conditions (like mini-orchestrator).
+    • Modern / Flat / Material Theme:
+       - A function apply_modern_theme() to set a QSS for a cleaner aesthetic.
+
+This module integrates with:
+  - brm_core_foundation for DB, logging, etc.
+  - brm_rule_engine BFS adjacency for impact analysis.
+  - brm_simulation_scheduler or scheduling logic for pipeline triggers.
+  - brm_advanced_approvals_and_lineage for multi-step approvals (we add forking).
 """
 
 import sys
 import logging
-import pyodbc
+import json
+import re
 from datetime import datetime
-from PyQt5.QtCore import Qt
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QTimer, QPointF
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QMessageBox, QLineEdit, QInputDialog, QPlainTextEdit,
-    QFileDialog, QLabel
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QDialog, 
+    QLineEdit, QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QComboBox, 
+    QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsItem, QFileDialog
 )
+from PyQt5.QtGui import QPen, QBrush, QColor, QFont
 
-from core_foundation import logger, insert_audit_log
+# from brm_core_foundation import logger, fetch_one_dict, fetch_all_dict, insert_audit_log
+# from brm_rule_engine import gather_all_related_rule_ids, lock_rule_for_edit, unlock_rule_for_edit
 
-# Optional logs function if DECISION_TABLE_LOGS table exists
-def log_decision_table_execution(conn, dt_id, success_flag, message, record_count):
+###############################################################################
+# 1) Rule Change Impact Analysis
+###############################################################################
+def find_downstream_impact_on_update(conn, rule_id):
     """
-    Insert a row into DECISION_TABLE_LOGS if it exists.
+    When rule_id is updated, run BFS to find impacted child rules or schedules.
+    Return a dictionary like {
+      "child_rules": [list_of_rule_ids],
+      "schedules": [list_of_schedule_ids_that_reference_these_rules]
+    }
     """
+    impacted_rules = gather_all_related_rule_ids(conn, rule_id)
+    # exclude the rule_id itself if you only want children
+    if rule_id in impacted_rules:
+        impacted_rules.remove(rule_id)
+
+    # find schedules that reference any of these impacted rules
     c = conn.cursor()
-    try:
+    placeholders=','.join('?' for _ in impacted_rules) if impacted_rules else ''
+    schedules=[]
+    if placeholders:
+        q=f"""
+           SELECT SCHEDULE_ID
+           FROM RULE_SCHEDULES
+           WHERE RULE_ID IN ({placeholders})
+        """
+        c.execute(q, tuple(impacted_rules))
+        rows=c.fetchall()
+        schedules=[r[0] for r in rows]
+
+    return {
+        "child_rules": list(impacted_rules),
+        "schedules": schedules
+    }
+
+def display_impact_warning_if_any(conn, rule_id):
+    """
+    Example function: after an update, we show a dialog listing impacted child rules or schedules,
+    asking user to proceed or not.
+    """
+    impact=find_downstream_impact_on_update(conn, rule_id)
+    child_count=len(impact["child_rules"])
+    sched_count=len(impact["schedules"])
+    if child_count==0 and sched_count==0:
+        return True  # no impact => proceed
+    msg=f"Rule {rule_id} update will impact {child_count} child rule(s) and {sched_count} schedule(s)."
+    msg+="\nContinue anyway?"
+    confirm=QMessageBox.question(None, "Impact Analysis", msg)
+    return (confirm==QMessageBox.Yes)
+
+###############################################################################
+# 2) Branching / Forking Approvals
+###############################################################################
+def fork_rule_approvals(conn, rule_id, fork_labels):
+    """
+    If a rule fails at stage X, we can fork it into multiple variants 
+    (A, B, C...) each with separate approvals. This requires:
+      - Creating new entries in BRM_RULES for each fork or 
+      - Storing a 'FORK_LABEL' in BRM_RULE_APPROVALS
+    Below, we store them in a hypothetical BRM_RULE_FORKS table or
+    extend BRM_RULE_APPROVALS with a FORK_LABEL. 
+    We'll do a minimal approach: store them in a new table.
+
+    fork_labels => list of strings, e.g. ["ReworkA","ReworkB","SecurityVariant"]
+    """
+    c=conn.cursor()
+    for label in fork_labels:
         c.execute("""
-            INSERT INTO DECISION_TABLE_LOGS(
-                DECISION_TABLE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT
+            INSERT INTO BRM_RULE_FORKS(
+              RULE_ID, FORK_LABEL, CREATED_TIMESTAMP
             )
-            VALUES(?, GETDATE(), ?, ?, ?)
-        """,(dt_id, 1 if success_flag else 0, message, record_count))
-        conn.commit()
-        logger.debug(f"DT {dt_id} execution logged, success={success_flag}, records={record_count}")
-    except Exception as ex:
-        logger.error(f"Error logging DT execution for {dt_id}: {ex}")
+            VALUES(?,?,GETDATE())
+        """,(rule_id, label))
+        # Also potentially create new approval lines for each fork, etc.
+    conn.commit()
 
-class DecisionTableEngine:
+def mark_rule_fork_failed(conn, rule_id, fork_label):
     """
-    Encapsulates decision table execution, possibly with extended logging into DECISION_TABLE_LOGS.
+    If a particular fork fails, mark it or remove it. 
+    This is a placeholder for more advanced logic.
     """
-    @staticmethod
-    def run_decision_table_query(conn, dt_id, query):
-        c = conn.cursor()
-        c.execute("BEGIN TRANSACTION")
-        success = False
-        msg = ""
-        impacted = 0
-        try:
-            c.execute(query)
-            try:
-                rows = c.fetchall()
-            except:
-                rows = []
-            impacted = len(rows)
-            # For demonstration, we consider success if it doesn't error
-            success = True
-            msg = f"Impacted {impacted} rows."
-            c.execute("ROLLBACK")  # always dry-run
-        except Exception as ex:
-            c.execute("ROLLBACK")
-            success = False
-            msg = f"Error: {ex}"
-            logger.error(f"DT {dt_id} run error: {ex}")
-        # log if table exists
-        log_decision_table_execution(conn, dt_id, success, msg, impacted)
-        insert_audit_log(conn, "RUN_DECISION_TABLE","DECISION_TABLES", dt_id,
-                         "DecisionTableEngine", None, {"impacted":impacted,"msg":msg})
-        return success, msg, impacted
+    c=conn.cursor()
+    c.execute("""
+        UPDATE BRM_RULE_FORKS
+        SET FORK_STATUS='FAILED'
+        WHERE RULE_ID=? AND FORK_LABEL=?
+    """,(rule_id, fork_label))
+    conn.commit()
 
-# -----------------------------------------------------------------------------
-# 1. AdvancedDecisionTablesTab – main UI
-# -----------------------------------------------------------------------------
-class AdvancedDecisionTablesTab(QWidget):
+###############################################################################
+# 3) Automated ETL / Data Pipeline
+###############################################################################
+class PipelineDesignerTab(QWidget):
     """
-    A more advanced approach to managing decision tables than the one in advanced_lineage.
-    Includes:
-      - Searching
-      - Export to CSV
-      - Execution logs in DECISION_TABLE_LOGS if available
+    A tab that provides a node-based interface for defining pipelines:
+      - Each node represents a BFS run or a rule set.
+      - Edges represent the sequence or condition checks.
+    For demonstration, we store pipeline definitions in memory or a small table.
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
-        self.connection = connection
-        self.setWindowTitle("Advanced Decision Tables (Full)")
-        layout = QVBoxLayout(self)
+        self.connection=connection
+        self.pipeline_id=None
+        self.init_ui()
+        self.load_pipeline_list()
 
-        # Searching
-        search_layout = QHBoxLayout()
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search by table name or description...")
-        self.search_edit.textChanged.connect(self.load_tables)
-        search_layout.addWidget(QLabel("Search:"))
-        search_layout.addWidget(self.search_edit)
-        layout.addLayout(search_layout)
+    def init_ui(self):
+        layout=QVBoxLayout(self)
+        top_h=QHBoxLayout()
 
-        # Main table
-        self.dt_table = QTableWidget(0,4)
-        self.dt_table.setHorizontalHeaderLabels(["DT_ID","Table Name","Description","Decision Query"])
-        self.dt_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.dt_table)
+        self.pipeline_combo=QComboBox()
+        top_h.addWidget(QLabel("Select Pipeline:"))
+        top_h.addWidget(self.pipeline_combo)
 
-        btn_layout = QHBoxLayout()
-        add_btn = QPushButton("Add DT")
-        add_btn.clicked.connect(self.add_dt)
-        btn_layout.addWidget(add_btn)
+        load_btn=QPushButton("Load Pipeline")
+        load_btn.clicked.connect(self.load_pipeline)
+        top_h.addWidget(load_btn)
 
-        update_btn = QPushButton("Update DT")
-        update_btn.clicked.connect(self.update_dt)
-        btn_layout.addWidget(update_btn)
+        new_btn=QPushButton("New Pipeline")
+        new_btn.clicked.connect(self.create_pipeline)
+        top_h.addWidget(new_btn)
 
-        delete_btn = QPushButton("Delete DT")
-        delete_btn.clicked.connect(self.delete_dt)
-        btn_layout.addWidget(delete_btn)
+        del_btn=QPushButton("Delete Pipeline")
+        del_btn.clicked.connect(self.delete_pipeline)
+        top_h.addWidget(del_btn)
 
-        exec_btn = QPushButton("Execute DT")
-        exec_btn.clicked.connect(self.execute_dt)
-        btn_layout.addWidget(exec_btn)
+        top_h.addStretch()
+        layout.addLayout(top_h)
 
-        export_btn = QPushButton("Export CSV")
-        export_btn.clicked.connect(self.export_csv)
-        btn_layout.addWidget(export_btn)
+        # The node-based scene
+        self.scene=QtWidgets.QGraphicsScene(self)
+        self.view=QtWidgets.QGraphicsView(self.scene)
+        self.view.setRenderHint(QtGui.QPainter.Antialiasing)
+        self.view.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+        layout.addWidget(self.view)
 
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.load_tables)
-        btn_layout.addWidget(refresh_btn)
+        # bottom row => add node, run pipeline
+        bot_h=QHBoxLayout()
+        node_btn=QPushButton("Add BFS Node")
+        node_btn.clicked.connect(self.add_bfs_node)
+        bot_h.addWidget(node_btn)
 
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
+        run_btn=QPushButton("Run Pipeline")
+        run_btn.clicked.connect(self.run_pipeline)
+        bot_h.addWidget(run_btn)
 
-        self.exec_log = QPlainTextEdit()
-        self.exec_log.setReadOnly(True)
-        self.exec_log.setPlaceholderText("Decision Table Execution Log...")
-        layout.addWidget(self.exec_log)
-
+        bot_h.addStretch()
+        layout.addLayout(bot_h)
         self.setLayout(layout)
-        self.load_tables()
 
-    def load_tables(self):
-        self.dt_table.setRowCount(0)
-        c = self.connection.cursor()
-        try:
-            search_txt = self.search_edit.text().strip()
-            if search_txt:
-                c.execute("""
-                    SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
-                    FROM DECISION_TABLES
-                    WHERE TABLE_NAME LIKE ? OR DESCRIPTION LIKE ? OR DECISION_QUERY LIKE ?
-                    ORDER BY DECISION_TABLE_ID
-                """,(f"%{search_txt}%",f"%{search_txt}%",f"%{search_txt}%"))
-            else:
-                c.execute("""
-                    SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION, DECISION_QUERY
-                    FROM DECISION_TABLES
-                    ORDER BY DECISION_TABLE_ID
-                """)
-            rows = c.fetchall()
-            for row in rows:
-                ridx = self.dt_table.rowCount()
-                self.dt_table.insertRow(ridx)
-                for col_i, val in enumerate(row):
-                    self.dt_table.setItem(ridx, col_i, QTableWidgetItem(str(val) if val else ""))
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", f"Error loading DTs: {ex}")
+    def load_pipeline_list(self):
+        self.pipeline_combo.clear()
+        c=self.connection.cursor()
+        c.execute("SELECT PIPELINE_ID, PIPELINE_NAME FROM BRM_PIPELINES ORDER BY PIPELINE_ID")
+        rows=c.fetchall()
+        for (pid,pnm) in rows:
+            self.pipeline_combo.addItem(f"{pnm} (ID={pid})", pid)
 
-    def add_dt(self):
-        name, ok = QInputDialog.getText(self, "Add DT", "Table Name:")
+    def load_pipeline(self):
+        pid=self.pipeline_combo.currentData()
+        if not pid:
+            return
+        self.pipeline_id=pid
+        self.scene.clear()
+        # load pipeline nodes
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT NODE_ID, NODE_TYPE, NODE_LABEL, POS_X, POS_Y
+            FROM BRM_PIPELINE_NODES
+            WHERE PIPELINE_ID=?
+        """,(pid,))
+        nodes=c.fetchall()
+        node_map={}
+        for (nid,ntype,nlabel,px,py) in nodes:
+            item=PipelineNodeItem(nid, ntype, nlabel)
+            item.setPos(px or 50, py or 50)
+            self.scene.addItem(item)
+            node_map[nid]=item
+
+        # load edges
+        c.execute("""
+            SELECT EDGE_ID, SOURCE_NODE_ID, TARGET_NODE_ID, CONDITION_LABEL
+            FROM BRM_PIPELINE_EDGES
+            WHERE PIPELINE_ID=?
+        """,(pid,))
+        edges=c.fetchall()
+        for (eid,snid,tnid,cond) in edges:
+            if snid in node_map and tnid in node_map:
+                src=node_map[snid]
+                tgt=node_map[tnid]
+                edge=PipelineEdgeItem(src,tgt,cond)
+                self.scene.addItem(edge)
+
+    def create_pipeline(self):
+        name,ok=QInputDialog.getText(self,"New Pipeline","Pipeline name:")
         if not ok or not name.strip():
             return
-        desc, ok2 = QInputDialog.getMultiLineText(self, "Description", "Optional desc:")
-        if not ok2:
-            desc = ""
-        query, ok3 = QInputDialog.getMultiLineText(self, "Decision Query", "Enter SQL:")
-        if not ok3 or not query.strip():
-            return
-        c = self.connection.cursor()
-        try:
-            c.execute("INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY) VALUES(?,?,?)",
-                      (name.strip(), desc.strip(), query.strip()))
-            self.connection.commit()
-            QMessageBox.information(self, "Added", "New DT created.")
-            insert_audit_log(self.connection, "ADD_DECISION_TABLE","DECISION_TABLES", None,
-                             "User", None, {"table_name":name})
-            self.load_tables()
-        except Exception as ex:
-            QMessageBox.critical(self, "Error", str(ex))
+        c=self.connection.cursor()
+        c.execute("""
+            INSERT INTO BRM_PIPELINES(PIPELINE_NAME,CREATED_TIMESTAMP)
+            VALUES(?,GETDATE())
+        """,(name.strip(),))
+        self.connection.commit()
+        QMessageBox.information(self,"Created",f"Pipeline '{name.strip()}' created.")
+        self.load_pipeline_list()
 
-    def update_dt(self):
-        row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "No selection", "No DT selected.")
+    def delete_pipeline(self):
+        pid=self.pipeline_combo.currentData()
+        if not pid:
             return
-        dt_id = int(self.dt_table.item(row,0).text())
-        cur_name = self.dt_table.item(row,1).text()
-        cur_desc = self.dt_table.item(row,2).text()
-        cur_query = self.dt_table.item(row,3).text()
-
-        name, ok = QInputDialog.getText(self, "Edit Table Name", "New name:", text=cur_name)
-        if not ok or not name.strip():
-            return
-        desc, ok2 = QInputDialog.getMultiLineText(self, "Edit Description", "New desc:", text=cur_desc)
-        if not ok2:
-            desc = cur_desc
-        query, ok3 = QInputDialog.getMultiLineText(self, "Edit Query", "New SQL:", text=cur_query)
-        if not ok3 or not query.strip():
-            return
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                UPDATE DECISION_TABLES
-                SET TABLE_NAME=?, DESCRIPTION=?, DECISION_QUERY=?
-                WHERE DECISION_TABLE_ID=?
-            """,(name.strip(), desc.strip(), query.strip(), dt_id))
-            self.connection.commit()
-            QMessageBox.information(self, "Updated", f"DT {dt_id} updated.")
-            insert_audit_log(self.connection, "EDIT_DECISION_TABLE","DECISION_TABLES", dt_id,
-                             "User", None, {"table_name":name})
-            self.load_tables()
-        except Exception as ex:
-            QMessageBox.critical(self, "Update Error", str(ex))
-
-    def delete_dt(self):
-        row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "No selection", "No DT selected.")
-            return
-        dt_id = int(self.dt_table.item(row,0).text())
-        confirm = QMessageBox.question(self, "Confirm", f"Delete DT {dt_id}?")
+        confirm=QMessageBox.question(self,"Confirm",f"Delete pipeline ID={pid}?")
         if confirm!=QMessageBox.Yes:
             return
-        c = self.connection.cursor()
-        try:
-            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?", (dt_id,))
-            self.connection.commit()
-            QMessageBox.information(self, "Deleted", f"DT {dt_id} deleted.")
-            insert_audit_log(self.connection, "DELETE_DECISION_TABLE","DECISION_TABLES", dt_id,
-                             "User", None, {"deleted":True})
-            self.load_tables()
-        except Exception as ex:
-            QMessageBox.critical(self, "Delete Error", str(ex))
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BRM_PIPELINE_EDGES WHERE PIPELINE_ID=?",(pid,))
+        c.execute("DELETE FROM BRM_PIPELINE_NODES WHERE PIPELINE_ID=?",(pid,))
+        c.execute("DELETE FROM BRM_PIPELINES WHERE PIPELINE_ID=?",(pid,))
+        self.connection.commit()
+        QMessageBox.information(self,"Deleted",f"Pipeline {pid} removed.")
+        self.load_pipeline_list()
+        self.scene.clear()
+        self.pipeline_id=None
 
-    def execute_dt(self):
-        row = self.dt_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "No selection", "No DT selected.")
+    def add_bfs_node(self):
+        if not self.pipeline_id:
+            QMessageBox.warning(self,"None","No pipeline loaded.")
             return
-        dt_id = int(self.dt_table.item(row,0).text())
-        query = self.dt_table.item(row,3).text()
-        if not query:
-            QMessageBox.warning(self, "No Query", "No query in DT.")
+        node_type="BFS"
+        node_label,ok=QInputDialog.getText(self,"Node Label","Enter BFS node label:")
+        if not ok or not node_label.strip():
             return
-        (ok, msg, impacted) = DecisionTableEngine.run_decision_table_query(self.connection, dt_id, query)
-        result_str = f"DT {dt_id} => success={ok}, impacted={impacted}, msg={msg}"
-        self.exec_log.appendPlainText(result_str)
-        QMessageBox.information(self, "Executed", result_str)
+        c=self.connection.cursor()
+        c.execute("""
+            INSERT INTO BRM_PIPELINE_NODES(PIPELINE_ID, NODE_TYPE, NODE_LABEL, POS_X, POS_Y)
+            OUTPUT inserted.NODE_ID
+            VALUES(?,?,?,?,?)
+        """,(self.pipeline_id,node_type,node_label,100,100))
+        row=c.fetchone()
+        nid=row[0]
+        self.connection.commit()
 
-    def export_csv(self):
-        """
-        Exports the current DT table to a CSV file.
-        """
-        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "decision_tables.csv", "CSV Files (*.csv)")
-        if not path:
+        item=PipelineNodeItem(nid,node_type,node_label)
+        item.setPos(100,100)
+        self.scene.addItem(item)
+
+    def run_pipeline(self):
+        # naive approach => gather BFS nodes in pipeline => run them in topological order
+        # or we do a graph approach with BFS. For demonstration, we'll just message.
+        if not self.pipeline_id:
+            QMessageBox.warning(self,"None","No pipeline loaded.")
             return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                header = ["DT_ID","TABLE_NAME","DESCRIPTION","DECISION_QUERY"]
-                f.write(",".join(header)+"\n")
-                for row_i in range(self.dt_table.rowCount()):
-                    row_vals = []
-                    for col_i in range(self.dt_table.columnCount()):
-                        val = self.dt_table.item(row_i, col_i).text()
-                        row_vals.append(val.replace(",", ";"))  # or use csv writer for safety
-                    f.write(",".join(row_vals)+"\n")
-            QMessageBox.information(self, "Exported", f"Exported to {path}")
-        except Exception as ex:
-            QMessageBox.critical(self, "Export Error", str(ex))
+        QMessageBox.information(self,"Pipeline","Pipeline run started... (stub)")
+
+###############################################################################
+# 4) Modern / Flat / Material Theme
+###############################################################################
+def apply_modern_theme(app):
+    """
+    Apply a QSS or QStyle to make the app more modern, e.g. a Material-like or Fusion-based style.
+    """
+    # We'll do a simple QSS snippet:
+    qss="""
+    QWidget {
+       font-family: "Segoe UI", Arial;
+       font-size: 10pt;
+       background-color: #F0F0F0;
+    }
+    QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QTableWidget, QTreeWidget {
+       background-color: #FFFFFF; 
+       border: 1px solid #C8C8C8;
+       border-radius: 4px;
+    }
+    QPushButton {
+       background-color: #007ACC;
+       color: white;
+       border: none;
+       padding: 5px 12px;
+       border-radius: 4px;
+    }
+    QPushButton:hover {
+       background-color: #005A9E;
+    }
+    QTabWidget::pane {
+       border: 1px solid #CCCCCC;
+    }
+    QTabBar::tab:selected {
+       background-color: #FFFFFF;
+       font-weight: bold;
+    }
+    """
+    app.setStyleSheet(qss)
+
+
+###############################################################################
+# QGraphics Items for Pipeline Designer
+###############################################################################
+class PipelineNodeItem(QtWidgets.QGraphicsItem):
+    """
+    Represents a BFS or scheduling node in the pipeline graph.
+    """
+    def __init__(self, node_id, node_type, label):
+        super().__init__()
+        self.node_id=node_id
+        self.node_type=node_type
+        self.label=label
+        self.rect_w=120
+        self.rect_h=60
+        self.setFlag(QtWidgets.QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable, True)
+
+    def boundingRect(self):
+        return self.shape().boundingRect()
+
+    def shape(self):
+        from PyQt5.QtGui import QPainterPath
+        path=QPainterPath()
+        path.addRoundedRect(0,0,self.rect_w,self.rect_h,8,8)
+        return path
+
+    def paint(self, painter, option, widget=None):
+        pen=QPen(Qt.black, 2)
+        fill=QColor("#E0E0E0")
+        if self.isSelected():
+            pen=QPen(Qt.blue,3)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(fill))
+        painter.drawRoundedRect(0,0,self.rect_w,self.rect_h,8,8)
+
+        text=f"{self.node_type}\n{self.label}"
+        painter.drawText(0,0,self.rect_w,self.rect_h,Qt.AlignCenter,text)
+
+
+class PipelineEdgeItem(QtWidgets.QGraphicsLineItem):
+    """
+    An edge connecting two PipelineNodeItem(s) with an optional label.
+    """
+    def __init__(self, source_node, target_node, label=None):
+        super().__init__()
+        self.source=source_node
+        self.target=target_node
+        self.label=label
+        self.setPen(QPen(Qt.darkGray,2))
+        self.adjust()
+
+    def adjust(self):
+        sr=self.source.sceneBoundingRect()
+        tr=self.target.sceneBoundingRect()
+        sp=sr.center()
+        tp=tr.center()
+        self.setLine(sp.x(), sp.y(), tp.x(), tp.y())
+
+    def paint(self, painter, option, widget=None):
+        self.adjust()
+        super().paint(painter, option, widget)
+        # optionally draw label in the middle
+        if self.label:
+            mid_x=(self.line().x1()+self.line().x2())/2
+            mid_y=(self.line().y1()+self.line().y2())/2
+            painter.setPen(QPen(Qt.darkGray,1))
+            painter.drawText(mid_x, mid_y, self.label)
+
+    def boundingRect(self):
+        return super().boundingRect()
