@@ -33,132 +33,89 @@ Integration:
     Here we just do presence/locking.
 
 """
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
-import sys
-import logging
+import sys, logging
 from datetime import datetime, timedelta
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QMessageBox
-)
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QLabel, QPushButton, QMessageBox
+from brm_core_foundation import logger
+from brm_rule_engine import unlock_rule_for_edit
 
-# from brm_core_foundation import logger
-# from brm_rule_engine (or whichever) import rule_current_lock_owner, auto_unlock_expired_locks
-
-###############################################################################
-# CollaborationManager
-###############################################################################
 class CollaborationManager(QtCore.QObject):
-    """
-    Manages real-time presence or locks for the entire application. 
-    A polling-based approach: every X seconds, query the DB for active locks.
-    Then emit a signal with the current lock states so subscribers can update.
-
-    If you want push-based, you'd implement a WebSocket server or some 
-    message bus. For brevity, we do QTimer + DB queries.
-    """
-    locks_updated = QtCore.pyqtSignal(list)  
-    # Emitted with a list of (rule_id, locked_by, lock_timestamp, expiry, force_lock)
-
+    locks_updated = QtCore.pyqtSignal(list)
+    
     def __init__(self, connection, poll_interval_ms=5000, parent=None):
         super().__init__(parent)
-        self.connection=connection
-        self.timer=QTimer(self)
+        self.connection = connection
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll_locks)
         self.timer.start(poll_interval_ms)
-
+    
     def poll_locks(self):
-        # Query BRM_RULE_LOCKS for ACTIVE_LOCK=1
-        # Return list of active locks
-        c=self.connection.cursor()
+        c = self.connection.cursor()
         try:
             c.execute("""
                 SELECT RULE_ID, LOCKED_BY, LOCK_TIMESTAMP, EXPIRY_TIMESTAMP, FORCE_LOCK
                 FROM BRM_RULE_LOCKS
                 WHERE ACTIVE_LOCK=1
             """)
-            rows=c.fetchall()
-            lock_list=[]
-            for row in rows:
-                lock_list.append((row[0],row[1],row[2],row[3],row[4]))
-            self.locks_updated.emit(lock_list)
+            rows = c.fetchall()
+            self.locks_updated.emit(rows)
         except Exception as ex:
-            logging.error(f"Error polling locks: {ex}")
+            logger.error(f"Error polling locks: {ex}")
 
-
-###############################################################################
-# CollaborationTab
-###############################################################################
 class CollaborationTab(QWidget):
-    """
-    A tab that displays all currently locked rules, who’s editing them, 
-    and how long. It uses CollaborationManager’s `locks_updated` signal 
-    to refresh the table in real time. 
-    """
     def __init__(self, connection, collab_manager, parent=None):
         super().__init__(parent)
-        self.connection=connection
-        self.collab_manager=collab_manager
-        layout=QVBoxLayout(self)
-
-        top_label=QLabel("Live Collaboration: Who is editing each rule right now?")
-        top_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(top_label)
-
-        self.lock_table=QTableWidget(0,5)
-        self.lock_table.setHorizontalHeaderLabels(["RuleID","LockedBy","LockTimestamp","Expiry","ForceLock?"])
+        self.connection = connection
+        self.collab_manager = collab_manager
+        self.init_ui()
+        self.collab_manager.locks_updated.connect(self.update_lock_table)
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        self.title_label = QLabel("Live Collaboration: Current Locked Rules")
+        layout.addWidget(self.title_label)
+        self.lock_table = QTableWidget(0, 5)
+        self.lock_table.setHorizontalHeaderLabels(["RuleID", "LockedBy", "LockTimestamp", "Expiry", "ForceLock"])
         self.lock_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.lock_table)
-
-        # we can have a "Force Unlock" button for admin
-        bh=QHBoxLayout()
-        self.force_unlock_btn=QPushButton("Force Unlock Selected")
+        btn_layout = QHBoxLayout()
+        self.force_unlock_btn = QPushButton("Force Unlock Selected")
         self.force_unlock_btn.clicked.connect(self.force_unlock_selected)
-        bh.addWidget(self.force_unlock_btn)
-        bh.addStretch()
-        layout.addLayout(bh)
-
+        btn_layout.addWidget(self.force_unlock_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
         self.setLayout(layout)
-
-        # connect the signal from collab_manager
-        self.collab_manager.locks_updated.connect(self.update_lock_table)
-
+    
     def update_lock_table(self, lock_list):
-        """
-        lock_list => list of (rule_id, locked_by, lock_ts, expiry_ts, forceLockBool).
-        """
         self.lock_table.setRowCount(0)
-        for lockrow in lock_list:
-            r_i=self.lock_table.rowCount()
+        for row in lock_list:
+            r_i = self.lock_table.rowCount()
             self.lock_table.insertRow(r_i)
-            for col_i,val in enumerate(lockrow):
-                it=QTableWidgetItem(str(val) if val else "")
-                self.lock_table.setItem(r_i,col_i,it)
+            for col, val in enumerate(row):
+                self.lock_table.setItem(r_i, col, QTableWidgetItem(str(val) if val is not None else ""))
         self.lock_table.resizeColumnsToContents()
-
+    
     def get_selected_rule_id(self):
-        row=self.lock_table.currentRow()
-        if row<0:
+        row = self.lock_table.currentRow()
+        if row < 0:
             return None
-        it=self.lock_table.item(row,0)
-        if not it:
-            return None
-        return int(it.text())
-
+        it = self.lock_table.item(row, 0)
+        return int(it.text()) if it else None
+    
     def force_unlock_selected(self):
-        rid=self.get_selected_rule_id()
+        rid = self.get_selected_rule_id()
         if not rid:
-            QMessageBox.warning(self,"None","No locked rule selected.")
+            QMessageBox.warning(self, "None", "No locked rule selected.")
             return
-        confirm=QMessageBox.question(self,"Confirm",f"Force unlock rule {rid}?")
-        if confirm!=QMessageBox.Yes:
+        if QMessageBox.question(self, "Confirm", f"Force unlock rule {rid}?") != QMessageBox.Yes:
             return
-        # call an override
-        # from brm_rule_engine import unlock_rule_for_edit
         try:
             unlock_rule_for_edit(self.connection, rid, locked_by="AdminOverride", force=True)
-            QMessageBox.information(self,"Forced","Rule unlocked forcibly.")
+            QMessageBox.information(self, "Forced", "Rule forcibly unlocked.")
         except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-        # we'll rely on next poll to refresh table
+            QMessageBox.critical(self, "Error", str(ex))
