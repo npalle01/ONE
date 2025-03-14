@@ -1,917 +1,524 @@
-Below is Module #2: an enhanced rule_engine.py that provides:
-	1.	Advanced BFS Execution with support for:
-	•	Parent–Child relationships (PARENT_RULE_ID)
-	•	Global-Critical links (BRM_GLOBAL_CRITICAL_LINKS)
-	•	Rule conflicts (RULE_CONFLICTS with priority)
-	•	Composite rules (COMPOSITE_RULES with a LOGIC_EXPR referencing other rules like Rule10)
-	•	Data validations (with a real run that can skip rules if table-level validations fail)
-	2.	CRUD (Create, Update, Delete, Force Activate/Deactivate) methods that integrate with the LockManager from Module #1, plus advanced permission checks.
-	3.	Performance logging to RULE_EXECUTION_LOGS, storing EXECUTION_TIME_MS, pass/fail, record counts, and an optional BFS-level ordering.
-	4.	Helper for partial impact analysis (which rules are impacted by the change to a given rule) with a combined adjacency approach.
-
-All placeholders are removed. This module expects:
-	•	The LockManager, insert_audit_log, fetch_all_dict, and fetch_one_dict from Module #1 (core_foundation.py).
-	•	A DATA_VALIDATIONS table for table-level checks, plus we store or at least skip rules if validations fail.
-	•	A RULE_PERF_STATS or RULE_EXECUTION_LOGS table to store execution results.
-
-⸻
-
-Module #2: rule_engine.py
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
-Module: rule_engine.py
+Module: brm_rule_engine.py
 Description:
-  Provides the advanced BFS logic and rule CRUD for the BRM Tool.
-  Key features:
-    • BFS with child, global-critical, conflict, composite references.
-    • Data validations that can skip a rule if table checks fail.
-    • CRUD operations (add, update, delete, force activate/deactivate) with 
-      LockManager integration and table-level permission checks.
-    • Impact analysis (which rules are affected by a changed rule).
-    • Performance logging to RULE_EXECUTION_LOGS (pass/fail, record counts, exec_time_ms).
-      
-Dependencies (from core_foundation.py):
-  - LockManager
-  - insert_audit_log
-  - fetch_all_dict, fetch_one_dict
-  - logger
+  The main BRM rule engine logic, now fully integrated with:
+    • BFS-based execution for child rules, conflicts, global/critical, composites
+    • Single/chain/group simulations
+    • Real data validations (via brm_data_validations.py)
+    • Lock usage (via brm_core_foundation.LockManager), ensuring concurrency control.
+
+Usage in aggregator:
+  - Import BFS or simulation as needed.
+  - Display SingleRuleSimulationDialog, ChainSimulationDialog, GroupSimulationDialog for UI-driven runs.
 """
 
 import sys
-import json
-import time
-import math
-import re
 import logging
+import pyodbc
+import re
 from datetime import datetime, timedelta
 from collections import deque
 
-import pyodbc
-
-# Suppose these come from your 'core_foundation' module:
-from core_foundation import (
-    logger,
-    LockManager,
-    insert_audit_log,
-    fetch_one_dict,
-    fetch_all_dict
+# PyQt5 imports for UI
+from PyQt5 import QtWidgets, QtCore
+from PyQt5.QtWidgets import (
+    QWidget, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit,
+    QPushButton, QComboBox, QCheckBox, QMessageBox
 )
 
-# If you have advanced SQL parser from an older module, you can import:
-# from advanced_sql_parser import parse_sql_dependencies
-# Or define a simpler parse below as fallback
+# Import from brm_core_foundation
+from brm_core_foundation import logger, LockManager, fetch_one_dict, insert_audit_log
 
-# ---------------------------------------------------------------------------
-# 1) PERMISSION CHECK (table-level, from GROUP_PERMISSIONS)
-# ---------------------------------------------------------------------------
-def user_has_table_permission(conn, user_group, table_name):
-    """
-    Check if user_group has permission on table_name by looking at GROUP_PERMISSIONS.
-    Assume table_name is something like 'dbo.Customers' (lowercase match).
-    Returns True/False.
-    """
-    if not table_name:
-        return True  # or false if you prefer
-    tn = table_name.lower()
-    c = conn.cursor()
-    c.execute("""
-        SELECT 1
-        FROM GROUP_PERMISSIONS
-        WHERE GROUP_NAME=? AND LOWER(TARGET_TABLE)=?
-    """,(user_group, tn))
-    row = c.fetchone()
-    return bool(row)
+# Import real data validations
+# We assume brm_data_validations exports run_data_validations_for_table(conn, table_name) => bool
+from brm_data_validations import run_data_validations_for_table  # <--- fully integrated reference
 
-def enforce_table_permissions_for_rule(conn, user_group, rule_sql, parse_sql_fn):
-    """
-    Parse rule_sql => find all real tables => check permission for each.
-    If missing => raise ValueError.
-    parse_sql_fn is a function that returns something like:
-      { "tables": [ (schema,table,alias,is_subselect), ... ], ...}
-    """
-    deps = parse_sql_fn(rule_sql)
-    for (sch, tbl, alias, issub) in deps.get("tables",[]):
-        if not tbl or "(CTE)" in tbl:
-            continue
-        sch_ = sch if sch else "dbo"
-        fulln = f"{sch_}.{tbl}".lower()
-        if not user_has_table_permission(conn, user_group, fulln):
-            raise ValueError(f"Group {user_group} lacks permission on table '{fulln}'. Cannot proceed.")
-
-
-# ---------------------------------------------------------------------------
-# 2) DATA VALIDATIONS
-# ---------------------------------------------------------------------------
-def load_validations_for_table(conn, table_name):
-    """
-    Returns a list of dict from DATA_VALIDATIONS for the given table_name (case-insensitive).
-    """
-    c = conn.cursor()
-    c.execute("""
-        SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
-        FROM DATA_VALIDATIONS
-        WHERE LOWER(TABLE_NAME)=LOWER(?)
-    """,(table_name,))
-    return fetch_all_dict(c)
-
-def run_single_validation(conn, validation_dict):
-    """
-    Interprets validation_dict => run a T-SQL check. 
-    Return True if pass, else False.
-    Possibly you insert into DATA_VALIDATION_LOGS as well.
-    """
-    table_ = validation_dict["TABLE_NAME"]
-    col_   = validation_dict["COLUMN_NAME"]
-    vtype  = validation_dict["VALIDATION_TYPE"].upper().strip()
-    pars   = validation_dict["PARAMS"] or ""
-
-    c = conn.cursor()
-    if vtype=="NOT NULL":
-        q = f"SELECT COUNT(*) FROM {table_} WHERE {col_} IS NULL"
-        c.execute(q)
-        row = c.fetchone()
-        null_count = row[0]
-        return (null_count==0)
-    elif vtype=="RANGE":
-        parts = pars.split(",")
-        if len(parts)==2:
-            try:
-                mn = float(parts[0])
-                mx = float(parts[1])
-                q = f"""SELECT COUNT(*) FROM {table_}
-                        WHERE {col_}<{mn} OR {col_}>{mx}"""
-                c.execute(q)
-                row = c.fetchone()
-                out_of_range = row[0]
-                return (out_of_range==0)
-            except:
-                return False
-        else:
-            return False
-    elif vtype=="REGEX":
-        # not trivial in T-SQL => skip or pass
-        return True
-    else:
-        return False
-
-def run_data_validations_for_table(conn, table_name):
-    """
-    Returns True if all validations pass for that table, else False.
-    """
-    rules = load_validations_for_table(conn, table_name.lower())
-    for rv in rules:
-        ok = run_single_validation(conn, rv)
-        if not ok:
-            return False
-    return True
-
-def run_data_validation_for_rule(conn, rule_id, parse_sql_fn):
-    """
-    For a single rule => gather table deps => run validations => if fail => skip.
-    Return (True if pass, or False if fail) plus list of failed tables.
-    """
-    c = conn.cursor()
-    c.execute("""
-        SELECT RULE_SQL
-        FROM BRM_RULES
-        WHERE RULE_ID=?
-    """,(rule_id,))
-    row = c.fetchone()
-    if not row or not row[0]:
-        return (True, [])  # no SQL => nothing to validate
-    sql_text = row[0]
-    deps = parse_sql_fn(sql_text)
-    failed = []
-    for (sch, tbl, alias, issub) in deps.get("tables",[]):
-        if not tbl or "(CTE)" in tbl:
-            continue
-        sch_ = sch if sch else "dbo"
-        fulln = f"{sch_}.{tbl}".lower()
-        if not run_data_validations_for_table(conn, fulln):
-            failed.append(fulln)
-    return (len(failed)==0, failed)
-
-
-# ---------------------------------------------------------------------------
-# 3) BFS RELATIONSHIPS (child, GCR, conflicts, composites)
-# ---------------------------------------------------------------------------
+###############################################################################
+# 1) BFS Relationship Building
+###############################################################################
 def load_rule_relationships(conn):
     """
-    Return adjacency dict => rid => set of child rids, from:
-     - parent_rule_id
-     - GCR
-     - conflicts
-     - composites
-    Also return all rule IDs for reference.
+    Build adjacency for BFS, factoring child rules (PARENT_RULE_ID), 
+    global-critical links (BRM_GLOBAL_CRITICAL_LINKS),
+    conflicts (RULE_CONFLICTS), and composite references (COMPOSITE_RULES).
+    Returns:
+      adjacency => dict: rule_id => set(child_rule_ids)
+      roots => list of rule_ids with no parent
+      parent_map => dict: rule_id => parent_rule_id
     """
-    adjacency = {}
     c = conn.cursor()
-
-    # parent
     c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
     rows = c.fetchall()
-    all_rids = set()
-    for (rid,pid) in rows:
-        all_rids.add(rid)
+
+    adjacency = {}
+    parent_map = {}
+    all_ids = set()
+
+    for (rid, pid) in rows:
+        all_ids.add(rid)
         if pid:
-            adjacency.setdefault(pid,set()).add(rid)
+            adjacency.setdefault(pid, set()).add(rid)
+            parent_map[rid] = pid
 
-    # GCR
+    # GCR links
     c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
-    gcr_rows = c.fetchall()
-    for (pr, ch) in gcr_rows:
-        adjacency.setdefault(pr,set()).add(ch)
-        all_rids.add(pr)
-        all_rids.add(ch)
+    g_rows = c.fetchall()
+    for (gcr, tgt) in g_rows:
+        adjacency.setdefault(gcr, set()).add(tgt)
 
-    # conflicts => priority usage is domain-specific. For BFS, we might just treat them as adjacency
-    c.execute("SELECT RULE_ID1, RULE_ID2, PRIORITY FROM RULE_CONFLICTS")
+    # conflicts
+    c.execute("SELECT RULE_ID1, RULE_ID2 FROM RULE_CONFLICTS")
     cf_rows = c.fetchall()
-    for (r1, r2, pri) in cf_rows:
-        adjacency.setdefault(r1,set()).add(r2)
-        all_rids.add(r1)
-        all_rids.add(r2)
+    for (r1, r2) in cf_rows:
+        adjacency.setdefault(r1, set()).add(r2)
+        # Possibly we add adjacency the other direction if needed
 
-    # composites
+    # composites => parse expression for "RuleX" references
+    pat = re.compile(r"Rule(\d+)")
     c.execute("SELECT COMPOSITE_RULE_ID, LOGIC_EXPR FROM COMPOSITE_RULES")
-    comp = c.fetchall()
-    pat = re.compile(r"Rule(\d+)", re.IGNORECASE)
-    for (cid, expr) in comp:
-        all_rids.add(cid)
+    comp_rows = c.fetchall()
+    for (cid, expr) in comp_rows:
         if expr:
             matches = pat.findall(expr)
             for m_ in matches:
                 try:
-                    sr_id = int(m_)
-                    adjacency.setdefault(sr_id,set()).add(cid)
-                    all_rids.add(sr_id)
+                    sub_id = int(m_)
+                    adjacency.setdefault(sub_id, set()).add(cid)
                 except:
                     pass
 
-    return adjacency, all_rids
+    child_ids = set(parent_map.keys())
+    roots = [r for r in all_ids if r not in child_ids]
+    return adjacency, roots, parent_map
 
 
-def gather_all_descendants(conn, start_rule_id):
+def skip_bfs_descendants(start_id, adjacency, skipped):
     """
-    BFS from start_rule_id => gather all reachable. 
-    Return a set of rule IDs.
+    Mark all reachable from start_id as skipped => BFS approach.
     """
-    adjacency, all_rids = load_rule_relationships(conn)
-    visited = set()
-    queue = [start_rule_id]
-    while queue:
-        rid = queue.pop(0)
-        if rid in visited:
-            continue
-        visited.add(rid)
-        if rid in adjacency:
-            for ch in adjacency[rid]:
-                if ch not in visited:
-                    queue.append(ch)
-    return visited
-
-
-def skip_bfs_descendants(rule_id, adjacency, skipped):
-    """
-    BFS skip from rule_id => add all children to skipped set.
-    """
-    stack = [rule_id]
+    stack = [start_id]
     while stack:
-        curr = stack.pop()
-        if curr in skipped:
+        cur = stack.pop()
+        if cur in skipped:
             continue
-        skipped.add(curr)
-        if curr in adjacency:
-            for child in adjacency[curr]:
-                if child not in skipped:
-                    stack.append(child)
+        skipped.add(cur)
+        if cur in adjacency:
+            for ch_ in adjacency[cur]:
+                if ch_ not in skipped:
+                    stack.append(ch_)
 
 
-# ---------------------------------------------------------------------------
-# 4) BFS EXECUTION
-# ---------------------------------------------------------------------------
-def run_single_rule_sql(conn, rule_id, dry_run=False):
+def get_rule_map(conn):
     """
-    Execute the RULE_SQL. If returns row[0][0] == 1 => pass, else fail => rollback if fail or if dry_run.
-    Return (ok_flag, msg, record_count, elapsed_ms).
+    Return dict => rule_id => entire row from BRM_RULES.
     """
-    # fetch rule sql
     c = conn.cursor()
-    c.execute("SELECT RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-    row = c.fetchone()
-    if not row or not row[0]:
-        return (True, "No SQL => treated as PASS", 0, 0)
-    sql_text = row[0]
-    start_time = time.time()
+    c.execute("SELECT * FROM BRM_RULES")
+    rows = c.fetchall()
+    colnames = [desc[0] for desc in c.description]
+    out = {}
+    for row in rows:
+        rd = dict(zip(colnames, row))
+        out[rd["RULE_ID"]] = rd
+    return out
+
+
+###############################################################################
+# 2) BFS Execution
+###############################################################################
+def run_data_validations_for_rule(conn, rule_id):
+    """
+    For each table in BRM_RULE_TABLE_DEPENDENCIES => call run_data_validations_for_table(...).
+    Return True if all pass, else False. 
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT DATABASE_NAME, TABLE_NAME
+        FROM BRM_RULE_TABLE_DEPENDENCIES
+        WHERE RULE_ID=?
+    """,(rule_id,))
+    deps = c.fetchall()
+
+    for (dbn, tname) in deps:
+        if not tname:
+            continue
+        full_table = f"{dbn}.{tname}".lower()
+        pass_ok = run_data_validations_for_table(conn, full_table)
+        if not pass_ok:
+            return False
+    return True
+
+
+def run_single_rule_transaction(conn, rule_info, is_dry_run=True):
+    """
+    Execute rule_info["RULE_SQL"] within a transaction. 
+    If row[0][0]==1 => PASS, else FAIL => or if no rows => PASS by default.
+    Return (success_flag, message, record_count).
+    """
+    sql_ = (rule_info.get("RULE_SQL") or "").strip()
+    c = conn.cursor()
     c.execute("BEGIN TRANSACTION")
-    ok = False
+    success = False
     msg = ""
     rec_count = 0
     try:
-        c.execute(sql_text)
+        c.execute(sql_)
         rows = c.fetchall()
         rec_count = len(rows)
-        if rows:
+        if rows and len(rows[0])>0:
             val = rows[0][0]
-            ok = (val==1)
+            success = (val == 1)
             msg = f"Returned: {val}"
         else:
-            ok = True
+            success = True
             msg = "No rows => PASS"
-        if dry_run or not ok:
+        if is_dry_run or not success:
             c.execute("ROLLBACK")
         else:
             c.execute("COMMIT")
     except Exception as ex:
         c.execute("ROLLBACK")
-        ok = False
+        success = False
         msg = str(ex)
-
-    elapsed_ms = int((time.time()-start_time)*1000)
-    return (ok, msg, rec_count, elapsed_ms)
+    return (success, msg, rec_count)
 
 
-def log_execution_result(conn, rule_id, pass_flag, message, record_count, exec_ms):
+def insert_simulation_log(conn, rule_id, success_flag, message, record_count):
     """
-    Insert into RULE_EXECUTION_LOGS => store performance data, pass/fail, record_count, etc.
+    Insert a simulation log record (dry-run or BFS run) into a SIMULATION_LOGS table (or RULE_EXECUTION_LOGS).
     """
     c = conn.cursor()
     c.execute("""
-        INSERT INTO RULE_EXECUTION_LOGS(
-          RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE,
-          RECORD_COUNT, EXECUTION_TIME_MS
+        INSERT INTO SIMULATION_LOGS(
+            RULE_ID, EXEC_TIMESTAMP, SUCCESS_FLAG, MESSAGE, RECORD_COUNT
         )
-        VALUES(?, GETDATE(), ?, ?, ?, ?)
-    """,(rule_id, 1 if pass_flag else 0, message, record_count, exec_ms))
+        VALUES(?, GETDATE(),?,?,?)
+    """,(rule_id, 1 if success_flag else 0, message, record_count))
     conn.commit()
 
 
-def execute_rules_bfs(conn, start_rule_ids=None, skip_data_validation=False, parse_sql_fn=None):
+def execute_rules_bfs(
+    conn, 
+    start_rule_ids, 
+    skip_data_validation=False, 
+    require_lock=False, 
+    lock_user="BFSUser", 
+    force_lock=False
+):
     """
-    BFS from either a set of start_rule_ids or from all "root" rules if none given.
-    We'll incorporate child, GCR, conflicts, composite adjacency. 
-    If a rule is CRITICAL_RULE=1 or IS_GLOBAL=1 => upon fail => skip BFS children.
-    If data validation fails => skip that rule & children.
-    Return (executed_list, skipped_set, validation_fail_tables).
+    BFS from given start_rule_ids. 
+    Steps for each rule:
+      1) If require_lock => attempt LockManager.lock_rule(...) 
+         - if fails => skip BFS from this rule
+      2) If not skip_data_validation => run_data_validations_for_rule
+         - if fail => skip BFS from this rule
+      3) run_single_rule_transaction => if fail & rule is critical => skip children
+      4) Insert simulation log
+      5) if require_lock => unlock after execution
 
-    parse_sql_fn => function that parses SQL => we can pass the advanced parser.
+    Return (executed_list, skipped_set).
     """
-    adjacency, all_rids = load_rule_relationships(conn)
-
-    # If not provided, find "roots" => those that are never a child in adjacency
-    if not start_rule_ids or len(start_rule_ids)==0:
-        # find all that are not in adjacency's .values
-        child_ids = set()
-        for pid, kids in adjacency.items():
-            child_ids.update(kids)
-        roots = [r_ for r_ in all_rids if r_ not in child_ids]
-        queue = list(roots)
-    else:
-        queue = list(start_rule_ids)
-
-    executed = []
-    skipped = set()
-    fail_tables = set()
-
-    # preload rule info in memory => to avoid repeated DB calls
-    rule_map = {}
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES")
-    rows = c.fetchall()
-    colnames = [d[0] for d in c.description]
-    for r_ in rows:
-        d_ = dict(zip(colnames,r_))
-        rule_map[d_["RULE_ID"]] = d_
+    adjacency, roots, parent_map = load_rule_relationships(conn)
+    rule_map = get_rule_map(conn)
+    queue = list(start_rule_ids)
+    visited = set()
+    executed=[]
+    skipped=set()
 
     while queue:
         rid = queue.pop(0)
-        if rid in skipped:
+        if rid in visited or rid in skipped:
             continue
-        if rid not in rule_map:
-            # not found => skip
+        visited.add(rid)
+
+        rinfo = rule_map.get(rid)
+        if not rinfo:
             skipped.add(rid)
             continue
 
-        # data validations
-        if not skip_data_validation:
-            pass_ok, fl = run_data_validation_for_rule(conn, rid, parse_sql_fn)
-            if not pass_ok:
-                # skip + skip BFS children
+        # (1) Attempt lock if required
+        if require_lock:
+            try:
+                LockManager.lock_rule(conn, rid, lock_user, force=force_lock)
+            except Exception as ex:
+                logger.warning(f"Could not lock rule {rid} => skipping BFS from it: {ex}")
                 skipped.add(rid)
-                fail_tables.update(fl)
                 if rid in adjacency:
                     skip_bfs_descendants(rid, adjacency, skipped)
                 continue
 
-        # run rule
-        (ok, msg, rc, ms) = run_single_rule_sql(conn, rid, dry_run=False)
-        log_execution_result(conn, rid, ok, msg, rc, ms)
-        if ok:
-            executed.append(rid)
-            # BFS -> add children
-            if rid in adjacency:
-                for ch_ in adjacency[rid]:
-                    if ch_ not in skipped:
-                        queue.append(ch_)
-        else:
-            # if CRITICAL => skip children
-            r_info = rule_map[rid]
-            if r_info["CRITICAL_RULE"]==1 or r_info["IS_GLOBAL"]==1:
+        # (2) Data validations
+        if not skip_data_validation:
+            pass_ok = run_data_validations_for_rule(conn, rid)
+            if not pass_ok:
+                logger.info(f"Rule {rid} => data validation failed => skipping BFS for children.")
+                skipped.add(rid)
                 if rid in adjacency:
                     skip_bfs_descendants(rid, adjacency, skipped)
+                if require_lock:
+                    # unlock rule
+                    try:
+                        LockManager.unlock_rule(conn, rid, lock_user, force=force_lock)
+                    except:
+                        pass
+                continue
+
+        # (3) Execute the rule transaction
+        (ok, msg, rec_count) = run_single_rule_transaction(conn, rinfo, is_dry_run=False)
+        insert_simulation_log(conn, rid, ok, msg, rec_count)
+        logger.info(f"Rule {rid} => {msg} (pass={ok}, rec_count={rec_count})")
+
+        # (4) If fail & rule is critical => skip children
+        is_crit = (rinfo.get("CRITICAL_RULE",0)==1 or rinfo.get("IS_GLOBAL",0)==1)
+        if ok:
+            executed.append(rid)
+            # BFS => add children
+            if rid in adjacency:
+                for ch_ in adjacency[rid]:
+                    if ch_ not in visited and ch_ not in skipped:
+                        queue.append(ch_)
+        else:
+            # skip
             skipped.add(rid)
+            if is_crit and rid in adjacency:
+                skip_bfs_descendants(rid, adjacency, skipped)
 
-    return (executed, skipped, fail_tables)
+        # (5) If we locked => unlock
+        if require_lock:
+            try:
+                LockManager.unlock_rule(conn, rid, lock_user, force=force_lock)
+            except Exception as e2:
+                logger.warning(f"Failed to unlock rule {rid}: {e2}")
 
-# For specialized BFS with conflicts ordering or composite logic (like checking priorities or evaluating expressions),
-# you can extend the logic in `execute_rules_bfs` to reorder adjacency or skip based on conflict priority, etc.
+    return (executed, skipped)
 
 
-# ---------------------------------------------------------------------------
-# 5) RULE CRUD (Add, Update, Delete, Force Activation, etc.)
-# ---------------------------------------------------------------------------
-
-def add_rule(conn, rule_info, created_by_user, parse_sql_fn, user_group=None):
+###############################################################################
+# 3) UI Dialogs: single, chain, group simulation
+###############################################################################
+class SingleRuleSimulationDialog(QDialog):
     """
-    Create a new rule => parse dependencies => data validations => set status='INACTIVE', approvals => lock is optional.
-    rule_info keys might be:
-      RULE_NAME, RULE_SQL, OWNER_GROUP, ...
-    user_group => the group of the user creating. We might check table perms.
-    Return newly inserted RULE_ID.
+    A dialog to pick 1 rule => BFS or single-run => integrated with data validations & lock usage
     """
-    # Permission check => parse rule sql => enforce
-    if user_group and rule_info.get("RULE_SQL"):
-        enforce_table_permissions_for_rule(conn, user_group, rule_info["RULE_SQL"], parse_sql_fn)
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.setWindowTitle("Single Rule Simulation – BRM Engine")
+        self.resize(550,400)
 
-    # Insert
-    c = conn.cursor()
-    # Possibly check duplicates by name in that group
-    c.execute("""
-        SELECT RULE_ID FROM BRM_RULES
-        WHERE OWNER_GROUP=? AND RULE_NAME=?
-    """,(rule_info.get("OWNER_GROUP"), rule_info["RULE_NAME"].strip()))
-    if c.fetchone():
-        raise ValueError(f"Duplicate rule name '{rule_info['RULE_NAME']}' in group {rule_info['OWNER_GROUP']}.")
+        layout = QVBoxLayout(self)
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    op_type = detect_operation_type(rule_info.get("RULE_SQL",""))
-    c.execute("""
-        INSERT INTO BRM_RULES(
-            RULE_NAME, RULE_SQL, OWNER_GROUP, STATUS, APPROVAL_STATUS,
-            CREATED_TIMESTAMP, CREATED_BY, OPERATION_TYPE, IS_GLOBAL, CRITICAL_RULE,
-            CRITICAL_SCOPE, LIFECYCLE_STATE, PARENT_RULE_ID
+        # selection
+        sel_layout = QHBoxLayout()
+        sel_layout.addWidget(QLabel("Select Rule:"))
+        self.rule_combo = QComboBox()
+        c = self.conn.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        for (rid,rn) in c.fetchall():
+            disp=f"{rid} - {rn}"
+            self.rule_combo.addItem(disp, rid)
+        sel_layout.addWidget(self.rule_combo)
+        layout.addLayout(sel_layout)
+
+        # checkboxes
+        self.skip_val_cb = QCheckBox("Skip Data Validations?")
+        self.require_lock_cb = QCheckBox("Require Lock?")
+        layout.addWidget(self.skip_val_cb)
+        layout.addWidget(self.require_lock_cb)
+
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
+
+        bh = QHBoxLayout()
+        run_btn = QPushButton("Run Simulation")
+        run_btn.clicked.connect(self.do_simulation)
+        bh.addWidget(run_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        bh.addWidget(close_btn)
+        bh.addStretch()
+        layout.addLayout(bh)
+
+        self.setLayout(layout)
+
+    def do_simulation(self):
+        rid = self.rule_combo.currentData()
+        skip_val = self.skip_val_cb.isChecked()
+        req_lock = self.require_lock_cb.isChecked()
+
+        exed, skp = execute_rules_bfs(
+            self.conn, 
+            [rid], 
+            skip_data_validation=skip_val,
+            require_lock=req_lock,
+            lock_user="SimUser",
+            force_lock=False
         )
-        OUTPUT inserted.RULE_ID
-        VALUES(?,?,?,'INACTIVE','APPROVAL_IN_PROGRESS',GETDATE(),?,
-               ?,?,?,?,?,?)
-    """,(
-        rule_info["RULE_NAME"].strip(),
-        rule_info["RULE_SQL"].strip() if rule_info.get("RULE_SQL") else "",
-        rule_info.get("OWNER_GROUP","BG1"),
-        created_by_user,
-        op_type,
-        rule_info.get("IS_GLOBAL",0),
-        rule_info.get("CRITICAL_RULE",0),
-        rule_info.get("CRITICAL_SCOPE","NONE"),
-        "DRAFT",
-        rule_info.get("PARENT_RULE_ID", None)
-    ))
-    new_row = c.fetchone()
-    if not new_row:
-        raise ValueError("Insert returned no RULE_ID.")
-    new_rule_id = new_row[0]
-
-    # parse deps
-    deps = parse_sql_fn(rule_info.get("RULE_SQL",""))
-    col_op = "READ"
-    if op_type in ("INSERT","UPDATE","DELETE"):
-        col_op="WRITE"
-    for (sch,tbl,alias,issub) in deps["tables"]:
-        if tbl and not tbl.startswith("(CTE)"):
-            sch_ = sch if sch else "dbo"
-            c.execute("""
-                INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
-                    RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
-                )
-                VALUES(?,?,?,?,?)
-            """,(new_rule_id, sch_, tbl, "AutoCol", col_op))
-
-    # audit
-    old_data = None
-    new_data = dict(rule_info)
-    insert_audit_log(conn, "INSERT", "BRM_RULES", new_rule_id, created_by_user, old_data, new_data)
-    conn.commit()
-    logger.info(f"Rule {new_rule_id} created by {created_by_user} => group={rule_info.get('OWNER_GROUP')}")
-
-    # create approvals if needed
-    create_multistep_approvals(conn, new_rule_id)  # define a function or skip
-    return new_rule_id
+        txt = f"Sim => single BFS from rule {rid}.\nExecuted={exed}\nSkipped={list(skp)}"
+        self.result_text.setPlainText(txt)
 
 
-def update_rule(conn, rule_info, updated_by_user, parse_sql_fn, user_group=None):
+class ChainSimulationDialog(QDialog):
     """
-    Must have lock => parse SQL => enforce perms => re-approval => set status=INACTIVE => update dependencies.
-    rule_info must have RULE_ID, RULE_NAME, RULE_SQL, etc.
+    BFS from a selected "parent" => chain simulation => integrated with validations & lock usage
     """
-    rule_id = rule_info["RULE_ID"]
-    # check lock
-    # you can wrap this in a function => e.g. LockManager or do direct:
-    LockManager.auto_clean_stale_locks(conn)
-    c=conn.cursor()
-    c.execute("""
-        SELECT LOCKED_BY
-        FROM BRM_RULE_LOCKS
-        WHERE RULE_ID=? AND ACTIVE_LOCK=1
-    """,(rule_id,))
-    lockrow=c.fetchone()
-    if not lockrow:
-        raise ValueError(f"Rule {rule_id} is not locked => cannot update.")
-    if lockrow[0]!=updated_by_user:
-        raise ValueError(f"You do not own the lock => locked by {lockrow[0]}.")
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.setWindowTitle("Chain Simulation – BRM Engine")
+        self.resize(550,400)
 
-    # fetch old
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
-    old_r = c.fetchone()
-    if not old_r:
-        raise ValueError("Rule not found.")
-    colnames=[d[0] for d in c.description]
-    old_data=dict(zip(colnames, old_r))
+        layout = QVBoxLayout(self)
 
-    # if global => only admin
-    if old_data["IS_GLOBAL"]==1 and user_group!="Admin":
-        raise ValueError("Only Admin can update a global rule.")
+        top_h = QHBoxLayout()
+        top_h.addWidget(QLabel("Select Starting Rule:"))
+        self.start_combo = QComboBox()
+        c = self.conn.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        for (rid,rn) in c.fetchall():
+            disp=f"{rid} - {rn}"
+            self.start_combo.addItem(disp,rid)
+        top_h.addWidget(self.start_combo)
+        layout.addLayout(top_h)
 
-    # check table perms
-    new_sql=rule_info.get("RULE_SQL","").strip()
-    if user_group and new_sql:
-        enforce_table_permissions_for_rule(conn, user_group, new_sql, parse_sql_fn)
+        self.skip_val_cb = QCheckBox("Skip Data Validations?")
+        self.req_lock_cb = QCheckBox("Require Lock?")
+        layout.addWidget(self.skip_val_cb)
+        layout.addWidget(self.req_lock_cb)
 
-    # parse => dep => remove old => add new
-    op_type = detect_operation_type(new_sql)
-    deps = parse_sql_fn(new_sql)
-    # do update
-    c.execute("""
-        UPDATE BRM_RULES
-        SET RULE_NAME=?,
-            RULE_SQL=?,
-            STATUS='INACTIVE',
-            APPROVAL_STATUS='APPROVAL_IN_PROGRESS',
-            UPDATED_BY=?,
-            VERSION=VERSION+1,
-            OPERATION_TYPE=?,
-            LIFECYCLE_STATE='UNDER_APPROVAL',
-            OWNER_GROUP=?,
-            CRITICAL_RULE=?,
-            CRITICAL_SCOPE=?,
-            IS_GLOBAL=?,
-            PARENT_RULE_ID=?
-        WHERE RULE_ID=?
-    """,(
-        rule_info["RULE_NAME"].strip(),
-        new_sql,
-        updated_by_user,
-        op_type,
-        rule_info.get("OWNER_GROUP", old_data["OWNER_GROUP"]),
-        rule_info.get("CRITICAL_RULE", old_data["CRITICAL_RULE"]),
-        rule_info.get("CRITICAL_SCOPE", old_data["CRITICAL_SCOPE"]),
-        rule_info.get("IS_GLOBAL", old_data["IS_GLOBAL"]),
-        rule_info.get("PARENT_RULE_ID", old_data["PARENT_RULE_ID"]),
-        rule_id
-    ))
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
 
-    c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?",(rule_id,))
-    col_op="READ"
-    if op_type in ("INSERT","UPDATE","DELETE"):
-        col_op="WRITE"
-    for (sch,tb,alias,issub) in deps["tables"]:
-        if tb and not tb.startswith("(CTE)"):
-            sch_ = sch if sch else "dbo"
-            c.execute("""
-                INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
-                    RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
-                )
-                VALUES(?,?,?,?,?)
-            """,(rule_id, sch_, tb, "AutoCol", col_op))
+        bh = QHBoxLayout()
+        run_btn = QPushButton("Run BFS Chain")
+        run_btn.clicked.connect(self.run_chain)
+        bh.addWidget(run_btn)
+        cls_btn = QPushButton("Close")
+        cls_btn.clicked.connect(self.close)
+        bh.addWidget(cls_btn)
+        bh.addStretch()
+        layout.addLayout(bh)
 
-    # audit
-    new_data=dict(old_data)
-    for k,v in rule_info.items():
-        new_data[k]=v
-    insert_audit_log(conn,"UPDATE","BRM_RULES",rule_id,updated_by_user,old_data,new_data)
-    conn.commit()
+        self.setLayout(layout)
 
-    # re-create approvals
-    create_multistep_approvals(conn, rule_id)
+    def run_chain(self):
+        rid = self.start_combo.currentData()
+        skip_val = self.skip_val_cb.isChecked()
+        req_lock = self.req_lock_cb.isChecked()
 
-    logger.info(f"Rule {rule_id} updated by {updated_by_user}, forced re-approval.")
+        exed, skp = execute_rules_bfs(
+            self.conn,
+            [rid],
+            skip_data_validation=skip_val,
+            require_lock=req_lock,
+            lock_user="ChainUser",
+            force_lock=False
+        )
+        txt = f"Chain BFS => start={rid}\nExecuted={exed}\nSkipped={list(skp)}"
+        self.result_text.setPlainText(txt)
 
 
-def delete_rule(conn, rule_id, deleted_by_user, user_group):
+class GroupSimulationDialog(QDialog):
     """
-    If global => admin only. Must be inactive => no children => no references => locked by user or admin override.
+    BFS from all rules in a selected custom group => integrated with validations & lock usage
     """
-    # check lock if not admin
-    if user_group!="Admin":
-        c=conn.cursor()
-        c.execute("""
-            SELECT LOCKED_BY
-            FROM BRM_RULE_LOCKS
-            WHERE RULE_ID=? AND ACTIVE_LOCK=1
-        """,(rule_id,))
-        lr = c.fetchone()
-        if not lr:
-            raise ValueError("Rule not locked => cannot delete.")
-        if lr[0]!=deleted_by_user:
-            raise ValueError("You do not own the lock => cannot delete rule.")
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.setWindowTitle("Group Simulation – BRM Engine")
+        self.resize(550,400)
 
-    # fetch old
-    c=conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
-    row=c.fetchone()
-    if not row:
-        raise ValueError("Rule not found.")
-    coln=[d[0] for d in c.description]
-    old_data=dict(zip(coln,row))
+        layout = QVBoxLayout(self)
 
-    if old_data["STATUS"]!="INACTIVE":
-        raise ValueError("Rule must be INACTIVE before delete.")
-    if old_data["IS_GLOBAL"]==1 and user_group!="Admin":
-        raise ValueError("Only Admin can delete global rule.")
+        top_h = QHBoxLayout()
+        top_h.addWidget(QLabel("Select Custom Group:"))
+        self.grp_combo = QComboBox()
+        c = self.conn.cursor()
+        c.execute("SELECT CUSTOM_GROUP_ID, CUSTOM_GROUP_NAME FROM BRM_CUSTOM_RULE_GROUPS ORDER BY CUSTOM_GROUP_ID")
+        for (cgid,cgn) in c.fetchall():
+            disp = f"{cgid} - {cgn}"
+            self.grp_combo.addItem(disp, cgid)
+        top_h.addWidget(self.grp_combo)
+        layout.addLayout(top_h)
 
-    # check children
-    c.execute("SELECT 1 FROM BRM_RULES WHERE PARENT_RULE_ID=? AND STATUS='ACTIVE'",(rule_id,))
-    if c.fetchone():
-        raise ValueError("Cannot delete => has active children.")
+        self.skip_val_cb = QCheckBox("Skip Data Validations?")
+        self.req_lock_cb = QCheckBox("Require Lock?")
+        layout.addWidget(self.skip_val_cb)
+        layout.addWidget(self.req_lock_cb)
 
-    # references => conflicts, custom group members, etc. You can skip or remove them
-    c.execute("DELETE FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
-    insert_audit_log(conn,"DELETE","BRM_RULES",rule_id,deleted_by_user,old_data,None)
-    conn.commit()
-    logger.info(f"Rule {rule_id} deleted by {deleted_by_user}.")
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        layout.addWidget(self.result_text)
 
+        bh = QHBoxLayout()
+        run_btn = QPushButton("Run BFS for Group")
+        run_btn.clicked.connect(self.run_group_bfs)
+        bh.addWidget(run_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        bh.addWidget(close_btn)
+        bh.addStretch()
+        layout.addLayout(bh)
 
-def force_activate_rule(conn, rule_id, user_id, user_group):
-    """
-    Force => ignore approvals => set STATUS=ACTIVE => must be admin or lock owner => skip BFS.
-    """
-    if user_group!="Admin":
-        # check lock
-        c=conn.cursor()
-        c.execute("""
-            SELECT LOCKED_BY
-            FROM BRM_RULE_LOCKS
-            WHERE RULE_ID=? AND ACTIVE_LOCK=1
-        """,(rule_id,))
-        row=c.fetchone()
-        if not row:
-            raise ValueError("Not locked => cannot force activate.")
-        if row[0]!=user_id:
-            raise ValueError(f"You do not own the lock => locked by {row[0]}.")
-    # fetch old
-    c=conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
-    ro=c.fetchone()
-    if not ro:
-        raise ValueError("Rule not found.")
-    coln=[d[0] for d in c.description]
-    old_data=dict(zip(coln, ro))
-    # if global => admin only
-    if old_data["IS_GLOBAL"]==1 and user_group!="Admin":
-        raise ValueError("Only Admin can force-activate a global rule.")
+        self.setLayout(layout)
 
-    c.execute("""
-        UPDATE BRM_RULES
-        SET STATUS='ACTIVE', APPROVAL_STATUS='FORCE_ACTIVATED',
-            LIFECYCLE_STATE='ACTIVE'
-        WHERE RULE_ID=?
-    """,(rule_id,))
-    new_data=dict(old_data)
-    new_data["STATUS"]="ACTIVE"
-    new_data["APPROVAL_STATUS"]="FORCE_ACTIVATED"
-    new_data["LIFECYCLE_STATE"]="ACTIVE"
-    insert_audit_log(conn,"FORCE_ACTIVATE","BRM_RULES",rule_id,str(user_id),old_data,new_data)
-    conn.commit()
-    logger.info(f"Rule {rule_id} forcibly activated by user {user_id} (group={user_group}).")
+    def run_group_bfs(self):
+        c = self.conn.cursor()
+        cgid = self.grp_combo.currentData()
+        c.execute("SELECT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS WHERE CUSTOM_GROUP_ID=?", (cgid,))
+        rows = c.fetchall()
+        group_rules = [r[0] for r in rows]
+
+        skip_val = self.skip_val_cb.isChecked()
+        req_lock = self.req_lock_cb.isChecked()
+
+        exed = []
+        skp = set()
+        visited = set()
+
+        # BFS from each rule => union results
+        for rid in group_rules:
+            part_ex, part_sk = execute_rules_bfs(
+                self.conn,
+                [rid],
+                skip_data_validation=skip_val,
+                require_lock=req_lock,
+                lock_user="GroupUser",
+                force_lock=False
+            )
+            for x in part_ex:
+                if x not in exed:
+                    exed.append(x)
+            for s_ in part_sk:
+                skp.add(s_)
+
+        txt = (f"Group BFS => group_id={cgid}\n"
+               f"Executed => {exed}\n"
+               f"Skipped => {list(skp)}")
+        self.result_text.setPlainText(txt)
 
 
-def force_deactivate_rule(conn, rule_id, user_id, user_group):
-    """
-    Force => set status=INACTIVE => must be admin or lock owner => skip BFS or child check
-    """
-    if user_group!="Admin":
-        # check lock
-        c=conn.cursor()
-        c.execute("""
-            SELECT LOCKED_BY
-            FROM BRM_RULE_LOCKS
-            WHERE RULE_ID=? AND ACTIVE_LOCK=1
-        """,(rule_id,))
-        row=c.fetchone()
-        if not row:
-            raise ValueError("Not locked => cannot force deactivate.")
-        if row[0]!=user_id:
-            raise ValueError(f"You do not own the lock => locked by {row[0]}.")
-    c=conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
-    ro=c.fetchone()
-    if not ro:
-        raise ValueError("Rule not found.")
-    coln=[d[0] for d in c.description]
-    old_data=dict(zip(coln, ro))
+###############################################################################
+# If run standalone test
+###############################################################################
+if __name__=="__main__":
+    from PyQt5.QtWidgets import QApplication
+    import pyodbc
 
-    # if global => admin only
-    if old_data["IS_GLOBAL"]==1 and user_group!="Admin":
-        raise ValueError("Only Admin can force-deactivate a global rule.")
+    app = QApplication(sys.argv)
+    try:
+        conn = pyodbc.connect("DSN=YourDSN;Trusted_Connection=yes;")
+    except Exception as e:
+        print("DB connect error:", e)
+        sys.exit(1)
 
-    c.execute("""
-        UPDATE BRM_RULES
-        SET STATUS='INACTIVE', LIFECYCLE_STATE='INACTIVE',
-            APPROVAL_STATUS='FORCE_DEACTIVATED'
-        WHERE RULE_ID=?
-    """,(rule_id,))
-    new_data=dict(old_data)
-    new_data["STATUS"]="INACTIVE"
-    new_data["LIFECYCLE_STATE"]="INACTIVE"
-    new_data["APPROVAL_STATUS"]="FORCE_DEACTIVATED"
-    insert_audit_log(conn,"FORCE_DEACTIVATE","BRM_RULES",rule_id,str(user_id),old_data,new_data)
-    conn.commit()
-    logger.info(f"Rule {rule_id} forcibly deactivated by {user_id}.")
+    # Let's just show SingleRuleSimulationDialog as a test
+    dlg = SingleRuleSimulationDialog(conn)
+    dlg.show()
 
-
-# ---------------------------------------------------------------------------
-# 6) MULTISTEP APPROVALS (create logic)
-# ---------------------------------------------------------------------------
-def create_multistep_approvals(conn, rule_id):
-    """
-    A placeholder that wipes out old approvals => inserts BG1 => BG2 => final. 
-    You can expand to read table dependencies (like finance => BG2, sensitive => BG3, etc.)
-    """
-    c = conn.cursor()
-    # Clear old
-    c.execute("DELETE FROM BRM_RULE_APPROVALS WHERE RULE_ID=?", (rule_id,))
-    # Suppose we do a trivial pipeline => BG1 => BG2 => final
-    # Check if user uses advanced logic => e.g. parse table references for "finance" => add BG2
-    # For demonstration, we just do a 2-stage + final
-    stage=1
-
-    # BG1 => get some user from BUSINESS_GROUP_APPROVERS
-    c2=conn.cursor()
-    c2.execute("SELECT USERNAME FROM BUSINESS_GROUP_APPROVERS WHERE GROUP_NAME='BG1'")
-    rows=c2.fetchall()
-    for (usr,) in rows:
-        c.execute("""
-            INSERT INTO BRM_RULE_APPROVALS(RULE_ID, GROUP_NAME, USERNAME, APPROVAL_STAGE, APPROVED_FLAG, APPROVED_TIMESTAMP)
-            VALUES(?,?,?, ?,0,NULL)
-        """,(rule_id, "BG1", usr, stage))
-    stage+=1
-
-    # BG2 => same approach
-    c2.execute("SELECT USERNAME FROM BUSINESS_GROUP_APPROVERS WHERE GROUP_NAME='BG2'")
-    rows2=c2.fetchall()
-    if rows2:
-        for (usr2,) in rows2:
-            c.execute("""
-                INSERT INTO BRM_RULE_APPROVALS(RULE_ID, GROUP_NAME, USERNAME, APPROVAL_STAGE, APPROVED_FLAG, APPROVED_TIMESTAMP)
-                VALUES(?,?,?, ?,0,NULL)
-            """,(rule_id, "BG2", usr2, stage))
-        stage+=1
-
-    # final
-    # we assume there's a "final_approver" placeholder
-    c.execute("""
-        INSERT INTO BRM_RULE_APPROVALS(RULE_ID, GROUP_NAME, USERNAME, APPROVAL_STAGE, APPROVED_FLAG, APPROVED_TIMESTAMP)
-        VALUES(?, 'FINAL', 'final_approver', ?, 0, NULL)
-    """,(rule_id, stage))
-    conn.commit()
-    logger.debug(f"Multi-step approvals re-created for rule {rule_id} with pipeline steps.")
-
-
-# ---------------------------------------------------------------------------
-# 7) IMPACT ANALYSIS
-# ---------------------------------------------------------------------------
-def rule_change_impact_analysis(conn, changed_rule_id):
-    """
-    BFS from changed_rule_id => list all children or referencing rules that might be impacted.
-    Return set of rule IDs impacted, excluding the original if desired.
-    """
-    impacted = gather_all_descendants(conn, changed_rule_id)
-    if changed_rule_id in impacted:
-        impacted.remove(changed_rule_id)
-    return impacted
-
-# ---------------------------------------------------------------------------
-# UTILITY: detect_operation_type
-# ---------------------------------------------------------------------------
-def detect_operation_type(sql_text):
-    """
-    Return "INSERT","UPDATE","DELETE","SELECT","OTHER" based on start of sql_text.
-    """
-    if not sql_text:
-        return "OTHER"
-    up = sql_text.strip().upper()
-    if up.startswith("INSERT"):
-        return "INSERT"
-    elif up.startswith("UPDATE"):
-        return "UPDATE"
-    elif up.startswith("DELETE"):
-        return "DELETE"
-    elif up.startswith("SELECT"):
-        return "SELECT"
-    else:
-        return "OTHER"
-
-# ---------------------------------------------------------------------------
-# UTILITY: parse_sql_dependencies (fallback if no advanced parser)
-# ---------------------------------------------------------------------------
-def parse_sql_dependencies(sql_text):
-    """
-    Very naive parse that looks for 'FROM schema.table' or 'JOIN schema.table'
-    Returns { "tables": [ (schema,table,alias,is_sub) ], ... }
-    For a real approach, rely on advanced sql parser (sqlparse).
-    """
-    # This is a minimal fallback. Adjust or import your advanced parser if needed.
-    results = []
-    lines = sql_text.split()
-    i=0
-    while i<len(lines):
-        token=lines[i].upper()
-        if token in ("FROM","JOIN","INNER","LEFT","RIGHT","FULL"):
-            # next might be table
-            # skip "JOIN" => parse next token if "JOIN"
-            # e.g. FROM dbo.Customers c
-            if token in ("INNER","LEFT","RIGHT","FULL") and i+1<len(lines):
-                nxt = lines[i+1].upper()
-                if nxt=="JOIN":
-                    i+=1
-                    token="JOIN"
-        elif token in ("FROM","JOIN"):
-            if i+1<len(lines):
-                t_part = lines[i+1]
-                # might be "dbo.Customers" or "dbo.Customers c"
-                splitted = t_part.split(".")
-                alias=None
-                schema=None
-                table_=None
-                if len(splitted)==2:
-                    schema=splitted[0]
-                    table_=splitted[1]
-                else:
-                    # no schema => assume "dbo"?
-                    schema="dbo"
-                    table_=splitted[0]
-                # next token might be alias
-                if i+2<len(lines):
-                    possible_alias=lines[i+2]
-                    # if not a keyword
-                    if possible_alias.upper() not in ("WHERE","GROUP","ORDER","JOIN","LEFT","RIGHT","FULL","INNER","UNION","INTERSECT"):
-                        alias=possible_alias
-                results.append( (schema, table_, alias, False) )
-        i+=1
-
-    return {
-        "tables": results
-    }
-
-Explanation of Key Sections
-	1.	user_has_table_permission & enforce_table_permissions_for_rule
-	•	Checks GROUP_PERMISSIONS for each table reference in the rule’s SQL. If missing, raise error.
-	2.	Data Validations
-	•	run_data_validation_for_rule scans the rule’s SQL → table references → calls run_data_validations_for_table on each.
-	•	If any fail, BFS skipping is triggered.
-	3.	BFS
-	•	Child (PARENT_RULE_ID), Global-Critical (BRM_GLOBAL_CRITICAL_LINKS), Conflicts (RULE_CONFLICTS), Composites (COMPOSITE_RULES.LOGIC_EXPR references).
-	•	execute_rules_bfs(...) collects adjacency from these sources.
-	•	On rule fail, if CRITICAL_RULE=1 or IS_GLOBAL=1, skip children.
-	4.	CRUD
-	•	add_rule: inserts record, parse dependencies, store them, set status=INACTIVE & APPROVAL_STATUS='APPROVAL_IN_PROGRESS', call create_multistep_approvals.
-	•	update_rule: must be locked by the same user or admin. Replaces dependencies, sets STATUS='INACTIVE', APPROVAL_STATUS='APPROVAL_IN_PROGRESS'.
-	•	delete_rule: must be locked, STATUS='INACTIVE', no children, if global => admin only, removes from DB.
-	•	force_activate_rule & force_deactivate_rule: skip approvals, set status. Must be admin or lock owner.
-	5.	create_multistep_approvals
-	•	Wipes old approvals, inserts new pipeline. Currently a stub for “BG1 => BG2 => final” logic. Expand as needed.
-	6.	Performance Logging
-	•	BFS uses run_single_rule_sql → measure time → store in RULE_EXECUTION_LOGS.
-	7.	Impact Analysis
-	•	rule_change_impact_analysis(...) BFS from a changed rule ID, returns set of impacted. Potentially show this in the UI.
-	8.	Fallback parse_sql_dependencies
-	•	If you want a robust approach, integrate sqlparse or your advanced parser. For demonstration, we included a simple parser to detect FROM / JOIN.
-
-⸻
-
-Usage & Integration
-	•	Imports:
-	•	You’d typically do from rule_engine import (execute_rules_bfs, add_rule, update_rule, ...) in your aggregator.
-	•	Make sure to have core_foundation.py in the same directory, so the imports (LockManager, insert_audit_log, etc.) are accessible.
-	•	DDL Requirements:
-	•	Must have these tables: BRM_RULES, BRM_RULE_TABLE_DEPENDENCIES, RULE_CONFLICTS, COMPOSITE_RULES, BRM_GLOBAL_CRITICAL_LINKS, DATA_VALIDATIONS, RULE_EXECUTION_LOGS, GROUP_PERMISSIONS, BRM_RULE_APPROVALS.
-	•	Possibly also RULE_LOCKS with columns for ephemeral locks.
-	•	See your final “no references” DDL you requested.
-	•	Data Validation:
-	•	The snippet shows a minimal “NOT NULL”, “RANGE”, “REGEX” approach. You can expand it further (like checking table_ or column_ existence).
-	•	Conflict Priority or Composite Expression**:
-	•	If you want to strictly reorder BFS by priority or interpret complex “Rule10==PASS” logic from composites, you’d expand execute_rules_bfs to reorder adjacency or skip nodes based on your logic expression. This code lays the foundation, but you can add custom behavior in execute_rules_bfs.
-
-Please respond “OK” if this Module #2 meets your needs. Next, we can produce Module #3, focusing on scheduling, real-time validations, advanced simulation dialogs, or any other desired domain.
+    sys.exit(app.exec_())
