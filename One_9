@@ -2,314 +2,344 @@
 # -*- coding: utf-8 -*-
 
 """
-Module: defect_management.py
-Description:
-  • Provides a defect logging and management system for the Advanced BRM Tool.
-  • DefectDialog: a QDialog to add or edit a single defect record.
-  • DefectManagementTab: a QWidget that displays the defect logs, allows searching,
-    adding/editing/deleting, and auto‑refreshing every 30 seconds.
-    
-Database Requirements:
-  - BRM_DEFECT_LOGS(
-       DEFECT_ID int PK, 
-       RULE_ID int NULL,
-       DESCRIPTION varchar(...), 
-       SEVERITY varchar(20),
-       REPORTER varchar(50),
-       STATUS varchar(20),  -- e.g. 'Open','In Progress','Resolved','Closed'
-       RESOLUTION varchar(...),
-       TIMESTAMP datetime
-    )
+Module: brm_defect_management.py
+
+Defect Logging and Management Module for the BRM Tool.
+This integrates seamlessly with the other modules to log, track,
+and manage defects that occur during rule authoring, BFS execution,
+data validations, or user-reported issues.
+
+Features:
+  - DefectManagementTab: displays defect logs, auto‑refresh, real‑time notifications.
+  - Create, edit, delete defect records (with confirmation).
+  - Searching/filtering by rule, description, severity, status, or reporter.
+  - Optionally, store simulation impacts or record counts if relevant.
 """
 
 import sys
+import json
 import logging
 from datetime import datetime
+from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QMessageBox, QDialog, QFormLayout, QLineEdit, QTextEdit,
-    QComboBox, QPlainTextEdit, QInputDialog, QLabel
+    QPushButton, QMessageBox, QDialog, QLineEdit, QTextEdit, QComboBox, 
+    QInputDialog, QPlainTextEdit, QLabel
 )
-from core_foundation import logger, insert_audit_log
 
+# Suppose from brm_core_foundation we have:
+from brm_core_foundation import (
+    logger, fetch_all_dict, fetch_one_dict
+)
+
+# ---------------------------------------------------------------------------
+# Database helper to add a defect log
+# ---------------------------------------------------------------------------
 def add_defect_log(conn, rule_id, description, severity, reporter, status="Open", resolution=None):
     """
-    Inserts a row into BRM_DEFECT_LOGS with the given details.
+    Insert a defect log record into BRM_DEFECT_LOGS table.
+    Columns might be:
+      - DEFECT_ID (PK identity)
+      - RULE_ID (int, nullable)
+      - DESCRIPTION (text)
+      - SEVERITY (varchar: Low, Medium, High, Critical)
+      - REPORTER (varchar)
+      - STATUS (varchar: Open, In Progress, Resolved, Closed, etc.)
+      - RESOLUTION (text, nullable)
+      - TIMESTAMP (datetime)
     """
-    c = conn.cursor()
     try:
+        c = conn.cursor()
         c.execute("""
-            INSERT INTO BRM_DEFECT_LOGS(RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION, TIMESTAMP)
+            INSERT INTO BRM_DEFECT_LOGS(
+                RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION, TIMESTAMP
+            )
             VALUES(?,?,?,?,?,?,GETDATE())
         """,(rule_id, description, severity, reporter, status, resolution))
         conn.commit()
-        logger.info(f"Defect log added for rule {rule_id} by {reporter}.")
-        insert_audit_log(conn, "ADD_DEFECT","BRM_DEFECT_LOGS", None, reporter, None,
-                         {"rule_id":rule_id, "desc":description, "severity":severity})
+        logger.info(f"Defect log added for rule {rule_id}, reported by {reporter}.")
     except Exception as ex:
-        logger.error(f"Error adding defect log for rule {rule_id}: {ex}")
+        logger.error(f"Error adding defect log: {ex}")
         raise
 
-# -----------------------------------------------------------------------------
-# 1. DefectDialog – QDialog to add/edit a defect
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DefectDialog for add/edit
+# ---------------------------------------------------------------------------
 class DefectDialog(QDialog):
     """
-    A dialog for adding or editing a defect record. 
-    If defect_data is provided, we load it for editing.
+    A dialog for adding or editing an existing defect record.
+    If defect_data is None, we create a new one. Otherwise, we edit.
     """
     def __init__(self, connection, defect_data=None, parent=None):
         super().__init__(parent)
-        self.connection = connection
-        self.defect_data = defect_data
-        self.setWindowTitle("Edit Defect" if defect_data else "Add New Defect")
+        self.connection=connection
+        self.defect_data=defect_data
+        self.is_edit=(defect_data is not None)
+        self.init_ui()
+
+    def init_ui(self):
+        title="Edit Defect" if self.is_edit else "Add Defect"
+        self.setWindowTitle(title)
         self.resize(500,400)
 
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
+        layout=QVBoxLayout(self)
 
-        self.rule_id_edit = QLineEdit()
-        self.rule_id_edit.setPlaceholderText("Optional: Rule ID")
-        form.addRow("Rule ID:", self.rule_id_edit)
+        form_layout=QtWidgets.QFormLayout()
+        self.rule_id_edit=QLineEdit()
+        self.rule_id_edit.setPlaceholderText("Optional rule ID")
+        form_layout.addRow("Rule ID:", self.rule_id_edit)
 
-        self.description_edit = QTextEdit()
-        form.addRow("Description:", self.description_edit)
+        self.desc_edit=QTextEdit()
+        form_layout.addRow("Description:", self.desc_edit)
 
-        self.severity_combo = QComboBox()
+        self.severity_combo=QComboBox()
         self.severity_combo.addItems(["Low","Medium","High","Critical"])
-        form.addRow("Severity:", self.severity_combo)
+        form_layout.addRow("Severity:", self.severity_combo)
 
-        self.reporter_edit = QLineEdit()
-        form.addRow("Reporter:", self.reporter_edit)
+        self.reporter_edit=QLineEdit()
+        form_layout.addRow("Reporter:", self.reporter_edit)
 
-        self.status_combo = QComboBox()
+        self.status_combo=QComboBox()
         self.status_combo.addItems(["Open","In Progress","Resolved","Closed"])
-        form.addRow("Status:", self.status_combo)
+        form_layout.addRow("Status:", self.status_combo)
 
-        self.resolution_edit = QTextEdit()
-        form.addRow("Resolution:", self.resolution_edit)
+        self.resolution_edit=QTextEdit()
+        form_layout.addRow("Resolution:", self.resolution_edit)
 
-        layout.addLayout(form)
+        layout.addLayout(form_layout)
 
-        btn_h = QHBoxLayout()
-        save_btn = QPushButton("Save")
+        bh=QHBoxLayout()
+        save_btn=QPushButton("Save")
         save_btn.clicked.connect(self.save_defect)
-        btn_h.addWidget(save_btn)
-        cancel_btn = QPushButton("Cancel")
+        bh.addWidget(save_btn)
+        cancel_btn=QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        btn_h.addWidget(cancel_btn)
-        layout.addLayout(btn_h)
-        self.setLayout(layout)
+        bh.addWidget(cancel_btn)
+        layout.addLayout(bh)
 
-        if self.defect_data:
+        if self.is_edit and self.defect_data:
             self.load_existing_data()
 
+        self.setLayout(layout)
+
     def load_existing_data(self):
-        """
-        Populate dialog fields with the existing defect data.
-        """
-        self.rule_id_edit.setText(str(self.defect_data.get("RULE_ID","")))
-        self.description_edit.setPlainText(self.defect_data.get("DESCRIPTION",""))
-        sev = self.defect_data.get("SEVERITY","Low")
-        idx = self.severity_combo.findText(sev, Qt.MatchFixedString)
-        if idx>=0:
-            self.severity_combo.setCurrentIndex(idx)
-        self.reporter_edit.setText(self.defect_data.get("REPORTER",""))
-        st = self.defect_data.get("STATUS","Open")
-        idx2 = self.status_combo.findText(st, Qt.MatchFixedString)
-        if idx2>=0:
-            self.status_combo.setCurrentIndex(idx2)
-        self.resolution_edit.setPlainText(self.defect_data.get("RESOLUTION",""))
+        d=self.defect_data
+        if d.get("RULE_ID"):
+            self.rule_id_edit.setText(str(d["RULE_ID"]))
+        self.desc_edit.setPlainText(d.get("DESCRIPTION",""))
+        sev=d.get("SEVERITY","Low")
+        idx_s=self.severity_combo.findText(sev, Qt.MatchFixedString)
+        if idx_s>=0:
+            self.severity_combo.setCurrentIndex(idx_s)
+        self.reporter_edit.setText(d.get("REPORTER",""))
+        st=d.get("STATUS","Open")
+        idx_st=self.status_combo.findText(st, Qt.MatchFixedString)
+        if idx_st>=0:
+            self.status_combo.setCurrentIndex(idx_st)
+        self.resolution_edit.setPlainText(d.get("RESOLUTION",""))
 
     def save_defect(self):
-        """
-        Insert or update the defect in DB, then close if successful.
-        """
         try:
-            rule_id_text = self.rule_id_edit.text().strip()
-            rule_id = int(rule_id_text) if rule_id_text else None
-        except ValueError:
-            QMessageBox.warning(self, "Input Error", "Rule ID must be an integer or blank.")
+            rule_id_text=self.rule_id_edit.text().strip()
+            rule_id=None
+            if rule_id_text:
+                rule_id=int(rule_id_text)
+        except:
+            QMessageBox.warning(self,"Error","Rule ID must be integer or blank.")
             return
-
-        description = self.description_edit.toPlainText().strip()
+        description=self.desc_edit.toPlainText().strip()
         if not description:
-            QMessageBox.warning(self, "Input Error", "Description is required.")
+            QMessageBox.warning(self,"Error","Description is required.")
             return
-        severity = self.severity_combo.currentText()
-        reporter = self.reporter_edit.text().strip()
+        severity=self.severity_combo.currentText()
+        reporter=self.reporter_edit.text().strip()
         if not reporter:
-            QMessageBox.warning(self, "Input Error", "Reporter is required.")
+            QMessageBox.warning(self,"Error","Reporter is required.")
             return
-        status = self.status_combo.currentText()
-        resolution = self.resolution_edit.toPlainText().strip() or None
+        status_=self.status_combo.currentText()
+        resolution=self.resolution_edit.toPlainText().strip() or None
 
-        c = self.connection.cursor()
-        if self.defect_data:
-            # update
-            defect_id = self.defect_data["DEFECT_ID"]
+        c=self.connection.cursor()
+        if self.is_edit and self.defect_data:
+            defect_id=self.defect_data["DEFECT_ID"]
             try:
                 c.execute("""
                     UPDATE BRM_DEFECT_LOGS
                     SET RULE_ID=?, DESCRIPTION=?, SEVERITY=?, REPORTER=?,
                         STATUS=?, RESOLUTION=?, TIMESTAMP=GETDATE()
                     WHERE DEFECT_ID=?
-                """,(rule_id, description, severity, reporter, status, resolution, defect_id))
-                c.connection.commit()
+                """,(rule_id, description, severity, reporter, status_, resolution, defect_id))
+                self.connection.commit()
                 logger.info(f"Defect {defect_id} updated by {reporter}.")
-                insert_audit_log(self.connection, "UPDATE_DEFECT","BRM_DEFECT_LOGS", defect_id, reporter,
-                                 None, {"desc":description,"status":status})
             except Exception as ex:
                 logger.error(f"Error updating defect {defect_id}: {ex}")
-                QMessageBox.critical(self, "Error", str(ex))
+                QMessageBox.critical(self,"Error",str(ex))
                 return
         else:
             # add new
             try:
-                add_defect_log(self.connection, rule_id, description, severity, reporter, status, resolution)
+                add_defect_log(self.connection, rule_id, description, severity, reporter, status_, resolution)
             except Exception as ex:
-                QMessageBox.critical(self, "Error", str(ex))
+                QMessageBox.critical(self,"Error",str(ex))
                 return
 
         self.accept()
 
-# -----------------------------------------------------------------------------
-# 2. DefectManagementTab – main UI for listing/managing defects
-# -----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# DefectManagementTab UI
+# ---------------------------------------------------------------------------
 class DefectManagementTab(QWidget):
     """
-    A tab that displays a table of BRM_DEFECT_LOGS, supports searching, adding,
-    editing, deleting, and auto-refresh every 30 seconds.
+    Main UI for defect logs:
+      - table with columns
+      - auto refresh every 30s
+      - new defects => real-time notification
+      - add, edit, delete
+      - search filter
     """
     def __init__(self, connection, parent=None):
         super().__init__(parent)
-        self.connection = connection
-        self.last_defect_count = 0
-        layout = QVBoxLayout(self)
+        self.connection=connection
+        self.last_defect_count=0  # used to detect new defects
+        self.init_ui()
+        self.load_defects()
+        self.start_auto_refresh()
 
-        self.notification_label = QLabel("")
-        self.notification_label.setStyleSheet("color: green; font-weight:bold;")
-        layout.addWidget(self.notification_label)
+    def init_ui(self):
+        layout=QVBoxLayout(self)
 
-        top_h = QHBoxLayout()
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search defects...")
+        # top row: search
+        top_h=QHBoxLayout()
+        self.search_edit=QLineEdit()
+        self.search_edit.setPlaceholderText("Search by description, severity, reporter, or status...")
         self.search_edit.textChanged.connect(self.search_defects)
         top_h.addWidget(QLabel("Search:"))
         top_h.addWidget(self.search_edit)
         layout.addLayout(top_h)
 
-        self.defect_table = QTableWidget(0,7)
+        self.defect_table=QTableWidget(0,7)
         self.defect_table.setHorizontalHeaderLabels([
-            "Defect ID","Rule ID","Description","Severity","Reporter","Status","Timestamp"
+            "DefectID","RuleID","Description","Severity","Reporter","Status","Timestamp"
         ])
         self.defect_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.defect_table)
 
-        btn_h = QHBoxLayout()
-        add_btn = QPushButton("Add Defect")
+        # bottom row => add/edit/del + refresh
+        btn_h=QHBoxLayout()
+        add_btn=QPushButton("Add Defect")
         add_btn.clicked.connect(self.add_defect)
         btn_h.addWidget(add_btn)
-
-        edit_btn = QPushButton("Edit Defect")
+        edit_btn=QPushButton("Edit Defect")
         edit_btn.clicked.connect(self.edit_defect)
         btn_h.addWidget(edit_btn)
-
-        del_btn = QPushButton("Delete Defect")
+        del_btn=QPushButton("Delete Defect")
         del_btn.clicked.connect(self.delete_defect)
         btn_h.addWidget(del_btn)
-
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.load_defects)
-        btn_h.addWidget(refresh_btn)
+        ref_btn=QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_defects)
+        btn_h.addWidget(ref_btn)
         btn_h.addStretch()
         layout.addLayout(btn_h)
 
+        # notification label
+        self.notification_label=QLabel("")
+        self.notification_label.setStyleSheet("color: green; font-weight: bold;")
+        layout.addWidget(self.notification_label)
+
         self.setLayout(layout)
-        # auto-refresh
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.timeout.connect(self.auto_refresh)
-        self.refresh_timer.start(30000)
-        self.load_defects()
 
     def load_defects(self):
         self.defect_table.setRowCount(0)
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP
-                FROM BRM_DEFECT_LOGS
-                ORDER BY TIMESTAMP DESC
-            """)
-            rows = c.fetchall()
-            curr_count = len(rows)
-            for row in rows:
-                r_i = self.defect_table.rowCount()
-                self.defect_table.insertRow(r_i)
-                for col_i, val in enumerate(row):
-                    self.defect_table.setItem(r_i, col_i, QTableWidgetItem(str(val) if val else ""))
-            if self.last_defect_count and curr_count>self.last_defect_count:
-                new_count = curr_count - self.last_defect_count
-                self.notification_label.setText(f"{new_count} new defect(s) logged.")
-                QtCore.QTimer.singleShot(5000, lambda: self.notification_label.setText(""))
-            self.last_defect_count = curr_count
-        except Exception as ex:
-            logger.error(f"Error loading defects: {ex}")
-            QMessageBox.critical(self, "Error", str(ex))
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP
+            FROM BRM_DEFECT_LOGS
+            ORDER BY TIMESTAMP DESC
+        """)
+        rows=c.fetchall()
+        current_count=len(rows)
+        for row in rows:
+            r_i=self.defect_table.rowCount()
+            self.defect_table.insertRow(r_i)
+            for col_i,val in enumerate(row):
+                self.defect_table.setItem(r_i,col_i,QTableWidgetItem(str(val) if val else ""))
+
+        # if new defects were added
+        if self.last_defect_count and current_count>self.last_defect_count:
+            new_ct=current_count-self.last_defect_count
+            self.notification_label.setText(f"{new_ct} new defect(s) logged.")
+            QtCore.QTimer.singleShot(5000, lambda: self.notification_label.setText(""))
+        self.last_defect_count=current_count
+
+        self.defect_table.resizeColumnsToContents()
 
     def search_defects(self, text):
-        text_lower = text.lower().strip()
+        txt=text.lower().strip()
         for row in range(self.defect_table.rowCount()):
-            visible = False
+            row_visible=False
             for col in range(self.defect_table.columnCount()):
-                item = self.defect_table.item(row, col)
-                if item and text_lower in item.text().lower():
-                    visible = True
+                it=self.defect_table.item(row,col)
+                if it and txt in it.text().lower():
+                    row_visible=True
                     break
-            self.defect_table.setRowHidden(row, not visible)
+            self.defect_table.setRowHidden(row, not row_visible)
 
-    def auto_refresh(self):
-        self.load_defects()
+    def start_auto_refresh(self):
+        self.refresh_timer=QTimer(self)
+        self.refresh_timer.timeout.connect(self.load_defects)
+        self.refresh_timer.start(30000)  # every 30s
+
+    def get_selected_defect_id(self):
+        row=self.defect_table.currentRow()
+        if row<0:
+            return None
+        it=self.defect_table.item(row,0)
+        if not it:
+            return None
+        return int(it.text())
 
     def add_defect(self):
-        dlg = DefectDialog(self.connection)
+        dlg=DefectDialog(self.connection, None, self)
         if dlg.exec_()==QDialog.Accepted:
             self.load_defects()
 
     def edit_defect(self):
-        row = self.defect_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "No Selection", "Select a defect to edit.")
+        did=self.get_selected_defect_id()
+        if not did:
+            QMessageBox.warning(self,"None","No defect selected.")
             return
-        defect_data = {
-            "DEFECT_ID": int(self.defect_table.item(row,0).text()),
-            "RULE_ID": self.defect_table.item(row,1).text(),
-            "DESCRIPTION": self.defect_table.item(row,2).text(),
-            "SEVERITY": self.defect_table.item(row,3).text(),
-            "REPORTER": self.defect_table.item(row,4).text(),
-            "STATUS": self.defect_table.item(row,5).text(),
-            "TIMESTAMP": self.defect_table.item(row,6).text()
-        }
-        dlg = DefectDialog(self.connection, defect_data=defect_data)
+        # fetch
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION
+            FROM BRM_DEFECT_LOGS
+            WHERE DEFECT_ID=?
+        """,(did,))
+        row=c.fetchone()
+        if not row:
+            QMessageBox.warning(self,"Not Found",f"No defect ID {did}")
+            return
+        colnames=[desc[0] for desc in c.description]
+        d_data=dict(zip(colnames,row))
+        dlg=DefectDialog(self.connection, d_data, self)
         if dlg.exec_()==QDialog.Accepted:
             self.load_defects()
 
     def delete_defect(self):
-        row = self.defect_table.currentRow()
-        if row<0:
-            QMessageBox.warning(self, "No Selection", "Select a defect to delete.")
+        did=self.get_selected_defect_id()
+        if not did:
+            QMessageBox.warning(self,"None","No defect selected.")
             return
-        defect_id = int(self.defect_table.item(row,0).text())
-        confirm = QMessageBox.question(self, "Confirm", f"Delete defect ID {defect_id}?")
+        confirm=QMessageBox.question(self,"Confirm",f"Delete defect {did}?")
         if confirm!=QMessageBox.Yes:
             return
-        c = self.connection.cursor()
         try:
-            c.execute("DELETE FROM BRM_DEFECT_LOGS WHERE DEFECT_ID=?", (defect_id,))
-            c.connection.commit()
-            QMessageBox.information(self, "Deleted", f"Defect {defect_id} deleted.")
+            c=self.connection.cursor()
+            c.execute("DELETE FROM BRM_DEFECT_LOGS WHERE DEFECT_ID=?",(did,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted",f"Defect {did} removed.")
             self.load_defects()
         except Exception as ex:
-            logger.error(f"Error deleting defect {defect_id}: {ex}")
-            QMessageBox.critical(self, "Error", str(ex))
+            QMessageBox.critical(self,"Error",str(ex))
