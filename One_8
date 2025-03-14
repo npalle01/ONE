@@ -1,296 +1,392 @@
+Below is Module #8: defect_management.py, which introduces a Defect Logging and Management capability. This includes:
+	•	A “DefectManagementTab” (or “DefectManagementWidget”) that:
+	•	Displays existing defect logs in a QTableWidget.
+	•	Auto‑refreshes (e.g. every 30 seconds) and notifies the user if new defects appear.
+	•	Allows the user to add, edit, and delete defect records.
+	•	Optionally includes a search feature that filters by description, status, severity, etc.
+	•	A DefectDialog for adding/editing a defect (with fields such as rule ID, description, severity, reporter, status, resolution, etc.).
+	•	Minimal or no placeholders. We assume you have a table named BRM_DEFECT_LOGS with columns:
+
+DEFECT_ID       (primary key identity),
+RULE_ID         (int, nullable),
+DESCRIPTION     (text or varchar),
+SEVERITY        (varchar, e.g. "Low"/"Medium"/"High"/"Critical"),
+REPORTER        (varchar),
+STATUS          (varchar, e.g. "Open"/"In Progress"/"Resolved"/"Closed"),
+RESOLUTION      (text or varchar, optional),
+TIMESTAMP       (datetime),
+...
+
+You can adapt fields as needed.
+
+Below is the fully functional code for Module #8: defect_management.py.
+
+⸻
+
+Module #8: defect_management.py
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
-Module: brm_tool_main.py
-Description:
-  The main integrator for the Advanced BRM Tool, bringing together:
-    • Database connection / login (from core_foundation)
-    • Simulation, scheduling (from simulation_scheduler, advanced_simulation)
-    • Advanced lineage visualization (from advanced_lineage)
-    • Multi-step approvals & global/critical admin (from advanced_approvals_and_lineage)
-    • Metrics, performance dashboards, control tables, group/user management (from metrics_and_control_management)
-    • Custom rule groups & alerts (from custom_rule_groups_and_alerts)
-    • Decision tables (from advanced_lineage.py or advanced_decision_tables.py)
-    • SQL→Business converter
-    • Defect management
+Module: defect_management.py
 
-All references to classes or functions match the modules as previously implemented.
+Defect Logging and Management Module for the BRM Tool.
+This module integrates seamlessly with the other modules and provides robust
+functionality for logging, tracking, and managing defects.
+
+Key Features:
+  • Viewing defect logs in a table with auto‑refresh every 30 seconds.
+  • Real‑time notifications (a status label or ephemeral text) when new defects are added.
+  • Adding, editing, and deleting defect records in the BRM_DEFECT_LOGS table.
+  • Searching defects by rule, description, severity, status, etc.
+  • Detailed logging of defect changes (can integrate with your `insert_audit_log` if desired).
+  • Full integration with other BRM modules (e.g. referencing `RULE_ID` or BFS data).
 """
 
 import sys
 import logging
+import json
+from datetime import datetime
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
-    QComboBox, QPushButton, QLabel, QMessageBox, QAction
-)
-from PyQt5.QtCore import QTimer
-
-# Import from core foundation
-from core_foundation import (
-    DatabaseConnectionDialog, LoginDialog, logger
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
+    QPushButton, QMessageBox, QDialog, QLineEdit, QTextEdit, QComboBox,
+    QPlainTextEdit, QInputDialog, QLabel
 )
 
-# Scheduling & Simulation
-from simulation_scheduler import (
-    SingleRuleSimulationDialog, ChainSimulationDialog,
-    ScheduleManagementTab, check_due_schedules
-)
-
-# Advanced simulation (forking BFS or advanced logs)
-from advanced_simulation import (
-    AdvancedSimulationEngine, SimulationManagerWidget, MultiRuleForkDialog
-)
-
-# Advanced lineage + decision tables
-from advanced_lineage import (
-    AdvancedLineageGraphView, DecisionTableManager
-)
-
-# Approvals & hierarchy
-from advanced_approvals_and_lineage import (
-    MultiStepApprovalTab, GlobalCriticalAdminTab, HierarchyViewTab
-)
-
-# Metrics & control mgmt
-from metrics_and_control_management import (
-    DashboardCardsTab, PerformanceTrendsTab, ControlTablesTab,
-    GroupManagementTab, UserManagementTab
-)
-
-# Custom rule groups & alerts
-from custom_rule_groups_and_alerts import (
-    CustomRuleGroupEnhancedTab, AlertsAndDashboardsTab
-)
-
-# If you have advanced_decision_tables as a separate module:
-from advanced_decision_tables import AdvancedDecisionTablesTab
-
-# Defect management
-from defect_management import DefectManagementTab
-
-# SQL→Business converter
-from sql_to_business_converter import SqlToBusinessLanguageConverterTab
+# from core_foundation import logger, fetch_one_dict, fetch_all_dict, insert_audit_log
+# from advanced_simulation import run_single_rule_transaction # only if needed
 
 
-class BRMTool(QMainWindow):
+###############################################################################
+# DEFECT DIALOG
+###############################################################################
+class DefectDialog(QDialog):
     """
-    Main window for the advanced BRM Tool, pulling together all tabs 
-    and referencing the correct modules (no placeholders).
+    A dialog for adding or editing a defect record.
+    If `defect_data` is provided => editing; else => adding new.
+    We store fields like (RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION).
     """
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Advanced BRM Tool – Production Ready")
-        self.resize(1400,900)
-
-        self.connection = None
-        self.user_id = None
-        self.logged_in_username = None
-        self.user_group = None
-
-        # Step 1: Database Connection
-        db_dialog = DatabaseConnectionDialog()
-        if db_dialog.exec_() == db_dialog.Accepted:
-            self.connection = db_dialog.get_connection()
-            if not self.connection:
-                sys.exit(1)
-        else:
-            sys.exit(0)
-
-        # Step 2: Login
-        login_dialog = LoginDialog(self.connection)
-        if login_dialog.exec_() != login_dialog.Accepted:
-            sys.exit(0)
-        self.user_id = login_dialog.user_id
-        self.user_group = login_dialog.user_group
-
-        c = self.connection.cursor()
-        c.execute("SELECT USERNAME FROM USERS WHERE USER_ID=?", (self.user_id,))
-        row = c.fetchone()
-        if row:
-            self.logged_in_username = row[0]
-        else:
-            self.logged_in_username = "UnknownUser"
-
+    def __init__(self, connection, defect_data=None, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.defect_data = defect_data
+        self.is_edit = bool(defect_data)
         self.init_ui()
-        self.apply_modern_theme()
 
     def init_ui(self):
-        menubar = self.menuBar()
+        self.setWindowTitle("Edit Defect" if self.is_edit else "Add Defect")
+        self.resize(480, 350)
+        layout = QVBoxLayout(self)
 
-        # File menu
-        file_menu = menubar.addMenu("File")
-        sync_action = QAction("Sync Metadata", self)
-        sync_action.triggered.connect(self.sync_metadata)
-        file_menu.addAction(sync_action)
+        form_lay = QtWidgets.QFormLayout()
 
-        data_val_action = QAction("Run Data Validations", self)
-        data_val_action.triggered.connect(self.run_data_validations)
-        file_menu.addAction(data_val_action)
+        self.rule_id_edit = QLineEdit()
+        self.rule_id_edit.setPlaceholderText("Optional Rule ID (int)")
+        form_lay.addRow("Rule ID:", self.rule_id_edit)
 
-        # Tools menu
-        tools_menu = menubar.addMenu("Tools")
-        chain_sim_action = QAction("Chain Simulation", self)
-        chain_sim_action.triggered.connect(self.open_chain_simulation)
-        tools_menu.addAction(chain_sim_action)
+        self.description_edit = QTextEdit()
+        form_lay.addRow("Description:", self.description_edit)
 
-        fork_sim_action = QAction("Forking Simulation", self)
-        fork_sim_action.triggered.connect(self.open_fork_simulation)
-        tools_menu.addAction(fork_sim_action)
+        self.severity_combo = QComboBox()
+        self.severity_combo.addItems(["Low","Medium","High","Critical"])
+        form_lay.addRow("Severity:", self.severity_combo)
 
-        single_sim_action = QAction("Single Rule Simulation", self)
-        single_sim_action.triggered.connect(self.open_single_simulation)
-        tools_menu.addAction(single_sim_action)
+        self.reporter_edit = QLineEdit()
+        form_lay.addRow("Reporter:", self.reporter_edit)
 
-        # Help menu
-        help_menu = menubar.addMenu("Help")
-        help_action = QAction("Show Help", self)
-        help_action.triggered.connect(self.show_help)
-        help_menu.addAction(help_action)
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["Open","In Progress","Resolved","Closed"])
+        form_lay.addRow("Status:", self.status_combo)
 
-        # Central widget
-        central_widget = QWidget()
-        central_layout = QVBoxLayout(central_widget)
+        self.resolution_edit = QTextEdit()
+        form_lay.addRow("Resolution:", self.resolution_edit)
 
-        # Dashboard Cards
-        self.dashboard_cards = DashboardCardsTab(self.connection)
-        central_layout.addWidget(self.dashboard_cards)
+        layout.addLayout(form_lay)
 
-        self.main_tabs = QTabWidget()
-        central_layout.addWidget(self.main_tabs)
+        bh = QHBoxLayout()
+        self.save_btn = QPushButton("Save")
+        self.save_btn.clicked.connect(self.save_defect)
+        bh.addWidget(self.save_btn)
 
-        # Approvals
-        approvals_tab = MultiStepApprovalTab(self.connection, self.logged_in_username, self.user_group)
-        self.main_tabs.addTab(approvals_tab, "Approvals")
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        bh.addWidget(cancel_btn)
 
-        # Global/Critical Admin (if admin)
-        if self.user_group=="Admin":
-            gcr_tab = GlobalCriticalAdminTab(self.connection, self.user_group)
-            self.main_tabs.addTab(gcr_tab, "Global/Critical Admin")
+        layout.addLayout(bh)
 
-        # Hierarchy
-        hier_tab = HierarchyViewTab(self.connection)
-        self.main_tabs.addTab(hier_tab, "Hierarchy")
+        if self.is_edit:
+            self.load_defect_data()
 
-        # Advanced lineage
-        lineage_container = QWidget()
-        lv_layout = QVBoxLayout(lineage_container)
-        lv_layout.addWidget(QLabel("Advanced Lineage Visualization"))
-        self.lineage_view = AdvancedLineageGraphView(self.connection)
-        lv_layout.addWidget(self.lineage_view)
-        lineage_container.setLayout(lv_layout)
-        self.main_tabs.addTab(lineage_container, "Lineage")
-
-        # Custom groups
-        custom_group_tab = CustomRuleGroupEnhancedTab(self.connection, self.user_id, self.user_group)
-        self.main_tabs.addTab(custom_group_tab, "Custom Groups")
-
-        # Alerts & dashboards
-        alerts_tab = AlertsAndDashboardsTab(self.connection, self.user_id, self.user_group)
-        self.main_tabs.addTab(alerts_tab, "Alerts & Dashboards")
-
-        # Scheduling
-        scheduling_tab = ScheduleManagementTab(self.connection)
-        self.main_tabs.addTab(scheduling_tab, "Scheduling")
-
-        # Control Tables
-        ctrl_tab = ControlTablesTab(self.connection)
-        self.main_tabs.addTab(ctrl_tab, "Control Tables")
-
-        # Performance trends
-        perf_tab = PerformanceTrendsTab(self.connection)
-        self.main_tabs.addTab(perf_tab, "Performance Trends")
-
-        # Group & user mgmt if admin
-        if self.user_group=="Admin":
-            group_mgmt_tab = GroupManagementTab(self.connection, self.user_id, self.user_group)
-            self.main_tabs.addTab(group_mgmt_tab, "Group Management")
-
-            user_mgmt_tab = UserManagementTab(self.connection)
-            self.main_tabs.addTab(user_mgmt_tab, "User Management")
-
-        # Decision tables (advanced)
-        adv_dt_tab = AdvancedDecisionTablesTab(self.connection)
-        self.main_tabs.addTab(adv_dt_tab, "Adv Decision Tables")
-
-        # Defect management
-        defect_tab = DefectManagementTab(self.connection)
-        self.main_tabs.addTab(defect_tab, "Defects")
-
-        # Simulation Manager (advanced logs)
-        sim_manager = SimulationManagerWidget(self.connection)
-        self.main_tabs.addTab(sim_manager, "Simulation Manager")
-
-        # SQL -> Business Converter
-        sql2biz_tab = SqlToBusinessLanguageConverterTab(self.connection)
-        self.main_tabs.addTab(sql2biz_tab, "SQL→Business")
-
-        self.setCentralWidget(central_widget)
-
-        # Timers for approvals, schedules, etc.
-        self.approvals_timer = QTimer(self)
-        self.approvals_timer.timeout.connect(approvals_tab.load_approvals)
-        self.approvals_timer.start(5000)
-
-        self.schedule_timer = QTimer(self)
-        self.schedule_timer.timeout.connect(lambda: self.check_schedules(scheduling_tab))
-        self.schedule_timer.start(60000)
-
-    def apply_modern_theme(self):
+    def load_defect_data(self):
         """
-        Apply a modern style sheet for a Material/flat aesthetic.
+        Populate the UI from self.defect_data.
         """
-        self.setStyleSheet("""
-            QMainWindow { background-color: #FAFAFA; }
-            QTabWidget::pane { border: 1px solid #CCC; }
-            QPushButton {
-                background-color: #0078D7; color: white;
-                padding: 6px; border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #005A9E; }
-            QLabel { font-family: "Segoe UI"; }
-            QTableWidget, QTreeWidget, QPlainTextEdit {
-                font-family: "Segoe UI"; background: #FFFFFF;
-            }
-            QToolTip { background-color: #333; color: #EEE; }
-        """)
-
-    def sync_metadata(self):
-        QMessageBox.information(self, "Sync Metadata", "Metadata sync completed (stub).")
-
-    def run_data_validations(self):
-        QMessageBox.information(self, "Data Validations", "Data validations triggered (stub).")
-
-    def open_chain_simulation(self):
-        dlg = ChainSimulationDialog(self.connection, self)
-        dlg.exec_()
-
-    def open_fork_simulation(self):
-        dlg = MultiRuleForkDialog(self.connection, self)
-        dlg.exec_()
-
-    def open_single_simulation(self):
-        rule_id, ok = QInputDialog.getInt(self, "Single Simulation", "Enter rule ID:")
-        if not ok:
+        if not self.defect_data:
             return
-        dlg = SingleRuleSimulationDialog(self.connection, rule_id, self)
-        dlg.exec_()
+        rule_id = self.defect_data.get("RULE_ID")
+        if rule_id:
+            self.rule_id_edit.setText(str(rule_id))
+        desc = self.defect_data.get("DESCRIPTION","")
+        self.description_edit.setText(desc)
+        sev = self.defect_data.get("SEVERITY","Low")
+        idx = self.severity_combo.findText(sev, Qt.MatchFixedString)
+        if idx>=0:
+            self.severity_combo.setCurrentIndex(idx)
+        rep = self.defect_data.get("REPORTER","")
+        self.reporter_edit.setText(rep)
+        st = self.defect_data.get("STATUS","Open")
+        idx2 = self.status_combo.findText(st, Qt.MatchFixedString)
+        if idx2>=0:
+            self.status_combo.setCurrentIndex(idx2)
+        reso = self.defect_data.get("RESOLUTION","")
+        self.resolution_edit.setText(reso)
 
-    def check_schedules(self, scheduling_tab):
-        check_due_schedules(self.connection)
-        scheduling_tab.load_schedules()
+    def save_defect(self):
+        # gather
+        rid_str=self.rule_id_edit.text().strip()
+        try:
+            rule_id=int(rid_str) if rid_str else None
+        except:
+            QMessageBox.warning(self,"Input Error","Rule ID must be integer or blank.")
+            return
+        desc = self.description_edit.toPlainText().strip()
+        if not desc:
+            QMessageBox.warning(self,"Input Error","Description is required.")
+            return
+        sev = self.severity_combo.currentText()
+        rep = self.reporter_edit.text().strip()
+        if not rep:
+            QMessageBox.warning(self,"Input Error","Reporter is required.")
+            return
+        st = self.status_combo.currentText()
+        reso = self.resolution_edit.toPlainText().strip() or None
 
-    def show_help(self):
-        QMessageBox.information(self, "Help", "Advanced BRM Tool user guide is not yet written, stay tuned.")
+        c = self.connection.cursor()
+        if self.is_edit:
+            defect_id = self.defect_data["DEFECT_ID"]
+            try:
+                c.execute("""
+                    UPDATE BRM_DEFECT_LOGS
+                    SET RULE_ID=?, DESCRIPTION=?, SEVERITY=?, REPORTER=?,
+                        STATUS=?, RESOLUTION=?, TIMESTAMP=GETDATE()
+                    WHERE DEFECT_ID=?
+                """,(rule_id, desc, sev, rep, st, reso, defect_id))
+                self.connection.commit()
+                # insert_audit_log(...) if you want
+                self.accept()
+            except Exception as ex:
+                QMessageBox.critical(self,"Error",str(ex))
+        else:
+            # insert
+            try:
+                c.execute("""
+                    INSERT INTO BRM_DEFECT_LOGS(
+                        RULE_ID, DESCRIPTION, SEVERITY, REPORTER,
+                        STATUS, RESOLUTION, TIMESTAMP
+                    )
+                    VALUES (?,?,?,?,?,?,GETDATE())
+                """,(rule_id, desc, sev, rep, st, reso))
+                self.connection.commit()
+                # insert_audit_log(...) if you want
+                self.accept()
+            except Exception as ex:
+                QMessageBox.critical(self,"Error",str(ex))
 
-    def closeEvent(self, event):
-        if self.connection:
-            self.connection.close()
-        event.accept()
 
+###############################################################################
+# DEFECT MANAGEMENT TAB
+###############################################################################
+class DefectManagementTab(QWidget):
+    """
+    This tab shows a table of defects from BRM_DEFECT_LOGS, with columns
+      (DefectID, RuleID, Description, Severity, Reporter, Status, Timestamp)
+    It auto-refreshes every 30s and notifies the user if the defect count increases.
+    Allows searching, adding, editing, and deleting defects.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.last_defect_count = 0  # track changes to notify new defects
+        self.init_ui()
+        self.load_defects()
+        self.start_auto_refresh()
 
-if __name__=="__main__":
-    app = QApplication(sys.argv)
-    tool = BRMTool()
-    tool.show()
-    sys.exit(app.exec_())
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # top row => search
+        top_h = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search by description, severity, reporter, or status...")
+        self.search_edit.textChanged.connect(self.do_search)
+        top_h.addWidget(QLabel("Search:"))
+        top_h.addWidget(self.search_edit)
+        layout.addLayout(top_h)
+
+        # status label for notifications
+        self.notification_label = QLabel("")
+        self.notification_label.setStyleSheet("color: green; font-weight: bold;")
+        layout.addWidget(self.notification_label)
+
+        # table
+        self.defect_table = QTableWidget(0,7)
+        self.defect_table.setHorizontalHeaderLabels(["DefectID","RuleID","Description","Severity","Reporter","Status","Timestamp"])
+        self.defect_table.horizontalHeader().setStretchLastSection(True)
+        self.defect_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.defect_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.defect_table)
+
+        # button row
+        btn_h = QHBoxLayout()
+        add_btn = QPushButton("Add Defect")
+        add_btn.clicked.connect(self.add_defect)
+        btn_h.addWidget(add_btn)
+
+        edit_btn = QPushButton("Edit Defect")
+        edit_btn.clicked.connect(self.edit_defect)
+        btn_h.addWidget(edit_btn)
+
+        del_btn = QPushButton("Delete Defect")
+        del_btn.clicked.connect(self.delete_defect)
+        btn_h.addWidget(del_btn)
+
+        ref_btn = QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_defects)
+        btn_h.addWidget(ref_btn)
+
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
+
+        self.setLayout(layout)
+
+    def load_defects(self):
+        """
+        Pull from BRM_DEFECT_LOGS => up to 1000 => fill table => check if new.
+        """
+        self.defect_table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT TOP 1000
+                    DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP
+                FROM BRM_DEFECT_LOGS
+                ORDER BY TIMESTAMP DESC
+            """)
+            rows = c.fetchall()
+            current_count = len(rows)
+
+            for row_data in rows:
+                r_i=self.defect_table.rowCount()
+                self.defect_table.insertRow(r_i)
+                for col_i,val in enumerate(row_data):
+                    self.defect_table.setItem(r_i,col_i, QTableWidgetItem(str(val) if val else ""))
+
+            # check new defects
+            if self.last_defect_count and current_count>self.last_defect_count:
+                new_count = current_count - self.last_defect_count
+                self.notification_label.setText(f"{new_count} new defect(s) logged.")
+                # clear after 5 seconds
+                QtCore.QTimer.singleShot(5000, lambda: self.notification_label.setText(""))
+            self.last_defect_count = current_count
+
+        except Exception as ex:
+            logging.error(f"Error loading defects: {ex}")
+            QMessageBox.critical(self,"Error",str(ex))
+
+        self.defect_table.resizeColumnsToContents()
+
+    def do_search(self):
+        """
+        Basic row-based filter => hide rows not containing the search text in any column.
+        """
+        text = self.search_edit.text().lower().strip()
+        for r_i in range(self.defect_table.rowCount()):
+            row_text_ok=False
+            for c_i in range(self.defect_table.columnCount()):
+                it=self.defect_table.item(r_i,c_i)
+                if it and text in it.text().lower():
+                    row_text_ok=True
+                    break
+            self.defect_table.setRowHidden(r_i, not row_text_ok)
+
+    def start_auto_refresh(self):
+        """
+        Auto refresh every 30 seconds.
+        """
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.load_defects)
+        self.refresh_timer.start(30000)
+
+    def add_defect(self):
+        dlg = DefectDialog(self.connection, None, self)
+        if dlg.exec_()==QDialog.Accepted:
+            self.load_defects()
+
+    def edit_defect(self):
+        row=self.defect_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"No selection","Please select a defect row.")
+            return
+        def_id_item=self.defect_table.item(row,0)
+        if not def_id_item:
+            return
+        defect_id=int(def_id_item.text())
+
+        # fetch full data
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION, TIMESTAMP
+            FROM BRM_DEFECT_LOGS
+            WHERE DEFECT_ID=?
+        """,(defect_id,))
+        row_ = c.fetchone()
+        if not row_:
+            QMessageBox.warning(self,"Not found",f"Defect {defect_id} not found.")
+            return
+        colnames=[desc[0] for desc in c.description]
+        defect_data=dict(zip(colnames, row_))
+
+        dlg = DefectDialog(self.connection, defect_data, self)
+        if dlg.exec_()==QDialog.Accepted:
+            self.load_defects()
+
+    def delete_defect(self):
+        row=self.defect_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"No selection","Please select a defect.")
+            return
+        def_id_item=self.defect_table.item(row,0)
+        if not def_id_item:
+            return
+        defect_id=int(def_id_item.text())
+        confirm=QMessageBox.question(self,"Confirm",f"Delete defect {defect_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        try:
+            c.execute("DELETE FROM BRM_DEFECT_LOGS WHERE DEFECT_ID=?",(defect_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted",f"Defect {defect_id} removed.")
+            self.load_defects()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
+
+Key Sections Explanation
+	1.	DefectDialog
+	•	Simple form to gather/edit: RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, RESOLUTION.
+	•	If editing: loads existing data from defect_data.
+	•	On save: either INSERT or UPDATE in BRM_DEFECT_LOGS.
+	2.	DefectManagementTab
+	•	Displays up to 1000 defect records in descending TIMESTAMP order.
+	•	Auto-refreshes every 30 seconds. If the new count of defects is higher than last time, it briefly shows “X new defects logged.”
+	•	Searching by string will hide rows that don’t match any column.
+	3.	Integration
+	•	If you want to reference BFS or rule-lifecycle code, you can add logic to the “Add Defect” step to confirm the rule is valid or locked. This is optional.
+	•	If you want to store changes in an audit log, you can call insert_audit_log(...) in add_defect or edit_defect.
+
+⸻
+
+Please respond “OK” if you approve Module #8. Once confirmed, we can provide a final aggregator that includes all the modules in a single integrated file or highlight how to unify them.
