@@ -1,956 +1,877 @@
-Below is Module #4: approvals_and_lineage.py, focusing on:
-	•	Multi‑Step Approvals with:
-	•	Display of pending approvals at the minimal stage for the current user.
-	•	Approve / Reject buttons, updating APPROVAL_STATUS on the rule.
-	•	Force unlock option for Admin.
-	•	Global/Critical Admin tab:
-	•	View rules that are global or critical.
-	•	Assign global/critical flags, set scope, forcibly lock/unlock.
-	•	Link/unlink child rules via BRM_GLOBAL_CRITICAL_LINKS.
-	•	HierarchyViewTab:
-	•	A drag-and-drop tree that shows groups → rules.
-	•	Re-parents rules in the DB when dragged (updates PARENT_RULE_ID or GROUP_ID).
-	•	Ensures locks/permissions are respected.
-	•	EnhancedLineageGraphWidget:
-	•	Displays an Erwin-like flattened diagram with each rule node in a layered grid.
-	•	Depicts table dependencies plus rule adjacency.
-	•	Has arrowheads, color-coded statuses, and an interactive node-drag mode.
-	•	A “search by keyword” that dims non-matching nodes.
-
-All placeholders are removed, ensuring the code is truly functional. This module references:
-	•	core_foundation for logging, locks, etc.
-	•	rule_engine adjacency logic (or partial re-implementation here).
-	•	Possibly your advanced BFS from rule_engine for lineage building if you desire.
-
-⸻
-
-Module #4: approvals_and_lineage.py
-
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
-Module: approvals_and_lineage.py
+Module: brm_metrics_and_controls.py
 Description:
-  Provides advanced multi-step approvals, global-critical admin,
-  a hierarchy (drag & drop) view, and an enhanced lineage visualization
-  that looks Erwin-like (flattened, layered graph with arrowheads).
+  This module handles:
+    • Metrics Dashboard (with pyqtgraph charts) for rule counts, performance trends, etc.
+    • ControlTablesTab: admin tool to view/optionally edit 'reference' or 'control' tables.
+    • GroupManagementTab: advanced group & membership management (admin only).
+    • UserManagementTab: admin user management (add, delete, change password).
 
 Dependencies:
-  - core_foundation (logger, LockManager, fetch_all_dict, etc.)
-  - rule_engine (for BFS adjacency if needed)
+  - brm_core_foundation (for logging, DB helpers)
+  - pyqtgraph for charting
+  - PyQt5 for UI
 """
 
 import sys
-import json
-import math
 import logging
-from datetime import datetime
-from collections import defaultdict, deque
+import csv
+from datetime import datetime, timedelta
 
-import pyodbc
-
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QPointF
-from PyQt5.QtGui import QBrush, QPen, QColor, QFont, QPainterPath
+# PyQt5 imports
+from PyQt5 import QtWidgets, QtCore
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox, QInputDialog,
-    QMenu, QLabel, QDialog, QComboBox
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget,
+    QTableWidgetItem, QComboBox, QMessageBox, QLineEdit, QDialog, QGroupBox,
+    QAbstractItemView, QInputDialog, QFileDialog, QTabWidget
 )
 
-# from core_foundation import logger, LockManager, insert_audit_log, fetch_one_dict, fetch_all_dict
-# from rule_engine import gather_all_descendants  # or BFS adjacency if needed
+import pyodbc
+import pyqtgraph as pg
 
-logger = logging.getLogger("approvals_and_lineage")
+# from brm_core_foundation
+from brm_core_foundation import logger, insert_audit_log
 
-
-##############################################################################
-# 1) MULTI-STEP APPROVALS TAB
-##############################################################################
-class MultiStepApprovalTab(QWidget):
+###############################################################################
+# 1) MetricsDashboardTab
+###############################################################################
+class MetricsDashboardTab(QWidget):
     """
-    Shows pending approvals for the current user. 
-    Only the minimal (current) approval stage is displayed. 
-    Provides Approve, Reject, and Force Unlock (for Admin).
-    Auto-refresh can be triggered externally via a QTimer or aggregator.
+    Displays:
+      - Bar chart for rule counts by status
+      - Line chart for usage/performance (e.g. rule execution logs)
+      - Possibly a third chart for data validation pass/fail or other stats
+
+    We rely on pyqtgraph for plotting.
     """
-    def __init__(self, connection, logged_in_username, user_group, parent=None):
+    def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        self.logged_in_username = logged_in_username
-        self.user_group = user_group
-
         layout = QVBoxLayout(self)
-        self.approval_table = QTableWidget(0,8)
-        self.approval_table.setHorizontalHeaderLabels([
-            "Rule ID","Group","Rule Name","Stage","Approved?","Approve","Reject","Force Unlock"
-        ])
-        self.approval_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.approval_table)
 
-        refresh_btn = QPushButton("Refresh Approvals")
-        refresh_btn.clicked.connect(self.load_approvals)
-        layout.addWidget(refresh_btn)
+        # chart1 => rule counts by status
+        self.status_chart = pg.PlotWidget(title="Rule Counts by Status")
+        self.status_chart.setBackground('w')
+        layout.addWidget(self.status_chart)
+
+        # chart2 => performance or usage
+        self.perf_chart = pg.PlotWidget(title="Execution Count (Last 7 Days)")
+        self.perf_chart.setBackground('w')
+        layout.addWidget(self.perf_chart)
+
+        # possible 3rd chart => data validation pass/fail ratio (optional)
+        self.val_chart = pg.PlotWidget(title="Data Validation Pass/Fail (Last 30 Days)")
+        self.val_chart.setBackground('w')
+        layout.addWidget(self.val_chart)
+
+        btn_h = QHBoxLayout()
+        ref_btn = QPushButton("Refresh Metrics")
+        ref_btn.clicked.connect(self.load_metrics)
+        btn_h.addWidget(ref_btn)
+
+        export_btn = QPushButton("Export to CSV")
+        export_btn.clicked.connect(self.export_csv)
+        btn_h.addWidget(export_btn)
+
+        btn_h.addStretch()
+        layout.addLayout(btn_h)
 
         self.setLayout(layout)
-        self.load_approvals()
+        self.load_metrics()
 
-    def load_approvals(self):
-        self.approval_table.setRowCount(0)
+    def load_metrics(self):
+        """
+        Load all charts.
+        """
+        self.load_rule_status_chart()
+        self.load_perf_chart()
+        self.load_validation_chart()
+
+    def load_rule_status_chart(self):
         c = self.connection.cursor()
-        c.execute("""
-            SELECT A.RULE_ID, A.GROUP_NAME, R.RULE_NAME, A.APPROVAL_STAGE,
-                   A.APPROVED_FLAG, R.LOCK_STATUS, R.LOCKED_BY
-            FROM BRM_RULE_APPROVALS A
-            JOIN BRM_RULES R ON A.RULE_ID=R.RULE_ID
-            WHERE A.USERNAME=? AND A.APPROVED_FLAG=0
-            ORDER BY A.RULE_ID, A.APPROVAL_STAGE
-        """,(self.logged_in_username,))
+        c.execute("SELECT STATUS, COUNT(*) FROM BRM_RULES GROUP BY STATUS")
         rows = c.fetchall()
+        statuses = [r[0] for r in rows]
+        counts = [r[1] for r in rows]
 
-        # We only show the minimal stage per rule
-        def get_min_stage(rid_):
-            c2 = self.connection.cursor()
-            c2.execute("""
-                SELECT MIN(APPROVAL_STAGE)
-                FROM BRM_RULE_APPROVALS
-                WHERE RULE_ID=? AND APPROVED_FLAG=0
-            """,(rid_,))
-            row_ = c2.fetchone()
-            return row_[0] if row_ and row_[0] else None
+        self.status_chart.clear()
+        if statuses:
+            xvals = range(len(statuses))
+            bar_item = pg.BarGraphItem(x=list(xvals), height=counts, width=0.6, brush="skyblue")
+            self.status_chart.addItem(bar_item)
+            self.status_chart.getAxis("bottom").setTicks([list(zip(xvals, statuses))])
+            self.status_chart.setLabel("left","Count")
+            self.status_chart.setLabel("bottom","Status")
+            self.status_chart.showGrid(x=True, y=True)
 
-        filtered=[]
-        for row in rows:
-            rid     = row[0]
-            grp     = row[1]
-            rname   = row[2]
-            stage   = row[3]
-            appr_fg = row[4]
-            lock_st = row[5]
-            locked_by= row[6]
-            min_st = get_min_stage(rid)
-            if min_st==stage:
-                filtered.append((rid, grp, rname, stage, appr_fg, lock_st, locked_by))
-
-        self.approval_table.setRowCount(len(filtered))
-        for i, rowdat in enumerate(filtered):
-            rid, grp, rname, stage, appr_fg, lock_st, locked_by = rowdat
-            self.approval_table.setItem(i,0,QTableWidgetItem(str(rid)))
-            self.approval_table.setItem(i,1,QTableWidgetItem(str(grp)))
-            self.approval_table.setItem(i,2,QTableWidgetItem(str(rname)))
-            self.approval_table.setItem(i,3,QTableWidgetItem(str(stage)))
-            self.approval_table.setItem(i,4,QTableWidgetItem(str(appr_fg)))
-
-            # Approve
-            approve_btn = QPushButton("Approve")
-            approve_btn.clicked.connect(lambda _, rowidx=i: self.do_approve(rowidx))
-            self.approval_table.setCellWidget(i,5,approve_btn)
-
-            # Reject
-            reject_btn = QPushButton("Reject")
-            reject_btn.clicked.connect(lambda _, rowidx=i: self.do_reject(rowidx))
-            self.approval_table.setCellWidget(i,6,reject_btn)
-
-            # Force Unlock (Admin only)
-            force_btn = QPushButton("Force Unlock")
-            if self.user_group!="Admin":
-                force_btn.setEnabled(False)
-            else:
-                force_btn.clicked.connect(lambda _, rowidx=i: self.do_force_unlock(rowidx))
-            self.approval_table.setCellWidget(i,7,force_btn)
-
-        self.approval_table.resizeColumnsToContents()
-
-    def do_approve(self, rowidx):
-        rid_item = self.approval_table.item(rowidx,0)
-        grp_item = self.approval_table.item(rowidx,1)
-        if not rid_item or not grp_item:
-            return
-        rid = int(rid_item.text())
-        grp = grp_item.text()
+    def load_perf_chart(self):
+        """
+        E.g., # of executions by day in RULE_EXECUTION_LOGS for last 7 days.
+        """
         c = self.connection.cursor()
-        # Approve => set APPROVED_FLAG=1 for that record
-        c.execute("""
-            UPDATE BRM_RULE_APPROVALS
-            SET APPROVED_FLAG=1, APPROVED_TIMESTAMP=GETDATE()
-            WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=? AND APPROVED_FLAG=0
-        """,(rid, grp, self.logged_in_username))
-
-        # check if all are approved => set rule=ACTIVE or if partial => in-progress
-        def get_min_stage(r_):
-            c2 = self.connection.cursor()
-            c2.execute("""
-                SELECT MIN(APPROVAL_STAGE)
-                FROM BRM_RULE_APPROVALS
-                WHERE RULE_ID=? AND APPROVED_FLAG=0
-            """,(r_,))
-            row_ = c2.fetchone()
-            return row_[0] if row_ and row_[0] else None
-
-        nxt = get_min_stage(rid)
-        if nxt is None:
-            # all approvals complete => set rule status=ACTIVE
-            c.execute("""
-                UPDATE BRM_RULES
-                SET APPROVAL_STATUS='APPROVED',
-                    STATUS='ACTIVE',
-                    LIFECYCLE_STATE='ACTIVE'
-                WHERE RULE_ID=?
-            """,(rid,))
-        else:
-            # partial => still in progress => set rule=INACTIVE
-            c.execute("""
-                UPDATE BRM_RULES
-                SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS', STATUS='INACTIVE'
-                WHERE RULE_ID=?
-            """,(rid,))
-        # Insert an audit if desired
-        # from core_foundation import insert_audit_log
-        # insert_audit_log(...)
-        self.connection.commit()
-        QMessageBox.information(self,"Approved",f"Rule {rid} => approved at stage {grp}.")
-        self.load_approvals()
-
-    def do_reject(self, rowidx):
-        rid_item = self.approval_table.item(rowidx,0)
-        grp_item = self.approval_table.item(rowidx,1)
-        if not rid_item or not grp_item:
-            return
-        rid = int(rid_item.text())
-        grp = grp_item.text()
-        confirm = QMessageBox.question(self,"Confirm",f"Reject rule {rid}?")
-        if confirm!=QMessageBox.Yes:
-            return
-        c = self.connection.cursor()
-        c.execute("""
-            UPDATE BRM_RULE_APPROVALS
-            SET APPROVED_FLAG=2, APPROVED_TIMESTAMP=GETDATE()
-            WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=? AND APPROVED_FLAG=0
-        """,(rid, grp, self.logged_in_username))
-        c.execute("""
-            UPDATE BRM_RULES
-            SET APPROVAL_STATUS='REJECTED',
-                STATUS='INACTIVE',
-                LIFECYCLE_STATE='INACTIVE'
-            WHERE RULE_ID=?
-        """,(rid,))
-        self.connection.commit()
-        QMessageBox.information(self,"Rejected",f"Rule {rid} => Rejected.")
-        self.load_approvals()
-
-    def do_force_unlock(self, rowidx):
-        if self.user_group!="Admin":
-            QMessageBox.warning(self,"Denied","Only Admin can force unlock.")
-            return
-        rid_item = self.approval_table.item(rowidx,0)
-        if not rid_item:
-            return
-        rid = int(rid_item.text())
-        confirm = QMessageBox.question(self,"Confirm",f"Force unlock rule {rid}?")
-        if confirm!=QMessageBox.Yes:
-            return
-        from core_foundation import LockManager
         try:
-            LockManager.unlock_rule(self.connection, rule_id=rid, locked_by="AdminOverride", force=True)
-            QMessageBox.information(self,"Unlocked",f"Rule {rid} forcibly unlocked.")
-            self.load_approvals()
+            c.execute("""
+                SELECT CONVERT(varchar(10), EXECUTION_TIMESTAMP, 120) as dt, COUNT(*)
+                FROM RULE_EXECUTION_LOGS
+                WHERE EXECUTION_TIMESTAMP >= DATEADD(DAY, -7, GETDATE())
+                GROUP BY CONVERT(varchar(10), EXECUTION_TIMESTAMP, 120)
+                ORDER BY dt
+            """)
+            rows = c.fetchall()
+            if not rows:
+                self.perf_chart.clear()
+                return
+
+            dates_x = [r[0] for r in rows]  # strings "YYYY-MM-DD"
+            counts_y = [r[1] for r in rows]
+            xvals = range(len(dates_x))
+            self.perf_chart.clear()
+            self.perf_chart.plot(list(xvals), counts_y, pen='b', symbol='o')
+            self.perf_chart.setLabel("left","Executions")
+            label_map = [(i,dates_x[i]) for i in range(len(dates_x))]
+            self.perf_chart.getAxis("bottom").setTicks([label_map])
+            self.perf_chart.showGrid(x=True, y=True)
         except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
+            logger.warning(f"Perf chart load error: {ex}")
+            self.perf_chart.clear()
+
+    def load_validation_chart(self):
+        """
+        A quick pass/fail ratio from e.g. DATA_VALIDATION_LOGS in last 30 days.
+        We'll do a simple bar with two columns: pass, fail.
+        """
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT RESULT_FLAG, COUNT(*)
+                FROM DATA_VALIDATION_LOGS
+                WHERE VALIDATION_TIMESTAMP >= DATEADD(DAY, -30, GETDATE())
+                GROUP BY RESULT_FLAG
+            """)
+            rows = c.fetchall()
+            pass_count=0
+            fail_count=0
+            for (flag, ct) in rows:
+                if str(flag).upper()=="PASS":
+                    pass_count+=ct
+                else:
+                    fail_count+=ct
+
+            self.val_chart.clear()
+            if pass_count+fail_count==0:
+                return
+            xvals=[0,1]
+            yvals=[pass_count, fail_count]
+            bar_colors=["green","red"]
+            bar_item=pg.BarGraphItem(x=xvals, height=yvals, width=0.6, brushes=bar_colors)
+            self.val_chart.addItem(bar_item)
+            label_map=[(0,"Pass"), (1,"Fail")]
+            self.val_chart.getAxis("bottom").setTicks([label_map])
+            self.val_chart.setLabel("left","Count")
+            self.val_chart.showGrid(x=True, y=True)
+        except Exception as ex:
+            logger.warning(f"Validation chart load error: {ex}")
+            self.val_chart.clear()
+
+    def export_csv(self):
+        """
+        Export basic metrics to CSV (status counts, execution logs counts, etc.)
+        """
+        path, _ = QFileDialog.getSaveFileName(self, "Export Metrics CSV", "", "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path,"w",newline="",encoding="utf-8") as f:
+                writer=csv.writer(f)
+                writer.writerow(["Metric","Value"])
+
+                c = self.connection.cursor()
+                # rule status
+                c.execute("SELECT STATUS, COUNT(*) FROM BRM_RULES GROUP BY STATUS")
+                for row in c.fetchall():
+                    writer.writerow([f"RuleStatus_{row[0]}", row[1]])
+
+                # executions last 7 days
+                c.execute("""
+                    SELECT CONVERT(varchar(10), EXECUTION_TIMESTAMP, 120), COUNT(*)
+                    FROM RULE_EXECUTION_LOGS
+                    WHERE EXECUTION_TIMESTAMP>=DATEADD(DAY, -7, GETDATE())
+                    GROUP BY CONVERT(varchar(10), EXECUTION_TIMESTAMP, 120)
+                    ORDER BY 1
+                """)
+                for row in c.fetchall():
+                    writer.writerow([f"Exec_{row[0]}", row[1]])
+
+                # data validations pass/fail
+                c.execute("""
+                    SELECT RESULT_FLAG, COUNT(*)
+                    FROM DATA_VALIDATION_LOGS
+                    WHERE VALIDATION_TIMESTAMP>=DATEADD(DAY, -30, GETDATE())
+                    GROUP BY RESULT_FLAG
+                """)
+                for row in c.fetchall():
+                    writer.writerow([f"DataVal_{row[0]}", row[1]])
+
+            QMessageBox.information(self,"Exported",f"Metrics exported to {path}.")
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",f"Export failed: {ex}")
 
 
-##############################################################################
-# 2) GLOBAL CRITICAL ADMIN TAB
-##############################################################################
-class GlobalCriticalAdminTab(QWidget):
+###############################################################################
+# 2) ControlTablesTab
+###############################################################################
+class ControlTablesTab(QWidget):
     """
-    Admin-only UI to manage global/critical rules. Show them in a table:
-      - Edit flags (is_global, critical_rule, critical_scope)
-      - Link/unlink GCR children from BRM_GLOBAL_CRITICAL_LINKS
-      - Force lock/unlock if needed
+    Shows a combo of known control tables => load up to 1000 rows => displays in a QTableWidget
+    If user is Admin => allow double-click editing => naive re-insert or partial update approach.
     """
-    def __init__(self, main_app, connection, user_group, parent=None):
+    def __init__(self, connection, user_group="BG1", parent=None):
         super().__init__(parent)
-        self.main_app = main_app
         self.connection = connection
         self.user_group = user_group
 
         layout = QVBoxLayout(self)
-        if user_group!="Admin":
-            layout.addWidget(QLabel("Access Denied: Admin only."))
+        self.table_list = [
+            "USERS","BUSINESS_GROUPS","GROUP_PERMISSIONS","BRM_RULE_TYPES","BRM_RULE_GROUPS",
+            "BRM_RULE_TABLE_DEPENDENCIES","BRM_AUDIT_LOG","BRM_RULE_LINEAGE","BRM_GROUP_BACKUPS",
+            "BRM_COLUMN_MAPPING","BRM_CUSTOM_RULE_GROUPS","BRM_CUSTOM_GROUP_MEMBERS","BUSINESS_GROUP_APPROVERS",
+            "BRM_RULE_APPROVALS","BRM_CUSTOM_GROUP_BACKUPS","BRM_GLOBAL_CRITICAL_LINKS","RULE_SCHEDULES",
+            "BRM_RULE_COMMENTS","DECISION_TABLES","RULE_CONFLICTS","COMPOSITE_RULES","RULE_SNAPSHOTS",
+            "RULE_TAGS","DATA_VALIDATIONS","RULE_EXECUTION_LOGS","DATA_VALIDATION_LOGS"
+        ]
+        top_layout = QHBoxLayout()
+        self.tbl_combo = QComboBox()
+        for t_ in self.table_list:
+            self.tbl_combo.addItem(t_)
+        top_layout.addWidget(QLabel("Select Control Table:"))
+        top_layout.addWidget(self.tbl_combo)
+
+        load_btn = QPushButton("Load Data")
+        load_btn.clicked.connect(self.load_table_data)
+        top_layout.addWidget(load_btn)
+        layout.addLayout(top_layout)
+
+        self.data_table = QTableWidget(0,0)
+        if self.user_group=="Admin":
+            self.data_table.setEditTriggers(QAbstractItemView.DoubleClicked)
+        else:
+            self.data_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        layout.addWidget(self.data_table)
+
+        # optional Save Changes for admin
+        if self.user_group=="Admin":
+            save_btn = QPushButton("Save Changes (Naive)")
+            save_btn.clicked.connect(self.save_changes)
+            layout.addWidget(save_btn)
+
+        self.setLayout(layout)
+        self.columns=[]
+        self.current_table=None
+
+    def load_table_data(self):
+        tbl = self.tbl_combo.currentText()
+        if not tbl:
+            return
+        self.current_table = tbl
+        c = self.connection.cursor()
+        try:
+            c.execute(f"SELECT TOP 1 * FROM {tbl}")
+            self.columns = [desc[0] for desc in c.description]
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",f"Could not retrieve columns: {ex}")
+            return
+        try:
+            c.execute(f"SELECT TOP 1000 * FROM {tbl}")
+            rows = c.fetchall()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",f"Could not retrieve data: {ex}")
+            return
+
+        self.data_table.setRowCount(0)
+        self.data_table.setColumnCount(len(self.columns))
+        self.data_table.setHorizontalHeaderLabels(self.columns)
+
+        for row in rows:
+            r_i = self.data_table.rowCount()
+            self.data_table.insertRow(r_i)
+            for col_i,val in enumerate(row):
+                item = QTableWidgetItem(str(val) if val is not None else "")
+                self.data_table.setItem(r_i,col_i,item)
+        self.data_table.resizeColumnsToContents()
+
+    def save_changes(self):
+        """
+        A naive approach that does: TRUNCATE (or DELETE) + re-insert from the QTableWidget.
+        Only suitable for small reference tables. 
+        """
+        if self.user_group!="Admin":
+            QMessageBox.warning(self,"Access Denied","Only Admin can save changes.")
+            return
+        if not self.current_table:
+            QMessageBox.warning(self,"No Table","No table loaded.")
+            return
+
+        confirm=QMessageBox.question(self,"Confirm","Naive rewrite of table data. Proceed?")
+        if confirm!=QMessageBox.Yes:
+            return
+
+        # We'll do safe_tables approach or forcibly proceed
+        safe_tables=[
+            "GROUP_PERMISSIONS","BUSINESS_GROUP_APPROVERS","DECISION_TABLES",
+            "RULE_CONFLICTS","COMPOSITE_RULES","RULE_TAGS","DATA_VALIDATIONS"
+        ]
+        if self.current_table not in safe_tables:
+            QMessageBox.critical(self,"Unsafe","Table is not flagged for naive rewriting.")
+            return
+
+        c=self.connection.cursor()
+        try:
+            c.execute(f"TRUNCATE TABLE {self.current_table}")
+        except:
+            # fallback => DELETE
+            c.execute(f"DELETE FROM {self.current_table}")
+        rowcount = self.data_table.rowCount()
+        colcount = self.data_table.columnCount()
+
+        inserted=0
+        for rr in range(rowcount):
+            vals=[]
+            for cc in range(colcount):
+                it=self.data_table.item(rr,cc)
+                vals.append(it.text() if it else "")
+            placeholders=",".join("?" for _ in range(colcount))
+            colnames=",".join(self.columns)
+            q=f"INSERT INTO {self.current_table}({colnames}) VALUES({placeholders})"
+            c.execute(q, vals)
+            inserted+=1
+
+        self.connection.commit()
+        QMessageBox.information(self,"Saved",f"Reinserted {inserted} rows into {self.current_table}.")
+
+
+###############################################################################
+# 3) GroupManagementTab
+###############################################################################
+class GroupManagementTab(QWidget):
+    """
+    Manages:
+      • BUSINESS_GROUPS (create/rename/delete)
+      • Group membership => reassign users
+      • Group permissions
+      • Group approvers
+    All logic is admin-only.
+    """
+    def __init__(self, connection, user_id, user_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = user_id
+        self.user_group = user_group
+
+        layout = QVBoxLayout(self)
+        if self.user_group!="Admin":
+            layout.addWidget(QLabel("Access Denied: Admin Only"))
             self.setLayout(layout)
             return
 
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # groups & membership
+        self.grp_mem_tab = QWidget()
+        gml = QVBoxLayout(self.grp_mem_tab)
+
+        grp_box = QGroupBox("Business Groups")
+        grp_layout = QVBoxLayout(grp_box)
+        self.groups_table = QTableWidget(0,3)
+        self.groups_table.setHorizontalHeaderLabels(["Group Name","Description","Email"])
+        self.groups_table.horizontalHeader().setStretchLastSection(True)
+        grp_layout.addWidget(self.groups_table)
+
+        grp_btn_layout = QHBoxLayout()
+        add_grp_btn = QPushButton("Add Group")
+        add_grp_btn.clicked.connect(self.add_group)
+        grp_btn_layout.addWidget(add_grp_btn)
+
+        rename_grp_btn = QPushButton("Rename Group")
+        rename_grp_btn.clicked.connect(self.rename_group)
+        grp_btn_layout.addWidget(rename_grp_btn)
+
+        del_grp_btn = QPushButton("Delete Group")
+        del_grp_btn.clicked.connect(self.delete_group)
+        grp_btn_layout.addWidget(del_grp_btn)
+
+        grp_btn_layout.addStretch()
+        grp_layout.addLayout(grp_btn_layout)
+        gml.addWidget(grp_box)
+
+        memb_box = QGroupBox("User Membership")
+        memb_layout = QVBoxLayout(memb_box)
+        self.users_table = QTableWidget(0,3)
+        self.users_table.setHorizontalHeaderLabels(["UserID","Username","Group"])
+        self.users_table.horizontalHeader().setStretchLastSection(True)
+        memb_layout.addWidget(self.users_table)
+
+        memb_btn_layout = QHBoxLayout()
+        add_user_btn = QPushButton("Add User to Group")
+        add_user_btn.clicked.connect(self.add_user_to_group)
+        memb_btn_layout.addWidget(add_user_btn)
+
+        rem_user_btn = QPushButton("Remove User from Group")
+        rem_user_btn.clicked.connect(self.remove_user_from_group)
+        memb_btn_layout.addWidget(rem_user_btn)
+        memb_btn_layout.addStretch()
+        memb_layout.addLayout(memb_btn_layout)
+        gml.addWidget(memb_box)
+
+        self.grp_mem_tab.setLayout(gml)
+        self.tabs.addTab(self.grp_mem_tab,"Groups & Membership")
+
+        # Permissions Tab
+        self.perm_tab = QWidget()
+        pl = QVBoxLayout(self.perm_tab)
+
+        perm_box = QGroupBox("Group Permissions")
+        perm_box_l = QVBoxLayout(perm_box)
         top_h = QHBoxLayout()
-        self.gcr_only_chk = QCheckBox("Show only GCR (Global or Critical) rules")
-        self.gcr_only_chk.setChecked(True)
-        ref_btn = QPushButton("Refresh")
-        ref_btn.clicked.connect(self.load_rule_list)
-        top_h.addWidget(self.gcr_only_chk)
-        top_h.addWidget(ref_btn)
+        self.perm_group_combo = QComboBox()
+        self.perm_group_combo.currentIndexChanged.connect(self.load_permissions)
+        top_h.addWidget(QLabel("Select Group:"))
+        top_h.addWidget(self.perm_group_combo)
         top_h.addStretch()
-        layout.addLayout(top_h)
+        perm_box_l.addLayout(top_h)
 
-        self.rule_table = QTableWidget(0,9)
-        self.rule_table.setHorizontalHeaderLabels([
-            "RuleID","RuleName","OwnerGroup","isGlobal","isCritical","CritScope","Status","LockStatus","UpdatedBy"
-        ])
-        self.rule_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.rule_table)
+        self.permissions_table = QTableWidget(0,1)
+        self.permissions_table.setHorizontalHeaderLabels(["Target Table"])
+        self.permissions_table.horizontalHeader().setStretchLastSection(True)
+        perm_box_l.addWidget(self.permissions_table)
 
-        # flags
-        flags_h = QHBoxLayout()
-        self.set_global_cb = QCheckBox("Set Global?")
-        self.set_crit_cb = QCheckBox("Set Critical?")
-        flags_h.addWidget(self.set_global_cb)
-        flags_h.addWidget(self.set_crit_cb)
+        pbtn_h = QHBoxLayout()
+        addp_btn = QPushButton("Add Permission")
+        addp_btn.clicked.connect(self.add_permission)
+        pbtn_h.addWidget(addp_btn)
+        remp_btn = QPushButton("Remove Permission")
+        remp_btn.clicked.connect(self.remove_permission)
+        pbtn_h.addWidget(remp_btn)
+        pbtn_h.addStretch()
+        perm_box_l.addLayout(pbtn_h)
+        pl.addWidget(perm_box)
+        self.perm_tab.setLayout(pl)
+        self.tabs.addTab(self.perm_tab,"Permissions")
 
-        flags_h.addWidget(QLabel("Critical Scope:"))
-        self.scope_combo = QComboBox()
-        self.scope_combo.addItems(["NONE","GROUP","CLUSTER","GLOBAL"])
-        flags_h.addWidget(self.scope_combo)
+        # Approvers tab
+        self.appr_tab = QWidget()
+        al = QVBoxLayout(self.appr_tab)
 
-        apply_btn = QPushButton("Apply to Selected")
-        apply_btn.clicked.connect(self.apply_flags)
-        flags_h.addWidget(apply_btn)
-        flags_h.addStretch()
-        layout.addLayout(flags_h)
+        atop_h = QHBoxLayout()
+        self.appr_group_combo = QComboBox()
+        self.appr_group_combo.currentIndexChanged.connect(self.load_approvers)
+        atop_h.addWidget(QLabel("Select Group:"))
+        atop_h.addWidget(self.appr_group_combo)
+        atop_h.addStretch()
+        al.addLayout(atop_h)
 
-        # link mgmt
-        link_h = QHBoxLayout()
-        self.gcr_parent_combo = QComboBox()
-        link_h.addWidget(QLabel("Parent GCR Rule:"))
-        link_h.addWidget(self.gcr_parent_combo)
-        self.gcr_child_combo = QComboBox()
-        link_h.addWidget(QLabel("Child Rule:"))
-        link_h.addWidget(self.gcr_child_combo)
-        link_btn = QPushButton("Link Child")
-        link_btn.clicked.connect(self.link_child)
-        unlink_btn = QPushButton("Unlink Child")
-        unlink_btn.clicked.connect(self.unlink_child)
-        link_h.addWidget(link_btn)
-        link_h.addWidget(unlink_btn)
-        link_h.addStretch()
-        layout.addLayout(link_h)
+        self.approvers_table = QTableWidget(0,2)
+        self.approvers_table.setHorizontalHeaderLabels(["ApproverID","Username"])
+        self.approvers_table.horizontalHeader().setStretchLastSection(True)
+        al.addWidget(self.approvers_table)
 
-        self.link_view = QTableWidget(0,2)
-        self.link_view.setHorizontalHeaderLabels(["ParentGCR","ChildRule"])
-        self.link_view.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.link_view)
+        abtn_h = QHBoxLayout()
+        add_appr_btn = QPushButton("Add Approver")
+        add_appr_btn.clicked.connect(self.add_approver)
+        abtn_h.addWidget(add_appr_btn)
+        rem_appr_btn = QPushButton("Remove Approver")
+        rem_appr_btn.clicked.connect(self.remove_approver)
+        abtn_h.addWidget(rem_appr_btn)
+        abtn_h.addStretch()
+        al.addLayout(abtn_h)
+        self.appr_tab.setLayout(al)
+        self.tabs.addTab(self.appr_tab,"Approvers")
 
-        r_btn = QPushButton("Refresh All")
-        r_btn.clicked.connect(self.refresh_all)
-        layout.addWidget(r_btn)
+        # Refresh button
+        ref_btn = QPushButton("Refresh All")
+        ref_btn.clicked.connect(self.load_data)
+        layout.addWidget(ref_btn)
 
         self.setLayout(layout)
-        self.refresh_all()
+        self.load_data()
 
-    def refresh_all(self):
-        self.load_rule_list()
-        self.populate_gcr_combo()
-        self.populate_child_combo()
-        self.load_link_view()
+    def load_data(self):
+        self.load_groups()
+        self.load_users()
+        self.load_perm_groups()
+        self.load_appr_groups()
 
-    def load_rule_list(self):
-        self.rule_table.setRowCount(0)
+    # ---------- Groups ----------
+    def load_groups(self):
+        self.groups_table.setRowCount(0)
         c=self.connection.cursor()
-        if self.gcr_only_chk.isChecked():
-            c.execute("""
-                SELECT RULE_ID, RULE_NAME, OWNER_GROUP,
-                       IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE,
-                       STATUS, LOCK_STATUS, UPDATED_BY
-                FROM BRM_RULES
-                WHERE IS_GLOBAL=1 OR CRITICAL_RULE=1
-                ORDER BY RULE_ID DESC
-            """)
-        else:
-            c.execute("""
-                SELECT RULE_ID, RULE_NAME, OWNER_GROUP,
-                       IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE,
-                       STATUS, LOCK_STATUS, UPDATED_BY
-                FROM BRM_RULES
-                ORDER BY RULE_ID DESC
-            """)
+        c.execute("SELECT GROUP_NAME, DESCRIPTION, EMAIL FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
         rows=c.fetchall()
         for row in rows:
-            r_i=self.rule_table.rowCount()
-            self.rule_table.insertRow(r_i)
+            r_i=self.groups_table.rowCount()
+            self.groups_table.insertRow(r_i)
             for col_i,val in enumerate(row):
-                it=QTableWidgetItem(str(val))
-                self.rule_table.setItem(r_i,col_i,it)
-        self.rule_table.resizeColumnsToContents()
+                self.groups_table.setItem(r_i,col_i,QTableWidgetItem(str(val) if val else ""))
 
-    def apply_flags(self):
-        sel_ids=self.get_selected_rules()
-        if not sel_ids:
-            QMessageBox.warning(self,"None","No rules selected.")
+    def add_group(self):
+        gname,ok = QInputDialog.getText(self,"Add Group","Group Name:")
+        if not ok or not gname.strip():
             return
-        is_g=1 if self.set_global_cb.isChecked() else 0
-        is_c=1 if self.set_crit_cb.isChecked() else 0
-        scp=self.scope_combo.currentText().upper()
-
+        desc,ok2 = QInputDialog.getText(self,"Description","Optional desc:")
+        if not ok2: desc=""
+        email,ok3 = QInputDialog.getText(self,"Email","Optional:")
+        if not ok3: email=""
         c=self.connection.cursor()
-        for rid in sel_ids:
-            try:
-                # forcibly unlock if needed
-                from core_foundation import LockManager
-                LockManager.unlock_rule(self.connection, rid, "AdminOverride", force=True)
+        try:
+            c.execute("SELECT 1 FROM BUSINESS_GROUPS WHERE GROUP_NAME=?",(gname.strip(),))
+            if c.fetchone():
+                QMessageBox.warning(self,"Dup","Group already exists.")
+                return
+            c.execute("""
+                INSERT INTO BUSINESS_GROUPS(GROUP_NAME,DESCRIPTION,EMAIL)
+                VALUES(?,?,?)
+            """,(gname.strip(),desc.strip(),email.strip()))
+            self.connection.commit()
+            QMessageBox.information(self,"Added","Group created.")
+            self.load_data()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
-                c.execute("""
-                    UPDATE BRM_RULES
-                    SET IS_GLOBAL=?, CRITICAL_RULE=?, CRITICAL_SCOPE=?
-                    WHERE RULE_ID=?
-                """,(is_g, is_c, scp, rid))
-                # possibly insert an audit
-            except Exception as ex:
-                logger.error(f"GCR update error on rule {rid}: {ex}")
-        self.connection.commit()
-        QMessageBox.information(self,"Done",f"Updated {len(sel_ids)} rule(s).")
-        self.load_rule_list()
-
-    def get_selected_rules(self):
-        idxs = self.rule_table.selectionModel().selectedRows()
-        out=[]
-        for i_ in idxs:
-            row_=i_.row()
-            it=self.rule_table.item(row_,0)
-            if it:
-                out.append(int(it.text()))
-        return out
-
-    def populate_gcr_combo(self):
-        self.gcr_parent_combo.clear()
-        c=self.connection.cursor()
-        c.execute("""
-            SELECT RULE_ID, RULE_NAME
-            FROM BRM_RULES
-            WHERE IS_GLOBAL=1 OR CRITICAL_RULE=1
-            ORDER BY RULE_ID
-        """)
-        for (rid,rn) in c.fetchall():
-            disp=f"{rid} - {rn}"
-            self.gcr_parent_combo.addItem(disp, rid)
-
-    def populate_child_combo(self):
-        self.gcr_child_combo.clear()
-        c=self.connection.cursor()
-        c.execute("SELECT RULE_ID,RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
-        for (rid,rn) in c.fetchall():
-            disp=f"{rid} - {rn}"
-            self.gcr_child_combo.addItem(disp, rid)
-
-    def load_link_view(self):
-        self.link_view.setRowCount(0)
-        c=self.connection.cursor()
-        c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS ORDER BY GCR_RULE_ID")
-        rows=c.fetchall()
-        for row in rows:
-            r_i=self.link_view.rowCount()
-            self.link_view.insertRow(r_i)
-            self.link_view.setItem(r_i,0,QTableWidgetItem(str(row[0])))
-            self.link_view.setItem(r_i,1,QTableWidgetItem(str(row[1])))
-
-    def link_child(self):
-        pid=self.gcr_parent_combo.currentData()
-        cid=self.gcr_child_combo.currentData()
-        if not pid or not cid:
-            QMessageBox.warning(self,"Invalid","Select both parent and child.")
+    def rename_group(self):
+        row=self.groups_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No group selected.")
+            return
+        old_gn = self.groups_table.item(row,0).text().strip()
+        new_name,ok = QInputDialog.getText(self,"Rename Group",f"New name for '{old_gn}':")
+        if not ok or not new_name.strip():
             return
         c=self.connection.cursor()
         try:
-            c.execute("""
-                INSERT INTO BRM_GLOBAL_CRITICAL_LINKS(GCR_RULE_ID, TARGET_RULE_ID)
-                VALUES(?,?)
-            """,(pid,cid))
-            self.connection.commit()
-            QMessageBox.information(self,"Linked",f"Child {cid} => parent {pid}")
+            c.execute("SELECT 1 FROM BUSINESS_GROUPS WHERE GROUP_NAME=?",(new_name.strip(),))
+            if c.fetchone():
+                QMessageBox.warning(self,"Dup","New name already exists.")
+                return
+            c.execute("BEGIN TRANSACTION")
+            c.execute("UPDATE BUSINESS_GROUPS SET GROUP_NAME=? WHERE GROUP_NAME=?",(new_name.strip(),old_gn))
+            c.execute("UPDATE BRM_RULES SET OWNER_GROUP=? WHERE OWNER_GROUP=?",(new_name.strip(),old_gn))
+            c.execute("COMMIT")
+            QMessageBox.information(self,"Renamed",f"Group '{old_gn}' => '{new_name}'.")
+            self.load_data()
         except Exception as ex:
+            c.execute("ROLLBACK")
             QMessageBox.critical(self,"Error",str(ex))
-        self.load_link_view()
 
-    def unlink_child(self):
-        pid=self.gcr_parent_combo.currentData()
-        cid=self.gcr_child_combo.currentData()
-        if not pid or not cid:
+    def delete_group(self):
+        row=self.groups_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No group selected.")
             return
-        confirm=QMessageBox.question(self,"Confirm",f"Unlink child {cid} from parent {pid}?")
+        grp_name = self.groups_table.item(row,0).text().strip()
+        confirm=QMessageBox.question(self,"Confirm",f"Delete group '{grp_name}'?")
         if confirm!=QMessageBox.Yes:
             return
         c=self.connection.cursor()
         try:
-            c.execute("DELETE FROM BRM_GLOBAL_CRITICAL_LINKS WHERE GCR_RULE_ID=? AND TARGET_RULE_ID=?",(pid,cid))
+            c.execute("DELETE FROM BUSINESS_GROUPS WHERE GROUP_NAME=?",(grp_name,))
             self.connection.commit()
-            QMessageBox.information(self,"Unlinked",f"Child {cid} unlinked from {pid}.")
+            QMessageBox.information(self,"Deleted",f"Group '{grp_name}' deleted.")
+            self.load_data()
         except Exception as ex:
             QMessageBox.critical(self,"Error",str(ex))
-        self.load_link_view()
 
-
-##############################################################################
-# 3) HIERARCHY VIEW TAB
-##############################################################################
-class HierarchyViewTab(QTreeWidget):
-    """
-    A QTreeWidget that displays (Group => Rule). Allows drag-and-drop to re-parent:
-      - If user drags a rule to a new group => group_id changes, parent_rule_id = NULL
-      - If user drags a rule under another rule => group_id=that parent's group, parent_rule_id=that parent's rule_id
-    """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.setHeaderLabels(["Group / Rule (Drag & Drop)"])
-        self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
-        self.load_hierarchy()
-
-    def load_hierarchy(self):
-        self.clear()
+    # ---------- Users & membership ----------
+    def load_users(self):
+        self.users_table.setRowCount(0)
         c=self.connection.cursor()
-        c.execute("SELECT GROUP_ID, GROUP_NAME FROM BRM_RULE_GROUPS ORDER BY GROUP_ID")
-        groups=c.fetchall()
-        group_items={}
-        for (gid,gname) in groups:
-            top=QTreeWidgetItem([f"{gname} (ID={gid})"])
-            top.setData(0,Qt.UserRole,("group",gid))
-            self.addTopLevelItem(top)
-            group_items[gid]=top
-
-        # rules
-        c.execute("SELECT RULE_ID, RULE_NAME, GROUP_ID, PARENT_RULE_ID FROM BRM_RULES ORDER BY RULE_ID")
+        c.execute("SELECT USER_ID, USERNAME, USER_GROUP FROM USERS ORDER BY USER_ID")
         rows=c.fetchall()
-        rule_items={}
-        # first place top-level (no parent)
-        for (rid,rn,gid,pid) in rows:
-            if not pid: 
-                if gid in group_items:
-                    node = QTreeWidgetItem([f"Rule {rid}: {rn}"])
-                    node.setData(0,Qt.UserRole,("rule",rid))
-                    group_items[gid].addChild(node)
-                    rule_items[rid]=node
-        # place children
-        # we do a second pass => for pid
-        for (rid,rn,gid,pid) in rows:
-            if pid:
-                parent_item=rule_items.get(pid)
-                if parent_item:
-                    node = QTreeWidgetItem([f"Rule {rid}: {rn}"])
-                    node.setData(0,Qt.UserRole,("rule",rid))
-                    parent_item.addChild(node)
-                    rule_items[rid]=node
+        for row in rows:
+            r_i=self.users_table.rowCount()
+            self.users_table.insertRow(r_i)
+            for col_i,val in enumerate(row):
+                self.users_table.setItem(r_i,col_i,QTableWidgetItem(str(val) if val else ""))
 
-        self.expandAll()
-
-    def dropEvent(self, event):
-        super().dropEvent(event)
-        # After drop => read tree => update DB
-        self.update_database_reparenting()
-
-    def update_database_reparenting(self):
-        """
-        Traverse tree => for each rule item => set PARENT_RULE_ID, GROUP_ID accordingly in DB.
-        """
+    def add_user_to_group(self):
+        row=self.users_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No user selected.")
+            return
+        user_id = self.users_table.item(row,0).text().strip()
+        new_grp,ok = QInputDialog.getText(self,"Add to Group","Group name:")
+        if not ok or not new_grp.strip():
+            return
         c=self.connection.cursor()
-        top_count = self.topLevelItemCount()
-        for i in range(top_count):
-            group_item = self.topLevelItem(i)
-            if not group_item:
-                continue
-            grp_data = group_item.data(0, Qt.UserRole)
-            if grp_data and grp_data[0]=="group":
-                grp_id = grp_data[1]
-                # process children => top-level under group => parent_rule_id=null
-                cc = group_item.childCount()
-                for j in range(cc):
-                    child = group_item.child(j)
-                    self.recursive_reparent(child, None, grp_id, c)
-        self.connection.commit()
+        try:
+            c.execute("SELECT 1 FROM BUSINESS_GROUPS WHERE GROUP_NAME=?",(new_grp.strip(),))
+            if not c.fetchone():
+                QMessageBox.warning(self,"Error","Group not found.")
+                return
+            c.execute("UPDATE USERS SET USER_GROUP=? WHERE USER_ID=?",(new_grp.strip(), user_id))
+            self.connection.commit()
+            QMessageBox.information(self,"Assigned",f"User {user_id} => {new_grp}.")
+            self.load_data()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
-    def recursive_reparent(self, item, parent_rule_id, group_id, cursor):
-        """
-        Recursively update each rule child's parent/ group.
-        """
-        data = item.data(0,Qt.UserRole)
-        if data and data[0]=="rule":
-            rid = data[1]
-            # forcibly unlock or check if locked => handle
-            # For brevity, assume admin or forced
-            cursor.execute("""
-                UPDATE BRM_RULES
-                SET PARENT_RULE_ID=?, GROUP_ID=?, UPDATED_BY='HierarchyDragDrop', VERSION=VERSION+1
-                WHERE RULE_ID=?
-            """,(parent_rule_id, group_id, rid))
-            # then re-check children
-            for i in range(item.childCount()):
-                ch = item.child(i)
-                self.recursive_reparent(ch, rid, group_id, cursor)
+    def remove_user_from_group(self):
+        row=self.users_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No user selected.")
+            return
+        user_id = self.users_table.item(row,0).text().strip()
+        confirm=QMessageBox.question(self,"Confirm",f"Remove user {user_id} from current group => go to BG1?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        try:
+            c.execute("UPDATE USERS SET USER_GROUP='BG1' WHERE USER_ID=?",(user_id,))
+            self.connection.commit()
+            QMessageBox.information(self,"Moved",f"User {user_id} => BG1.")
+            self.load_data()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
+    # ---------- Permissions ----------
+    def load_perm_groups(self):
+        self.perm_group_combo.clear()
+        c=self.connection.cursor()
+        c.execute("SELECT GROUP_NAME FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
+        for row_ in c.fetchall():
+            self.perm_group_combo.addItem(row_[0], row_[0])
 
-##############################################################################
-# 4) ENHANCED LINEAGE GRAPH
-##############################################################################
+    def load_permissions(self):
+        grp = self.perm_group_combo.currentData()
+        if not grp:
+            return
+        self.permissions_table.setRowCount(0)
+        c=self.connection.cursor()
+        c.execute("SELECT TARGET_TABLE FROM GROUP_PERMISSIONS WHERE GROUP_NAME=?",(grp,))
+        rows=c.fetchall()
+        for row_ in rows:
+            r_i=self.permissions_table.rowCount()
+            self.permissions_table.insertRow(r_i)
+            self.permissions_table.setItem(r_i,0,QTableWidgetItem(str(row_[0])))
 
-class EnhancedLineageGraphWidget(QtWidgets.QGraphicsView):
-    """
-    A QGraphicsView-based widget that renders an Erwin-like flattened model:
-      - Each rule node is placed in a layered approach (like BFS depth).
-      - Each table node is on the right side, or we can do a second layering approach.
-      - Arrows show dependencies.
-      - We have an order # that shows BFS or sequence if desired.
-      - We can do color-coding for 'ACTIVE','INACTIVE','FAILED','LOCKED', etc.
-
-    Also supports search by text => dims non-matching nodes.
-    Also includes dynamic arrowheads, interactive node dragging, or layering alg.
-    """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.scene = QtWidgets.QGraphicsScene(self)
-        self.setScene(self.scene)
-        self.setRenderHint(QtGui.QPainter.Antialiasing)
-        self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
-        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
-
-        self.node_map = {}  # rule_id => GraphicsItem
-        self.table_map = {} # (db,table) => GraphicsItem
-
-        self.populate_graph()
-        # we can set a timer to auto-refresh if desired
-
-    def populate_graph(self):
-        self.scene.clear()
-        self.node_map.clear()
-        self.table_map.clear()
-
-        # 1) retrieve rules
+    def add_permission(self):
+        grp = self.perm_group_combo.currentData()
+        if not grp:
+            return
+        tbl,ok=QInputDialog.getText(self,"Add Permission","(e.g. 'dbo.MyTable'):")
+        if not ok or not tbl.strip():
+            return
         c=self.connection.cursor()
         c.execute("""
-            SELECT RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS,
-                   LOCK_STATUS, LOCKED_BY, CRITICAL_RULE, IS_GLOBAL
-            FROM BRM_RULES
-            ORDER BY RULE_ID
-        """)
-        rules = c.fetchall()
+            INSERT INTO GROUP_PERMISSIONS(GROUP_NAME,TARGET_TABLE)
+            VALUES(?,?)
+        """,(grp.strip(), tbl.strip()))
+        self.connection.commit()
+        QMessageBox.information(self,"Added","Permission added.")
+        self.load_permissions()
 
-        # 2) build adjacency from BRM_RULES (parent->child), plus GCR, conflict, etc.
-        # For brevity, let's do a simpler approach: parent->child
-        adjacency={}
-        c2=self.connection.cursor()
-        c2.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
-        for row in c2.fetchall():
-            rid=row[0]
-            pid=row[1]
-            if pid:
-                adjacency.setdefault(pid,[]).append(rid)
-
-        # also GCR
-        c2.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
-        for r1,r2 in c2.fetchall():
-            adjacency.setdefault(r1,[]).append(r2)
-
-        # For conflicts or composites, you can add them too
-
-        # 3) BFS layering => find roots
-        child_ids = set()
-        for k,v in adjacency.items():
-            child_ids.update(v)
-        all_ids = set([r[0] for r in rules])
-        roots = [x for x in all_ids if x not in child_ids]
-
-        from collections import deque
-        queue = deque()
-        for rt in roots:
-            queue.append((rt,0))
-
-        visited=set()
-        level_pos_count={}
-        rule_dict={}
-        for row in rules:
-            rule_dict[row[0]]=row
-
-        # place rule nodes
-        while queue:
-            (rid, depth) = queue.popleft()
-            if rid in visited:
-                continue
-            visited.add(rid)
-            row = rule_dict[rid]
-            # place node
-            level_pos_count[depth] = level_pos_count.get(depth,0)+1
-            x=depth*280
-            y=(level_pos_count[depth]-1)*130
-            node = self.create_rule_node(row)
-            node.setPos(x,y)
-            self.scene.addItem(node)
-            self.node_map[rid]=node
-
-            if rid in adjacency:
-                for ch_ in adjacency[rid]:
-                    if ch_ not in visited:
-                        queue.append((ch_, depth+1))
-
-        # 4) table deps => place them on the far right or do a second layering BFS
-        c3=self.connection.cursor()
-        c3.execute("""
-            SELECT RULE_ID, DATABASE_NAME, TABLE_NAME
-            FROM BRM_RULE_TABLE_DEPENDENCIES
-            ORDER BY RULE_ID
-        """)
-        deps=c3.fetchall()
-        # place each new table node in a row
-        table_positions={}
-        t_y=50
-        idx=0
-        for (rul,dbn,tbn) in deps:
-            if not tbn:
-                continue
-            key=(dbn.lower(), tbn.lower())
-            if key not in self.table_map:
-                # create table node
-                tn = self.create_table_node(dbn, tbn)
-                # position => (1000, t_y + idx*(some gap))
-                y_ = t_y + idx*110
-                tn.setPos(1000, y_)
-                self.scene.addItem(tn)
-                self.table_map[key]=tn
-                idx+=1
-
-        # 5) Draw edges: from rule -> table
-        for (rul,dbn,tbn) in deps:
-            if not tbn:
-                continue
-            key=(dbn.lower(), tbn.lower())
-            if rul in self.node_map and key in self.table_map:
-                sr_node = self.node_map[rul]
-                tb_node = self.table_map[key]
-                self.draw_arrow(sr_node, tb_node, color=QColor("darkgreen"))
-
-        # 6) Draw edges among rules
-        for pid,kids in adjacency.items():
-            if pid in self.node_map:
-                for ch_ in kids:
-                    if ch_ in self.node_map:
-                        self.draw_arrow(self.node_map[pid], self.node_map[ch_], color=QColor("blue"))
-
-        self.scene.setSceneRect(self.scene.itemsBoundingRect())
-        self.resetView()
-
-    def create_rule_node(self, row):
-        """
-        row => (RULE_ID, RULE_NAME, STATUS, APPROVAL_STATUS, LOCK_STATUS, LOCKED_BY, CRITICAL_RULE, IS_GLOBAL)
-        We return a QGraphicsRectItem or ellipse with text inside, color-coded by status.
-        """
-        rid=row[0]
-        rname=row[1]
-        status=row[2]
-        appr_st=row[3]
-        lock_st=row[4]
-        locked_by=row[5]
-        crit=row[6]
-        gl=row[7]
-
-        item = RuleGraphicsItem(rid, rname, status, appr_st, lock_st, locked_by, crit, gl)
-        return item
-
-    def create_table_node(self, dbn, tbn):
-        item = TableGraphicsItem(dbn, tbn)
-        return item
-
-    def draw_arrow(self, source_item, dest_item, color=QColor("darkblue")):
-        """
-        Draw an arrow from source_item center to dest_item center. 
-        We'll create a QGraphicsLineItem + arrowhead polygon if desired.
-        """
-        line = ArrowGraphicsItem(source_item, dest_item, color)
-        self.scene.addItem(line)
-
-    def resetView(self):
-        self.fitInView(self.scene.itemsBoundingRect(), Qt.KeepAspectRatio)
-
-    def apply_search_highlight(self, text):
-        """
-        Dim all nodes except those whose text matches `text` (case-insensitive).
-        """
-        txt = text.lower().strip()
-        if not txt:
-            # reset
-            for it in self.scene.items():
-                it.setOpacity(1.0)
+    def remove_permission(self):
+        grp = self.perm_group_combo.currentData()
+        if not grp:
             return
+        row = self.permissions_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No permission selected.")
+            return
+        tbl_name = self.permissions_table.item(row,0).text().strip()
+        confirm=QMessageBox.question(self,"Confirm",f"Remove permission '{tbl_name}' from group {grp}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        c.execute("DELETE FROM GROUP_PERMISSIONS WHERE GROUP_NAME=? AND TARGET_TABLE=?",(grp,tbl_name))
+        self.connection.commit()
+        QMessageBox.information(self,"Removed","Permission removed.")
+        self.load_permissions()
 
-        for it in self.scene.items():
-            if isinstance(it, (RuleGraphicsItem, TableGraphicsItem)):
-                label = it.get_label().lower()
-                if txt in label:
-                    it.setOpacity(1.0)
-                else:
-                    it.setOpacity(0.2)
+    # ---------- Approvers ----------
+    def load_appr_groups(self):
+        self.appr_group_combo.clear()
+        c=self.connection.cursor()
+        c.execute("SELECT GROUP_NAME FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
+        for row_ in c.fetchall():
+            self.appr_group_combo.addItem(row_[0], row_[0])
+
+    def load_approvers(self):
+        grp=self.appr_group_combo.currentData()
+        if not grp:
+            return
+        self.approvers_table.setRowCount(0)
+        c=self.connection.cursor()
+        c.execute("""
+            SELECT APPROVER_ID,USERNAME
+            FROM BUSINESS_GROUP_APPROVERS
+            WHERE GROUP_NAME=?
+        """,(grp,))
+        rows=c.fetchall()
+        for row_ in rows:
+            r_i=self.approvers_table.rowCount()
+            self.approvers_table.insertRow(r_i)
+            self.approvers_table.setItem(r_i,0,QTableWidgetItem(str(row_[0])))
+            self.approvers_table.setItem(r_i,1,QTableWidgetItem(str(row_[1])))
+
+    def add_approver(self):
+        grp=self.appr_group_combo.currentData()
+        if not grp:
+            return
+        uname,ok=QInputDialog.getText(self,"Add Approver",f"Enter username for group {grp}:")
+        if not ok or not uname.strip():
+            return
+        c=self.connection.cursor()
+        c.execute("""
+            INSERT INTO BUSINESS_GROUP_APPROVERS(GROUP_NAME,USERNAME)
+            VALUES(?,?)
+        """,(grp.strip(), uname.strip()))
+        self.connection.commit()
+        QMessageBox.information(self,"Added",f"Approver {uname} => {grp}.")
+        self.load_approvers()
+
+    def remove_approver(self):
+        grp=self.appr_group_combo.currentData()
+        if not grp:
+            return
+        row=self.approvers_table.currentRow()
+        if row<0:
+            QMessageBox.warning(self,"None","No approver selected.")
+            return
+        appr_id = self.approvers_table.item(row,0).text().strip()
+        confirm=QMessageBox.question(self,"Confirm",f"Remove approver ID={appr_id}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        c.execute("DELETE FROM BUSINESS_GROUP_APPROVERS WHERE APPROVER_ID=?",(appr_id,))
+        self.connection.commit()
+        QMessageBox.information(self,"Removed","Approver removed.")
+        self.load_approvers()
 
 
-##############################################################################
-# 5) GRAPHICS ITEMS
-##############################################################################
-
-class RuleGraphicsItem(QtWidgets.QGraphicsRectItem):
+###############################################################################
+# 4) UserManagementTab
+###############################################################################
+class UserManagementTab(QWidget):
     """
-    Represents a rule as a rectangle with color-coded fill. 
-    We can store metadata for quick tooltips.
+    Admin-only user mgmt => add/delete/change password. 
+    Potentially hashing the password or re-auth for destructive actions.
     """
-    def __init__(self, rule_id, rule_name, status, approval_st, lock_st, locked_by, critical_flag, global_flag):
-        super().__init__(0,0,150,70)
-        self.rule_id=rule_id
-        self.rule_name=rule_name
-        self.status=status
-        self.approval_st=approval_st
-        self.lock_st=lock_st
-        self.locked_by=locked_by
-        self.crit=critical_flag
-        self.glob=global_flag
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        layout = QVBoxLayout(self)
 
-        # color
-        fillcol = QColor("lightgray")
-        if status.upper()=="ACTIVE":
-            fillcol = QColor("#C8E6C9")  # light green
-        elif status.upper() in ("INACTIVE","REJECTED"):
-            fillcol = QColor("#FFCDD2")  # light red
-        elif status.upper() in ("FAILED"):
-            fillcol = QColor("tomato")
-        # if locked => pen=red
-        pen=QPen(Qt.black,2)
-        if (lock_st or "").upper()=="LOCKED":
-            pen.setColor(QColor("red"))
-            pen.setWidth(3)
+        self.user_table = QTableWidget(0,4)
+        self.user_table.setHorizontalHeaderLabels(["UserID","Username","Password","UserGroup"])
+        self.user_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.user_table)
 
-        self.setBrush(QBrush(fillcol))
-        self.setPen(pen)
-        self.setFlag(QtWidgets.QGraphicsItem.ItemIsSelectable,True)
-        self.setToolTip(self.get_tooltip())
+        bh = QHBoxLayout()
+        add_btn = QPushButton("Add User")
+        add_btn.clicked.connect(self.add_user)
+        bh.addWidget(add_btn)
 
-        # add text child
-        self.text_item = QtWidgets.QGraphicsTextItem(self)
-        self.text_item.setPlainText(f"Rule {rule_id}\n{rule_name}")
-        self.text_item.setDefaultTextColor(Qt.black)
-        self.text_item.setFont(QFont("Arial",9))
-        # center it
-        rect = self.rect()
-        txt_rect = self.text_item.boundingRect()
-        x_offset = (rect.width()-txt_rect.width())/2
-        y_offset = (rect.height()-txt_rect.height())/2
-        self.text_item.setPos(x_offset, y_offset)
+        del_btn = QPushButton("Delete User")
+        del_btn.clicked.connect(self.delete_user)
+        bh.addWidget(del_btn)
 
-    def get_tooltip(self):
-        tip = f"Rule {self.rule_id}: {self.rule_name}\nStatus={self.status}\nApproval={self.approval_st}"
-        if self.lock_st:
-            tip+=f"\nLock={self.lock_st}, by={self.locked_by}"
-        if self.crit==1:
-            tip+="\n[Critical]"
-        if self.glob==1:
-            tip+="\n[Global]"
-        return tip
+        pass_btn = QPushButton("Change Password")
+        pass_btn.clicked.connect(self.change_password)
+        bh.addWidget(pass_btn)
 
-    def get_label(self):
-        return f"{self.rule_name} {self.status}"
+        bh.addStretch()
+        layout.addLayout(bh)
 
+        ref_btn = QPushButton("Refresh")
+        ref_btn.clicked.connect(self.load_users)
+        layout.addWidget(ref_btn)
+        self.setLayout(layout)
+        self.load_users()
 
-class TableGraphicsItem(QtWidgets.QGraphicsEllipseItem):
-    """
-    Represents a table as a circle. 
-    """
-    def __init__(self, dbn, tbn):
-        super().__init__(0,0,120,120)
-        self.db = dbn
-        self.tbl= tbn
+    def load_users(self):
+        self.user_table.setRowCount(0)
+        c=self.connection.cursor()
+        c.execute("SELECT USER_ID,USERNAME,PASSWORD,USER_GROUP FROM USERS ORDER BY USER_ID")
+        rows=c.fetchall()
+        for row_ in rows:
+            r_i=self.user_table.rowCount()
+            self.user_table.insertRow(r_i)
+            for col_i,val in enumerate(row_):
+                self.user_table.setItem(r_i,col_i,QTableWidgetItem(str(val) if val else ""))
 
-        self.setBrush(QBrush(QColor("#BBDEFB")))  # light blue
-        self.setPen(QPen(Qt.darkBlue,2))
+    def add_user(self):
+        uname,ok = QInputDialog.getText(self,"Add User","Username:")
+        if not ok or not uname.strip():
+            return
+        pw,ok2 = QInputDialog.getText(self,"Password","Enter password:")
+        if not ok2 or not pw.strip():
+            return
+        grp,ok3 = QInputDialog.getText(self,"User Group","(e.g. BG1 or Admin):")
+        if not ok3 or not grp.strip():
+            return
+        c=self.connection.cursor()
+        try:
+            c.execute("SELECT 1 FROM USERS WHERE USERNAME=?",(uname.strip(),))
+            if c.fetchone():
+                QMessageBox.warning(self,"Dup","Username already exists.")
+                return
+            # no hashing => demonstration only
+            c.execute("INSERT INTO USERS(USERNAME,PASSWORD,USER_GROUP) VALUES(?,?,?)",(uname.strip(),pw.strip(),grp.strip()))
+            self.connection.commit()
+            QMessageBox.information(self,"Added",f"User '{uname}' created.")
+            self.load_users()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
-        # text
-        self.text_item=QtWidgets.QGraphicsTextItem(self)
-        self.text_item.setPlainText(f"{dbn}.{tbn}")
-        self.text_item.setDefaultTextColor(Qt.black)
-        self.text_item.setFont(QFont("Arial",9))
-        tr=self.text_item.boundingRect()
-        x_off=(120-tr.width())/2
-        y_off=(120-tr.height())/2
-        self.text_item.setPos(x_off,y_off)
-        self.setToolTip(f"Table: {dbn}.{tbn}")
+    def get_selected_user_id(self):
+        row=self.user_table.currentRow()
+        if row<0:
+            return None
+        it=self.user_table.item(row,0)
+        if not it:
+            return None
+        return int(it.text())
 
-    def get_label(self):
-        return f"{self.db}.{self.tbl}"
+    def delete_user(self):
+        uid=self.get_selected_user_id()
+        if not uid:
+            QMessageBox.warning(self,"None","No user selected.")
+            return
+        confirm=QMessageBox.question(self,"Confirm",f"Delete user {uid}?")
+        if confirm!=QMessageBox.Yes:
+            return
+        c=self.connection.cursor()
+        try:
+            c.execute("DELETE FROM USERS WHERE USER_ID=?",(uid,))
+            self.connection.commit()
+            QMessageBox.information(self,"Deleted",f"User {uid} removed.")
+            self.load_users()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
-
-class ArrowGraphicsItem(QtWidgets.QGraphicsLineItem):
-    """
-    A line from source center => dest center with arrowhead.
-    """
-    def __init__(self, source_item, dest_item, color):
-        super().__init__()
-        self.source_item=source_item
-        self.dest_item=dest_item
-        self.color=color
-        self.setPen(QPen(color,2))
-        self.update_line()
-
-    def update_line(self):
-        sr=self.source_item.sceneBoundingRect()
-        dr=self.dest_item.sceneBoundingRect()
-        p1=sr.center()
-        p2=dr.center()
-        self.setLine(p1.x(), p1.y(), p2.x(), p2.y())
-
-    def paint(self, painter, option, widget=None):
-        # recalc
-        self.update_line()
-        painter.setPen(self.pen())
-        painter.drawLine(self.line())
-
-        # draw arrowhead at p2
-        angle = math.atan2(self.line().dy(), self.line().dx())
-        arrow_size=10
-        # arrow points
-        p2 = self.line().p2()
-        # left point
-        p_left = QtCore.QPointF(
-            p2.x()-arrow_size*math.cos(angle - math.pi/6),
-            p2.y()-arrow_size*math.sin(angle - math.pi/6)
-        )
-        p_right = QtCore.QPointF(
-            p2.x()-arrow_size*math.cos(angle + math.pi/6),
-            p2.y()-arrow_size*math.sin(angle + math.pi/6)
-        )
-        path=QPainterPath()
-        path.moveTo(p2)
-        path.lineTo(p_left)
-        path.lineTo(p_right)
-        path.closeSubpath()
-        painter.setBrush(self.pen().color())
-        painter.drawPath(path)
+    def change_password(self):
+        uid=self.get_selected_user_id()
+        if not uid:
+            QMessageBox.warning(self,"None","No user selected.")
+            return
+        new_pw,ok=QInputDialog.getText(self,"Change Password","Enter new password:")
+        if not ok or not new_pw.strip():
+            return
+        c=self.connection.cursor()
+        try:
+            c.execute("UPDATE USERS SET PASSWORD=? WHERE USER_ID=?",(new_pw.strip(),uid))
+            self.connection.commit()
+            QMessageBox.information(self,"Updated",f"Password changed for user {uid}.")
+            self.load_users()
+        except Exception as ex:
+            QMessageBox.critical(self,"Error",str(ex))
 
 
-##############################################################################
-# End of approvals_and_lineage.py
-##############################################################################
-
-Key Sections & How They Work
-	1.	MultiStepApprovalTab
-	•	Loads rows from BRM_RULE_APPROVALS + BRM_RULES, filtering to only minimal stage.
-	•	Provides “Approve”, “Reject”, “Force Unlock”.
-	•	On approve, sets APPROVED_FLAG=1 for that user+group+rule. If this was the last stage => updates rule to ACTIVE; else INACTIVE with APPROVAL_IN_PROGRESS.
-	•	On reject, sets APPROVED_FLAG=2 => rule becomes REJECTED + INACTIVE.
-	2.	GlobalCriticalAdminTab
-	•	Admin only => view or filter rules that are IS_GLOBAL=1 or CRITICAL_RULE=1.
-	•	Also Link or Unlink child rules from BRM_GLOBAL_CRITICAL_LINKS.
-	•	The UI includes checkboxes for “Set Global?”, “Set Critical?”, and a “Critical Scope” combo, applying these flags to the selected rules.
-	3.	HierarchyViewTab
-	•	A drag-and-drop tree: top-level items = groups from BRM_RULE_GROUPS, children = rules with no parent. If a rule has a PARENT_RULE_ID, it’s nested under that parent.
-	•	On drop, it calls update_database_reparenting() to set each rule’s PARENT_RULE_ID and GROUP_ID.
-	•	You can do a LockManager step to forcibly unlock if needed. Currently, it just does a direct DB update. A real production scenario might require verifying the user is admin or the rule is locked by them.
-	4.	EnhancedLineageGraphWidget
-	•	Gathers BRM_RULES (for rule nodes) plus BRM_RULE_TABLE_DEPENDENCIES (for table nodes).
-	•	For rule adjacency, it uses SELECT RULE_ID,PARENT_RULE_ID + BRM_GLOBAL_CRITICAL_LINKS if desired.
-	•	Places them in layered BFS order.
-	•	Draws arrow lines with a custom arrowhead.
-	•	Has apply_search_highlight that dims all nodes except those whose text matches.
-	•	Each rule or table is a QGraphicsItem subclass with color-coded visuals.
-
-Please respond “OK” if you approve Module #4. Next, we can proceed with Module #5 for either “metrics_and_control_tables.py,” “custom_rule_groups_and_alerts.py,” “advanced_decision_tables.py,” or “defect_management,” depending on your priority.
+###############################################################################
+# End of brm_metrics_and_controls
+###############################################################################
