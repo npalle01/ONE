@@ -1,0 +1,178 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Module: performance_alerts.py
+Description:
+  Provides advanced performance alerting and historical trend visualization for the BRM Tool. 
+  Key features:
+    1. PerformanceAlertTab: a PyQt tab that displays a line chart of rule execution times over a selected timeframe.
+    2. Alert thresholds: if average execution time exceeds a user-defined threshold for X consecutive days, trigger an alert.
+    3. Data Source: 
+       - either from RULE_PERF_STATS (with columns RULE_ID, DATE_KEY, AVG_EXEC_MS, etc.), 
+         or by aggregating RULE_EXECUTION_LOGS daily/hourly.
+    4. Optional email or GUI popup alerts.
+
+Usage:
+  - Add PerformanceAlertTab into your aggregator as another tab or sub‑window.
+  - Provide a method to define thresholds (maybe stored in a config or table).
+  - Integrate with theming and your BFS/scheduling logic as needed.
+"""
+
+import sys
+import math
+import logging
+from datetime import datetime, timedelta
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt
+import pyqtgraph as pg
+
+class PerformanceAlertTab(QtWidgets.QWidget):
+    """
+    Displays a line chart of average execution times for a selected rule, over the last N days or a chosen timeframe.
+    Also includes a threshold input: if the average time is above that threshold for consecutive days, show an alert.
+
+    Requires:
+     - a DB table RULE_PERF_STATS or daily aggregated logs in RULE_EXECUTION_LOGS
+       (e.g., we do SELECT DATE_KEY, AVG_EXEC_TIME_MS FROM RULE_PERF_STATS WHERE RULE_ID=? ORDER BY DATE_KEY).
+     - or adapt to RULE_EXECUTION_LOGS: SELECT CAST(EXECUTION_TIMESTAMP as date), AVG(EXECUTION_TIME_MS)...
+
+    Also, we store/compare consecutive days above threshold => popup or label alert.
+    """
+    def __init__(self, connection, user_id=None, user_group=None, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = user_id
+        self.user_group = user_group
+        self.setWindowTitle("Advanced Performance Alerts")
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # top form => rule selection, timeframe, threshold
+        form_h = QtWidgets.QHBoxLayout()
+        form_h.addWidget(QtWidgets.QLabel("Select Rule:"))
+        self.rule_combo = QtWidgets.QComboBox()
+        form_h.addWidget(self.rule_combo)
+
+        self.days_edit = QtWidgets.QLineEdit()
+        self.days_edit.setPlaceholderText("Days (e.g. 30)")
+        self.days_edit.setFixedWidth(60)
+        form_h.addWidget(QtWidgets.QLabel("Timeframe:"))
+        form_h.addWidget(self.days_edit)
+
+        self.threshold_edit = QtWidgets.QLineEdit()
+        self.threshold_edit.setPlaceholderText("ms threshold (e.g. 2000)")
+        self.threshold_edit.setFixedWidth(80)
+        form_h.addWidget(QtWidgets.QLabel("Threshold (ms):"))
+        form_h.addWidget(self.threshold_edit)
+
+        load_btn = QtWidgets.QPushButton("Load Performance")
+        load_btn.clicked.connect(self.load_performance_data)
+        form_h.addWidget(load_btn)
+
+        layout.addLayout(form_h)
+
+        # chart
+        self.chart = pg.PlotWidget(title="Rule Performance Trend")
+        self.chart.setBackground('w')
+        layout.addWidget(self.chart)
+
+        # alert label
+        self.alert_label = QtWidgets.QLabel("")
+        self.alert_label.setStyleSheet("color:red; font-weight:bold;")
+        layout.addWidget(self.alert_label)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+        self.populate_rule_combo()
+        self.days_edit.setText("30")
+        self.threshold_edit.setText("2000")
+
+    def populate_rule_combo(self):
+        self.rule_combo.clear()
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        rows = c.fetchall()
+        for (rid,rname) in rows:
+            disp=f"{rid} - {rname}"
+            self.rule_combo.addItem(disp, rid)
+
+    def load_performance_data(self):
+        # read inputs
+        rid = self.rule_combo.currentData()
+        if not rid:
+            QtWidgets.QMessageBox.warning(self, "No Rule", "Please select a rule.")
+            return
+        try:
+            days = int(self.days_edit.text().strip())
+        except:
+            days=30
+        try:
+            threshold_ms = float(self.threshold_edit.text().strip())
+        except:
+            threshold_ms = 2000.0
+
+        # gather data from e.g. RULE_PERF_STATS
+        # SELECT DATE_KEY, AVG_EXEC_TIME_MS FROM RULE_PERF_STATS WHERE RULE_ID=? AND DATE_KEY>=?
+        # or from RULE_EXECUTION_LOGS aggregated
+        c = self.connection.cursor()
+        date_limit = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")  # e.g. "20230405"
+        # adapt to your schema
+        try:
+            c.execute("""
+                SELECT DATE_KEY, AVG_EXEC_TIME_MS
+                FROM RULE_PERF_STATS
+                WHERE RULE_ID=? 
+                  AND DATE_KEY >= ?
+                ORDER BY DATE_KEY ASC
+            """,(rid, date_limit))
+            rows = c.fetchall()
+        except:
+            # fallback to logs
+            c.execute("""
+                SELECT CONVERT(varchar(8), EXECUTION_TIMESTAMP, 112) as date_key,
+                       AVG(EXECUTION_TIME_MS)
+                FROM RULE_EXECUTION_LOGS
+                WHERE RULE_ID=?
+                  AND EXECUTION_TIMESTAMP >= DATEADD(DAY, -?, GETDATE())
+                GROUP BY CONVERT(varchar(8), EXECUTION_TIMESTAMP, 112)
+                ORDER BY date_key ASC
+            """,(rid, days))
+            rows = c.fetchall()
+
+        if not rows:
+            self.chart.clear()
+            self.alert_label.setText("No performance data found.")
+            return
+
+        # parse x as integer index, store date_keys to show labels
+        xvals=range(len(rows))
+        yvals=[float(r[1]) for r in rows]
+        date_keys=[r[0] for r in rows]
+
+        self.chart.clear()
+        self.chart.plot(list(xvals), yvals, pen=pg.mkPen('b',width=2), symbol='o')
+
+        self.chart.setLabel("left","Avg Exec Time (ms)")
+        label_map = [ (i,str(date_keys[i])) for i in range(len(date_keys)) ]
+        self.chart.getAxis("bottom").setTicks([label_map])
+        self.chart.showGrid(x=True, y=True)
+
+        # check consecutive days above threshold
+        consecutive=0
+        max_consecutive=0
+        for val in yvals:
+            if val>threshold_ms:
+                consecutive+=1
+                max_consecutive=max(max_consecutive, consecutive)
+            else:
+                consecutive=0
+        
+        if max_consecutive>0:
+            self.alert_label.setText(
+                f"Alert: Found {max_consecutive} consecutive day(s) above {threshold_ms} ms threshold."
+            )
+        else:
+            self.alert_label.setText("No alerts. All data below threshold.")
