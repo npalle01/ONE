@@ -15,648 +15,799 @@ Description:
 Requires:
   - brm_core_foundation for logging, parse_sql_dependencies, LockManager, etc.
 """
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 
-import json, time, re
-from datetime import datetime, timedelta
+import json
+import time
+import re
+from datetime import datetime
 from collections import deque
-import pyodbc, sqlparse
-from brm_core_foundation import logger, insert_audit_log, fetch_all_dict, fetch_one_dict, LockManager
 
-def detect_operation_type(sql_text):
-    s = sql_text.strip().upper()
-    if s.startswith("INSERT"):
-        return "INSERT"
-    elif s.startswith("UPDATE"):
-        return "UPDATE"
-    elif s.startswith("DELETE"):
-        return "DELETE"
-    elif s.startswith("SELECT"):
-        return "SELECT"
-    else:
-        return "OTHER"
+import pyodbc
 
-def user_has_table_permission(conn, user_group, table_name):
+# We assume you have something like:
+from brm_core_foundation import (
+    logger, parse_sql_dependencies, detect_operation_type,
+    insert_audit_log, LockManager, fetch_all_dict, fetch_one_dict
+)
+
+###############################################################################
+# 1) TABLE-LEVEL PERMISSIONS (Placeholder)
+###############################################################################
+def user_has_table_permission(conn, user_group, table_name:str)->bool:
+    """
+    Checks if `user_group` can access table_name by looking at GROUP_PERMISSIONS 
+    or some other structure. 
+    For demonstration, we do a simplified approach:
+      SELECT 1 FROM GROUP_PERMISSIONS WHERE GROUP_NAME=? AND TARGET_TABLE=?
+    Return True if found, else False.
+    """
     normalized_table = table_name.lower()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM GROUP_PERMISSIONS WHERE GROUP_NAME=? AND LOWER(TARGET_TABLE)=?", (user_group, normalized_table))
-    return bool(c.fetchone())
+    c=conn.cursor()
+    c.execute("""
+        SELECT 1 
+        FROM GROUP_PERMISSIONS
+        WHERE GROUP_NAME=? AND LOWER(TARGET_TABLE)=?
+    """,(user_group,normalized_table))
+    row=c.fetchone()
+    return bool(row)
+
 
 def enforce_table_permissions_for_rule(conn, user_group, rule_sql):
+    """
+    Parse the rule_sql => find all tables => for each, check if user_group 
+    has permission. If not => raise ValueError.
+    """
     deps = parse_sql_dependencies(rule_sql)
-    for (schema, table, alias, is_sub) in deps.get("tables", []):
+    tables=deps["tables"] # (schema, table, alias, is_subselect)
+
+    for (schema, table, alias, is_sub) in tables:
         if table and not table.startswith("(CTE)"):
-            full_tn = f"{schema}.{table}" if schema else f"dbo.{table}"
-            if not user_has_table_permission(conn, user_group, full_tn.lower()):
-                raise ValueError(f"Group '{user_group}' has no permission for table '{full_tn.lower()}'.")
+            if schema:
+                full_tn = f"{schema}.{table}".lower()
+            else:
+                full_tn = f"dbo.{table}".lower()
+            if not user_has_table_permission(conn, user_group, full_tn):
+                raise ValueError(f"Group '{user_group}' has no permission for table '{full_tn}'.")
 
-def load_data_validations_for_table(conn, table_name):
-    c = conn.cursor()
-    c.execute("SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS FROM DATA_VALIDATIONS WHERE LOWER(TABLE_NAME)=LOWER(?)", (table_name,))
-    return fetch_all_dict(c)
 
-def run_single_data_validation(conn, validation_rule):
-    vtype = (validation_rule.get("VALIDATION_TYPE") or "").upper().strip()
-    tbl = validation_rule.get("TABLE_NAME")
-    col = validation_rule.get("COLUMN_NAME")
-    params = validation_rule.get("PARAMS") or ""
-    c = conn.cursor()
+###############################################################################
+# 2) DATA VALIDATION HELPERS (If integrated here)
+###############################################################################
+def load_data_validations_for_table(conn, table_name:str):
+    """
+    Pull from DATA_VALIDATIONS (TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS).
+    Return list of dict. We do a simplified approach.
+    """
+    c=conn.cursor()
+    c.execute("""
+        SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
+        FROM DATA_VALIDATIONS
+        WHERE LOWER(TABLE_NAME)=LOWER(?)
+    """,(table_name,))
+    rows=fetch_all_dict(c)
+    return rows
+
+def run_single_data_validation(conn, validation_rule:dict)->bool:
+    """
+    Execute the given data validation rule, returning True if pass, else False.
+    This is a simplified approach. 
+    E.g. if VALIDATION_TYPE='NOT NULL' => check that col has no null, etc.
+    """
+    vtype=(validation_rule["VALIDATION_TYPE"] or "").upper().strip()
+    tbl=validation_rule["TABLE_NAME"]
+    col=validation_rule["COLUMN_NAME"]
+    params=validation_rule["PARAMS"] or ""
+    c=conn.cursor()
+
     try:
-        if vtype == "NOT NULL":
-            c.execute(f"SELECT COUNT(*) FROM {tbl} WHERE {col} IS NULL")
-            return (c.fetchone()[0] == 0)
-        elif vtype == "RANGE":
-            parts = params.split(",")
-            if len(parts) == 2:
-                min_val = float(parts[0])
-                max_val = float(parts[1])
-                c.execute(f"SELECT COUNT(*) FROM {tbl} WHERE {col} < {min_val} OR {col} > {max_val}")
-                return (c.fetchone()[0] == 0)
-            return False
-        elif vtype == "REGEX":
+        if vtype=="NOT NULL":
+            q=f"SELECT COUNT(*) FROM {tbl} WHERE {col} IS NULL"
+            c.execute(q)
+            row=c.fetchone()
+            cnt=row[0]
+            return (cnt==0)
+        elif vtype=="RANGE":
+            # e.g. param="0,100"
+            parts=params.split(",")
+            if len(parts)==2:
+                try:
+                    min_val=float(parts[0])
+                    max_val=float(parts[1])
+                    q=f"SELECT COUNT(*) FROM {tbl} WHERE {col}<{min_val} OR {col}>{max_val}"
+                    c.execute(q)
+                    row=c.fetchone()
+                    out_of_range=row[0]
+                    return (out_of_range==0)
+                except:
+                    return False
+            else:
+                return False
+        elif vtype=="REGEX":
+            # For demonstration, pass:
             return True
         else:
+            # unknown => fail
             return False
     except:
         return False
 
-def run_data_validations_for_table(conn, table_name):
-    rules = load_data_validations_for_table(conn, table_name)
-    for r in rules:
-        if not run_single_data_validation(conn, r):
+def run_data_validations_for_table(conn, table_name:str)->bool:
+    """
+    Load all validations => if any fail => return False
+    """
+    rules=load_data_validations_for_table(conn, table_name)
+    for r_ in rules:
+        ok=run_single_data_validation(conn,r_)
+        if not ok:
             return False
     return True
 
-def run_data_validations_for_rule(conn, rule_id):
-    c = conn.cursor()
-    c.execute("SELECT DATABASE_NAME, TABLE_NAME FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?", (rule_id,))
-    for (dbn, tbn) in c.fetchall():
-        if tbn:
-            fulltbl = f"{dbn}.{tbn}".lower()
-            if not run_data_validations_for_table(conn, fulltbl):
-                return False
+def run_data_validations_for_rule(conn, rule_id)->bool:
+    """
+    Query `BRM_RULE_TABLE_DEPENDENCIES` for rule_id => for each table => run validations => if any fail => return False
+    """
+    c=conn.cursor()
+    c.execute("""
+        SELECT DATABASE_NAME, TABLE_NAME
+        FROM BRM_RULE_TABLE_DEPENDENCIES
+        WHERE RULE_ID=?
+    """,(rule_id,))
+    deps=c.fetchall()
+    for (dbn, tbn) in deps:
+        if not tbn:
+            continue
+        fulln=f"{dbn}.{tbn}".lower()
+        ok=run_data_validations_for_table(conn, fulln)
+        if not ok:
+            return False
     return True
 
+
+###############################################################################
+# 3) MULTI-STEP APPROVALS
+###############################################################################
 def create_multistep_approvals(conn, rule_id):
-    pipeline = ["BG1", "BG2", "FINAL"]
-    c = conn.cursor()
-    c.execute("DELETE FROM BRM_RULE_APPROVALS WHERE RULE_ID=?", (rule_id,))
-    stage = 1
+    """
+    Insert pipeline stages in BRM_RULE_APPROVALS. 
+    This is a sample logic:
+      - pipeline => BG1 => BG2 => BG3 => FINAL
+    or you can dynamically check the impacted groups or finance references, etc.
+    Overwrite to match your real logic.
+    """
+    # for demonstration => always create BG1 => BG2 => FINAL
+    pipeline=["BG1","BG2","FINAL"]
+    c=conn.cursor()
+    c.execute("DELETE FROM BRM_RULE_APPROVALS WHERE RULE_ID=?",(rule_id,))
+
+    stage=1
     for grp in pipeline:
-        if grp == "FINAL":
-            c.execute("INSERT INTO BRM_RULE_APPROVALS(RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVED_TIMESTAMP, APPROVAL_STAGE) VALUES(?, ?, ?, 0, NULL, ?)", (rule_id, "FINAL", "final_approver", stage))
+        # if grp=="FINAL", we might store a special “final_approver” user
+        if grp=="FINAL":
+            c.execute("""
+                INSERT INTO BRM_RULE_APPROVALS(
+                  RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVED_TIMESTAMP, APPROVAL_STAGE
+                )
+                VALUES(?,?,?,0,NULL,?)
+            """,(rule_id,"FINAL","final_approver",stage))
         else:
-            c2 = conn.cursor()
-            c2.execute("SELECT USERNAME FROM BUSINESS_GROUP_APPROVERS WHERE GROUP_NAME=?", (grp,))
-            approvers = c2.fetchall()
+            # fetch group approvers
+            c2=conn.cursor()
+            c2.execute("SELECT USERNAME FROM BUSINESS_GROUP_APPROVERS WHERE GROUP_NAME=?",(grp,))
+            approvers=c2.fetchall()
             if not approvers:
-                c.execute("INSERT INTO BRM_RULE_APPROVALS(RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVED_TIMESTAMP, APPROVAL_STAGE) VALUES(?, ?, ?, 0, NULL, ?)", (rule_id, grp, f"user_of_{grp}", stage))
+                # if no dedicated approvers => fallback
+                c.execute("""
+                    INSERT INTO BRM_RULE_APPROVALS(
+                      RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG,
+                      APPROVED_TIMESTAMP, APPROVAL_STAGE
+                    )
+                    VALUES(?,?,?,0,NULL,?)
+                """,(rule_id, grp, f"user_of_{grp}", stage))
             else:
                 for (ap_user,) in approvers:
-                    c.execute("INSERT INTO BRM_RULE_APPROVALS(RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVED_TIMESTAMP, APPROVAL_STAGE) VALUES(?, ?, ?, 0, NULL, ?)", (rule_id, grp, ap_user, stage))
-        stage += 1
+                    c.execute("""
+                        INSERT INTO BRM_RULE_APPROVALS(
+                          RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG,
+                          APPROVED_TIMESTAMP, APPROVAL_STAGE
+                        )
+                        VALUES(?,?,?,0,NULL,?)
+                    """,(rule_id, grp, ap_user, stage))
+        stage+=1
     conn.commit()
 
+
+###############################################################################
+# 4) BFS ADJACENCY LOAD
+###############################################################################
 def load_rule_relationships(conn):
-    c = conn.cursor()
+    """
+    Build adjacency from:
+      - PARENT_RULE_ID => children
+      - GCR => from BRM_GLOBAL_CRITICAL_LINKS
+      - Conflicts => from RULE_CONFLICTS (optional)
+      - Composites => from COMPOSITE_RULES logic expressions
+    Return adjacency => rid => set(child_rid)
+    Also return a rule_info map => rid => {some fields}
+    """
+    c=conn.cursor()
     c.execute("SELECT RULE_ID, PARENT_RULE_ID, CRITICAL_RULE, IS_GLOBAL FROM BRM_RULES")
-    rows = c.fetchall()
-    adjacency = {}
-    rule_info = {}
-    for (rid, pid, crit, glob) in rows:
-        rule_info[rid] = {"CRITICAL_RULE": crit, "IS_GLOBAL": glob}
+    rows=c.fetchall()
+    adjacency={}
+    parent_map={}
+    rule_info={}
+    for (rid,pid,crit,glob) in rows:
+        rule_info[rid]={"CRITICAL_RULE":crit,"IS_GLOBAL":glob}
         if pid:
-            adjacency.setdefault(pid, set()).add(rid)
+            adjacency.setdefault(pid,set()).add(rid)
+            parent_map[rid]=pid
+
+    # GCR
     c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
-    for (gcr, child) in c.fetchall():
-        adjacency.setdefault(gcr, set()).add(child)
+    for (gcr,child) in c.fetchall():
+        adjacency.setdefault(gcr,set()).add(child)
+
+    # Conflicts
     c.execute("SELECT RULE_ID1, RULE_ID2, PRIORITY FROM RULE_CONFLICTS")
-    for (r1, r2, _) in c.fetchall():
-        adjacency.setdefault(r1, set()).add(r2)
+    for (r1,r2,pri) in c.fetchall():
+        adjacency.setdefault(r1,set()).add(r2)
+        # you can also do adjacency[r2].add(r1) if it's a 2-way conflict
+
+    # Composites => parse LOGIC_EXPR for "Rule\d+"
     c.execute("SELECT COMPOSITE_RULE_ID, LOGIC_EXPR FROM COMPOSITE_RULES")
-    pat = re.compile(r"Rule(\d+)")
+    pat=re.compile(r"Rule(\d+)")
     for (cid, expr) in c.fetchall():
-        if expr:
-            for m in pat.findall(expr):
-                try:
-                    sub_rid = int(m)
-                    adjacency.setdefault(sub_rid, set()).add(cid)
-                except:
-                    pass
+        if not expr:
+            continue
+        matches=pat.findall(expr)
+        for m_ in matches:
+            try:
+                sub_rid=int(m_)
+                adjacency.setdefault(sub_rid,set()).add(cid)
+            except:
+                pass
+
     return adjacency, rule_info
 
+
+###############################################################################
+# 5) BFS EXECUTION
+###############################################################################
 def skip_bfs_descendants(start_id, adjacency, skipped):
-    stack = [start_id]
+    stack=[start_id]
     while stack:
-        cur = stack.pop()
+        cur=stack.pop()
         if cur in skipped:
             continue
         skipped.add(cur)
         if cur in adjacency:
-            stack.extend(child for child in adjacency[cur] if child not in skipped)
+            for ch_ in adjacency[cur]:
+                if ch_ not in skipped:
+                    stack.append(ch_)
 
 def run_single_rule_transaction(conn, rule_info, is_dry_run=True):
-    sql_text = (rule_info.get("RULE_SQL") or "").strip()
-    c = conn.cursor()
+    """
+    Execute rule in a transaction. If returns row => row[0][0]==1 => pass, else fail.
+    If is_dry_run => rollback, else commit if pass, rollback if fail.
+    Return (pass_flag, msg, record_count)
+    """
+    sql_=(rule_info.get("RULE_SQL") or "").strip()
+    c=conn.cursor()
     c.execute("BEGIN TRANSACTION")
-    success, message, rec_count = False, "", 0
+    success=False
+    msg=""
+    rec_count=0
     try:
-        c.execute(sql_text)
-        try:
-            rows = c.fetchall()
-            rec_count = len(rows)
-            if rows:
-                val = rows[0][0]
-                success = (val == 1)
-                message = f"Returned: {val}"
-            else:
-                success = True
-                message = "No rows => pass"
-        except:
-            success = True
-            message = "Executed without result set"
+        c.execute(sql_)
+        rows=c.fetchall()
+        rec_count=len(rows)
+        if rows:
+            val=rows[0][0]
+            success=(val==1)
+            msg=f"Returned: {val}"
+        else:
+            success=True
+            msg="No rows => pass"
+
         if is_dry_run or not success:
             c.execute("ROLLBACK")
         else:
             c.execute("COMMIT")
     except Exception as ex:
         c.execute("ROLLBACK")
-        success = False
-        message = str(ex)
-    return (success, message, rec_count)
+        success=False
+        msg=str(ex)
+    return (success,msg,rec_count)
 
-def insert_rule_execution_log(conn, rule_id, pass_flag, message, rec_count, elapsed_ms):
-    c = conn.cursor()
-    c.execute("INSERT INTO RULE_EXECUTION_LOGS(RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT, EXECUTION_TIME_MS) VALUES(?, GETDATE(), ?, ?, ?, ?)", (rule_id, 1 if pass_flag else 0, message, rec_count, elapsed_ms))
+def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count, elapsed_ms):
+    c=conn.cursor()
+    c.execute("""
+        INSERT INTO RULE_EXECUTION_LOGS(
+            RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT, EXECUTION_TIME_MS
+        )
+        VALUES(?,GETDATE(),?,?,?,?)
+    """,(rule_id, 1 if pass_flag else 0, message, record_count, elapsed_ms))
     conn.commit()
 
-def execute_rules_bfs(conn, start_rule_ids=None, skip_data_validation=False):
-    adjacency, rule_info_map = load_rule_relationships(conn)
+def execute_rules_bfs(conn, start_rule_ids:list=None, skip_data_validation=False):
+    """
+    BFS from the given start_rule_ids. If None => find “root” rules (PARENT_RULE_ID is null).
+    Gather adjacency from load_rule_relationships. 
+    For each rule => if data validations fail => skip, if rule is critical & fails => skip children.
+    Return (executed, skipped, failed_validations)
+    """
+    adjacency, rule_info_map=load_rule_relationships(conn)
+
+    # find roots if not given
     if not start_rule_ids:
-        child_set = {child for subs in adjacency.values() for child in subs}
-        all_ids = set(rule_info_map.keys())
-        start_rule_ids = [x for x in all_ids if x not in child_set]
-    queue = list(start_rule_ids)
-    executed = []
-    skipped = set()
-    failed_val_tables = set()
-    def run_data_val_for_rule(r):
-        return run_data_validations_for_rule(conn, r)
+        # build child set
+        child_set=set()
+        for p_ in adjacency:
+            for c_ in adjacency[p_]:
+                child_set.add(c_)
+        # all known = rule_info_map.keys()
+        all_ids=set(rule_info_map.keys())
+        start_list=[x for x in all_ids if x not in child_set]
+        queue=list(start_list)
+    else:
+        queue=list(start_rule_ids)
+
+    executed=[]
+    skipped=set()
+    failed_val_tables=set()
+
+    def run_data_val_for_rule(r_):
+        ok=run_data_validations_for_rule(conn, r_)
+        return ok
+
     while queue:
-        rid = queue.pop(0)
-        if rid in skipped or rid not in rule_info_map:
+        rid=queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_info_map:
             skipped.add(rid)
             continue
+
+        # data validations
         if not skip_data_validation:
-            if not run_data_val_for_rule(rid):
+            dv_ok=run_data_val_for_rule(rid)
+            if not dv_ok:
                 skipped.add(rid)
+                # skip BFS descendants
                 if rid in adjacency:
-                    for child in adjacency[rid]:
-                        skip_bfs_descendants(child, adjacency, skipped)
+                    for child_ in adjacency[rid]:
+                        skip_bfs_descendants(child_, adjacency, skipped)
                 continue
-        c2 = conn.cursor()
-        c2.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rid,))
-        row = c2.fetchone()
+
+        # run rule
+        c2=conn.cursor()
+        c2.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+        row=c2.fetchone()
         if not row:
             skipped.add(rid)
             continue
-        colnames = [d[0] for d in c2.description]
-        rinfo = dict(zip(colnames, row))
-        start_t = time.time()
-        ok, msg, rec_count = run_single_rule_transaction(conn, rinfo, is_dry_run=False)
-        elapsed_ms = int((time.time() - start_t) * 1000)
+        colnames=[d[0] for d in c2.description]
+        rinfo=dict(zip(colnames,row))
+        start_t=time.time()
+        (ok, msg, rec_count)=run_single_rule_transaction(conn, rinfo, is_dry_run=False)
+        elapsed_ms=int((time.time()-start_t)*1000)
         insert_rule_execution_log(conn, rid, ok, msg, rec_count, elapsed_ms)
+
         if ok:
             executed.append(rid)
             if rid in adjacency:
-                queue.extend(child for child in adjacency[rid] if child not in skipped)
+                for ch_ in adjacency[rid]:
+                    if ch_ not in skipped:
+                        queue.append(ch_)
         else:
-            crit = (rule_info_map[rid].get("CRITICAL_RULE", 0) == 1)
-            glob = (rule_info_map[rid].get("IS_GLOBAL", 0) == 1)
-            if crit or glob:
+            # if rule is critical => skip BFS children
+            crit_flag= rule_info_map[rid].get("CRITICAL_RULE",0)==1
+            glob_flag= rule_info_map[rid].get("IS_GLOBAL",0)==1
+            if crit_flag or glob_flag:
                 if rid in adjacency:
-                    for child in adjacency[rid]:
-                        skip_bfs_descendants(child, adjacency, skipped)
+                    for child_ in adjacency[rid]:
+                        skip_bfs_descendants(child_, adjacency, skipped)
             skipped.add(rid)
+
     return (executed, skipped, failed_val_tables)
 
-def add_rule(conn, rule_data, created_by_user_id, created_by_group):
-    rule_sql = rule_data.get("RULE_SQL", "").strip()
+
+###############################################################################
+# 6) RULE CRUD (Add, Update, Force Activate, Delete, etc.)
+###############################################################################
+def add_rule(conn, rule_data:dict, created_by_user_id, created_by_group):
+    """
+    Insert new rule. Must enforce table permissions, parse SQL, set LIFECYCLE -> DRAFT, 
+    create approvals, etc. 
+    Return new RULE_ID.
+    """
+    # check table perms if rule_sql present
+    rule_sql=rule_data.get("RULE_SQL","").strip()
     if rule_sql:
         enforce_table_permissions_for_rule(conn, created_by_group, rule_sql)
-    op_type = detect_operation_type(rule_sql)
-    deps = parse_sql_dependencies(rule_sql)
-    c = conn.cursor()
-    c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?", (rule_data["OWNER_GROUP"], rule_data["RULE_NAME"].strip()))
-    if c.fetchone():
-        raise ValueError("Duplicate rule name in the same group.")
-    if rule_data.get("IS_GLOBAL", 0) == 1 and created_by_group != "Admin":
+
+    op_type=detect_operation_type(rule_sql)
+    deps=parse_sql_dependencies(rule_sql)
+
+    c=conn.cursor()
+
+    # check duplicates by rule name in the same group
+    c.execute("""
+        SELECT RULE_ID 
+        FROM BRM_RULES
+        WHERE OWNER_GROUP=? AND RULE_NAME=?
+    """,(rule_data["OWNER_GROUP"], rule_data["RULE_NAME"].strip()))
+    dup=c.fetchone()
+    if dup:
+        raise ValueError("Another rule with that name already exists in the group.")
+
+    # if is_global => must be admin
+    if rule_data.get("IS_GLOBAL",0)==1 and created_by_group!="Admin":
         raise ValueError("Only Admin can create a global rule.")
+
+    # insert
     c.execute("""
         INSERT INTO BRM_RULES(
-            GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
-            EFFECTIVE_START_DATE, EFFECTIVE_END_DATE, STATUS, VERSION, CREATED_BY,
-            DESCRIPTION, OPERATION_TYPE, BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP,
-            UPDATED_BY, OWNER_GROUP, CLUSTER_NAME, APPROVAL_STATUS, IS_GLOBAL,
-            CRITICAL_RULE, CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE
+          GROUP_ID, PARENT_RULE_ID, RULE_TYPE_ID, RULE_NAME, RULE_SQL,
+          EFFECTIVE_START_DATE, EFFECTIVE_END_DATE,
+          STATUS, VERSION, CREATED_BY, DESCRIPTION, OPERATION_TYPE,
+          BUSINESS_JUSTIFICATION, CREATED_TIMESTAMP,
+          UPDATED_BY, OWNER_GROUP, CLUSTER_NAME,
+          APPROVAL_STATUS, IS_GLOBAL, CRITICAL_RULE,
+          CRITICAL_SCOPE, CDC_TYPE, LIFECYCLE_STATE
         )
         OUTPUT INSERTED.RULE_ID
-        VALUES(?,?,?,?,?, ?,?, ?,?, ?,?,?,?,?, ?,?,?, ?,?, ?,?,?)
-    """, (
-        rule_data.get("GROUP_ID"), rule_data.get("PARENT_RULE_ID"),
-        rule_data["RULE_TYPE_ID"], rule_data["RULE_NAME"].strip(), rule_sql,
-        rule_data["EFFECTIVE_START_DATE"], rule_data.get("EFFECTIVE_END_DATE"),
-        rule_data.get("STATUS", "INACTIVE"), 1, created_by_user_id,
-        rule_data.get("DESCRIPTION", ""), op_type, rule_data.get("BUSINESS_JUSTIFICATION", ""),
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), None, rule_data["OWNER_GROUP"],
-        rule_data.get("CLUSTER_NAME", ""), "APPROVAL_IN_PROGRESS", rule_data.get("IS_GLOBAL", 0),
-        rule_data.get("CRITICAL_RULE", 0), rule_data.get("CRITICAL_SCOPE", "NONE"),
-        rule_data.get("CDC_TYPE", "NONE"), "DRAFT"
+        VALUES(?,?,?,?,?,
+               ?,?,
+               ?,?,
+               ?,?,?,?,?,?,
+               ?,?,?,?,
+               ?,?,?)
+    """,(
+       rule_data.get("GROUP_ID"), 
+       rule_data.get("PARENT_RULE_ID"),
+       rule_data["RULE_TYPE_ID"],
+       rule_data["RULE_NAME"].strip(),
+       rule_sql,
+
+       rule_data["EFFECTIVE_START_DATE"],
+       rule_data.get("EFFECTIVE_END_DATE"),
+
+       rule_data.get("STATUS","INACTIVE"),
+       1, # version
+       created_by_user_id,
+       rule_data.get("DESCRIPTION",""),
+       op_type,
+
+       rule_data.get("BUSINESS_JUSTIFICATION",""),
+       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+       None,
+       rule_data["OWNER_GROUP"],
+       rule_data.get("CLUSTER_NAME",""),
+
+       "APPROVAL_IN_PROGRESS", # approval status
+       rule_data.get("IS_GLOBAL",0),
+       rule_data.get("CRITICAL_RULE",0),
+       rule_data.get("CRITICAL_SCOPE","NONE"),
+       rule_data.get("CDC_TYPE","NONE"),
+       "DRAFT"
     ))
-    new_rid = c.fetchone()[0]
-    col_op = "WRITE" if op_type in ("INSERT", "UPDATE", "DELETE") else "READ"
-    for (sch, tb, alias, is_sub) in deps.get("tables", []):
+    new_rid=c.fetchone()[0]
+
+    # Insert dependencies
+    col_op="READ"
+    if op_type in ("INSERT","UPDATE","DELETE"):
+        col_op="WRITE"
+    for (sch, tb, alias, is_sub) in deps["tables"]:
         if tb and not tb.startswith("(CTE)"):
-            dbn = sch if sch else "dbo"
-            c.execute("INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP) VALUES(?,?,?,?,?)", (new_rid, dbn, tb, "Auto", col_op))
-    insert_audit_log(conn, "INSERT", "BRM_RULES", new_rid, str(created_by_user_id), None, rule_data)
+            dbn=sch if sch else "dbo"
+            c.execute("""
+                INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+                  RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+                )
+                VALUES(?,?,?,?,?)
+            """,(new_rid, dbn, tb, "Auto", col_op))
+
+    # audit
+    insert_audit_log(conn,"INSERT","BRM_RULES",new_rid,str(created_by_user_id),None,rule_data)
+
     conn.commit()
+
+    # create multistep approvals if you want that logic
     create_multistep_approvals(conn, new_rid)
+
     return new_rid
 
-def update_rule(conn, rule_data, updated_by_user_id, updated_by_group):
-    rid = rule_data["RULE_ID"]
-    lock_info = LockManager.rule_current_lock_owner(conn, rid)
+
+def update_rule(conn, rule_data:dict, updated_by_user_id, updated_by_group):
+    """
+    Update an existing rule => must have lock or be admin => parse new SQL => re-approval => 
+    lifecycle => 'UNDER_APPROVAL', status => 'INACTIVE', version++.
+    """
+    rid=rule_data["RULE_ID"]
+    # check lock
+    lock_info=LockManager.rule_current_lock_owner(conn, rid)
     if not lock_info:
-        raise ValueError(f"Rule {rid} is not locked.")
-    if lock_info[0] != updated_by_user_id and updated_by_group != "Admin":
-        raise ValueError("You do not own the lock.")
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rid,))
-    old_row = c.fetchone()
+        raise ValueError(f"Rule {rid} is not locked => cannot update.")
+    locked_by=lock_info[0]
+    if locked_by!=updated_by_user_id and updated_by_group!="Admin":
+        raise ValueError("You do not own the lock => cannot update rule.")
+
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rid,))
+    old_row=c.fetchone()
     if not old_row:
-        raise ValueError("Rule not found.")
-    colnames = [d[0] for d in c.description]
-    old_data = dict(zip(colnames, old_row))
-    if old_data["IS_GLOBAL"] == 1 and updated_by_group != "Admin":
+        raise ValueError("Rule not found for update.")
+    cols=[d[0] for d in c.description]
+    old_data=dict(zip(cols, old_row))
+
+    # if global => only admin can update
+    if old_data["IS_GLOBAL"]==1 and updated_by_group!="Admin":
         raise ValueError("Only Admin can update a global rule.")
-    new_sql = rule_data.get("RULE_SQL", "").strip()
+
+    new_sql=rule_data.get("RULE_SQL","").strip()
     if new_sql:
         enforce_table_permissions_for_rule(conn, updated_by_group, new_sql)
-    new_name = rule_data.get("RULE_NAME", old_data["RULE_NAME"]).strip()
-    if new_name != old_data["RULE_NAME"]:
-        c.execute("SELECT RULE_ID FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_NAME=?", (rule_data.get("OWNER_GROUP", old_data["OWNER_GROUP"]), new_name))
-        rowdup = c.fetchone()
-        if rowdup and rowdup[0] != rid:
-            raise ValueError("Duplicate rule name exists.")
-    op_type = detect_operation_type(new_sql)
-    deps = parse_sql_dependencies(new_sql)
+
+    # check duplicates if name changes
+    new_name=rule_data.get("RULE_NAME", old_data["RULE_NAME"]).strip()
+    if new_name!=old_data["RULE_NAME"]:
+        c.execute("""
+            SELECT RULE_ID
+            FROM BRM_RULES
+            WHERE OWNER_GROUP=? AND RULE_NAME=? 
+        """,(rule_data.get("OWNER_GROUP", old_data["OWNER_GROUP"]), new_name))
+        rowdup=c.fetchone()
+        if rowdup and rowdup[0]!=rid:
+            raise ValueError("Another rule with the same name in that group exists.")
+
+    op_type=detect_operation_type(new_sql)
+    deps=parse_sql_dependencies(new_sql)
+
+    # update
     c.execute("""
         UPDATE BRM_RULES
-        SET GROUP_ID=?, PARENT_RULE_ID=?, RULE_TYPE_ID=?, RULE_NAME=?, RULE_SQL=?,
-            EFFECTIVE_START_DATE=?, EFFECTIVE_END_DATE=?, STATUS='INACTIVE', VERSION=VERSION+1,
-            UPDATED_BY=?, DESCRIPTION=?, OPERATION_TYPE=?, BUSINESS_JUSTIFICATION=?,
-            OWNER_GROUP=?, CLUSTER_NAME=?, APPROVAL_STATUS='APPROVAL_IN_PROGRESS',
-            IS_GLOBAL=?, CRITICAL_RULE=?, CRITICAL_SCOPE=?, CDC_TYPE=?, LIFECYCLE_STATE='UNDER_APPROVAL'
+        SET GROUP_ID=?,
+            PARENT_RULE_ID=?,
+            RULE_TYPE_ID=?,
+            RULE_NAME=?,
+            RULE_SQL=?,
+            EFFECTIVE_START_DATE=?,
+            EFFECTIVE_END_DATE=?,
+            STATUS='INACTIVE',
+            VERSION=VERSION+1,
+            UPDATED_BY=?,
+            DESCRIPTION=?,
+            OPERATION_TYPE=?,
+            BUSINESS_JUSTIFICATION=?,
+            OWNER_GROUP=?,
+            CLUSTER_NAME=?,
+            APPROVAL_STATUS='APPROVAL_IN_PROGRESS',
+            IS_GLOBAL=?,
+            CRITICAL_RULE=?,
+            CRITICAL_SCOPE=?,
+            CDC_TYPE=?,
+            LIFECYCLE_STATE='UNDER_APPROVAL'
         WHERE RULE_ID=?
-    """, (
-        rule_data.get("GROUP_ID", old_data["GROUP_ID"]),
-        rule_data.get("PARENT_RULE_ID", old_data["PARENT_RULE_ID"]),
-        rule_data["RULE_TYPE_ID"], new_name, new_sql,
-        rule_data["EFFECTIVE_START_DATE"], rule_data.get("EFFECTIVE_END_DATE"),
-        str(updated_by_user_id), rule_data.get("DESCRIPTION", old_data["DESCRIPTION"]),
-        op_type, rule_data.get("BUSINESS_JUSTIFICATION", old_data["BUSINESS_JUSTIFICATION"]),
-        rule_data.get("OWNER_GROUP", old_data["OWNER_GROUP"]),
-        rule_data.get("CLUSTER_NAME", old_data["CLUSTER_NAME"]),
-        rule_data.get("IS_GLOBAL", old_data["IS_GLOBAL"]),
-        rule_data.get("CRITICAL_RULE", old_data["CRITICAL_RULE"]),
-        rule_data.get("CRITICAL_SCOPE", old_data["CRITICAL_SCOPE"]),
-        rule_data.get("CDC_TYPE", old_data["CDC_TYPE"]),
-        rid
+    """,(
+       rule_data.get("GROUP_ID", old_data["GROUP_ID"]),
+       rule_data.get("PARENT_RULE_ID", old_data["PARENT_RULE_ID"]),
+       rule_data["RULE_TYPE_ID"],
+       new_name,
+       new_sql,
+       rule_data["EFFECTIVE_START_DATE"],
+       rule_data.get("EFFECTIVE_END_DATE"),
+       str(updated_by_user_id),
+       rule_data.get("DESCRIPTION", old_data["DESCRIPTION"]),
+       op_type,
+       rule_data.get("BUSINESS_JUSTIFICATION", old_data["BUSINESS_JUSTIFICATION"]),
+       rule_data.get("OWNER_GROUP", old_data["OWNER_GROUP"]),
+       rule_data.get("CLUSTER_NAME", old_data["CLUSTER_NAME"]),
+       rule_data.get("IS_GLOBAL", old_data["IS_GLOBAL"]),
+       rule_data.get("CRITICAL_RULE", old_data["CRITICAL_RULE"]),
+       rule_data.get("CRITICAL_SCOPE", old_data["CRITICAL_SCOPE"]),
+       rule_data.get("CDC_TYPE", old_data["CDC_TYPE"]),
+       rid
     ))
-    c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?", (rid,))
-    col_op = "WRITE" if op_type in ("INSERT", "UPDATE", "DELETE") else "READ"
-    for (sch, tb, alias, is_sub) in deps.get("tables", []):
+
+    # refresh table deps
+    c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?",(rid,))
+    col_op="READ"
+    if op_type in ("INSERT","UPDATE","DELETE"):
+        col_op="WRITE"
+    for (sch,tb,alias,is_sub) in deps["tables"]:
         if tb and not tb.startswith("(CTE)"):
-            dbn = sch if sch else "dbo"
-            c.execute("INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP) VALUES(?,?,?,?,?)", (rid, dbn, tb, "Auto", col_op))
-    new_data = dict(old_data)
-    new_data.update(rule_data)
-    new_data["STATUS"] = "INACTIVE"
-    new_data["LIFECYCLE_STATE"] = "UNDER_APPROVAL"
-    insert_audit_log(conn, "UPDATE", "BRM_RULES", rid, str(updated_by_user_id), old_data, new_data)
+            dbn=sch if sch else "dbo"
+            c.execute("""
+                INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(
+                  RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP
+                )
+                VALUES(?,?,?,?,?)
+            """,(rid, dbn, tb, "Auto", col_op))
+
+    # build new_data
+    new_data=dict(old_data)
+    for k,v in rule_data.items():
+        new_data[k]=v
+    new_data["STATUS"]="INACTIVE"
+    new_data["LIFECYCLE_STATE"]="UNDER_APPROVAL"
+
+    insert_audit_log(conn,"UPDATE","BRM_RULES",rid,str(updated_by_user_id),old_data,new_data)
     conn.commit()
+
+    # re-create approvals
     create_multistep_approvals(conn, rid)
 
+
 def force_activate_rule(conn, rule_id, user_id, user_group):
-    if user_group != "Admin":
-        inf = LockManager.rule_current_lock_owner(conn, rule_id)
-        if not inf or inf[0] != user_id:
-            raise ValueError("Rule not locked by you.")
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-    old_row = c.fetchone()
+    """
+    Bypass normal approvals => set status=ACTIVE. If not admin => must lock. 
+    """
+    if user_group!="Admin":
+        # must have lock
+        inf=LockManager.rule_current_lock_owner(conn, rule_id)
+        if not inf:
+            raise ValueError("Rule not locked => cannot force activate.")
+        if inf[0]!=user_id:
+            raise ValueError("You do not own the lock => cannot force activate.")
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old_row=c.fetchone()
     if not old_row:
         raise ValueError("Rule not found.")
-    cols = [d[0] for d in c.description]
-    old_data = dict(zip(cols, old_row))
-    c.execute("UPDATE BRM_RULES SET STATUS='ACTIVE', LIFECYCLE_STATE='ACTIVE', APPROVAL_STATUS='FORCE_ACTIVATED' WHERE RULE_ID=?", (rule_id,))
-    new_data = dict(old_data)
-    new_data.update({"STATUS": "ACTIVE", "LIFECYCLE_STATE": "ACTIVE", "APPROVAL_STATUS": "FORCE_ACTIVATED"})
-    insert_audit_log(conn, "FORCE_ACTIVATE", "BRM_RULES", rule_id, str(user_id), old_data, new_data)
+    cols=[d[0] for d in c.description]
+    old_data=dict(zip(cols,old_row))
+
+    c.execute("""
+        UPDATE BRM_RULES
+        SET STATUS='ACTIVE', LIFECYCLE_STATE='ACTIVE', APPROVAL_STATUS='FORCE_ACTIVATED'
+        WHERE RULE_ID=?
+    """,(rule_id,))
+    new_data=dict(old_data)
+    new_data["STATUS"]="ACTIVE"
+    new_data["LIFECYCLE_STATE"]="ACTIVE"
+    new_data["APPROVAL_STATUS"]="FORCE_ACTIVATED"
+    insert_audit_log(conn,"FORCE_ACTIVATE","BRM_RULES",rule_id,str(user_id),old_data,new_data)
     conn.commit()
+
 
 def force_deactivate_rule(conn, rule_id, user_id, user_group):
-    if user_group != "Admin":
-        inf = LockManager.rule_current_lock_owner(conn, rule_id)
-        if not inf or inf[0] != user_id:
-            raise ValueError("Rule not locked by you.")
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-    old_row = c.fetchone()
+    """
+    Force => set status=INACTIVE => skip approvals. If not admin => must lock.
+    """
+    if user_group!="Admin":
+        inf=LockManager.rule_current_lock_owner(conn, rule_id)
+        if not inf:
+            raise ValueError("Not locked => cannot force deactivate.")
+        if inf[0]!=user_id:
+            raise ValueError("You do not own the lock => cannot force deactivate.")
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old_row=c.fetchone()
     if not old_row:
         raise ValueError("Rule not found.")
-    cols = [d[0] for d in c.description]
-    old_data = dict(zip(cols, old_row))
-    c.execute("UPDATE BRM_RULES SET STATUS='INACTIVE', LIFECYCLE_STATE='INACTIVE', APPROVAL_STATUS='FORCE_DEACTIVATED' WHERE RULE_ID=?", (rule_id,))
-    new_data = dict(old_data)
-    new_data.update({"STATUS": "INACTIVE", "LIFECYCLE_STATE": "INACTIVE", "APPROVAL_STATUS": "FORCE_DEACTIVATED"})
-    insert_audit_log(conn, "FORCE_DEACTIVATE", "BRM_RULES", rule_id, str(user_id), old_data, new_data)
+    cols=[d[0] for d in c.description]
+    old_data=dict(zip(cols,old_row))
+
+    c.execute("""
+        UPDATE BRM_RULES
+        SET STATUS='INACTIVE', LIFECYCLE_STATE='INACTIVE', APPROVAL_STATUS='FORCE_DEACTIVATED'
+        WHERE RULE_ID=?
+    """,(rule_id,))
+    new_data=dict(old_data)
+    new_data["STATUS"]="INACTIVE"
+    new_data["LIFECYCLE_STATE"]="INACTIVE"
+    new_data["APPROVAL_STATUS"]="FORCE_DEACTIVATED"
+    insert_audit_log(conn,"FORCE_DEACTIVATE","BRM_RULES",rule_id,str(user_id),old_data,new_data)
     conn.commit()
+
 
 def deactivate_rule(conn, rule_id, user_id, user_group):
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-    old_row = c.fetchone()
+    """
+    Normal deactivate => must be fully approved => must be locked => no active children => if global => only admin
+    """
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old_row=c.fetchone()
     if not old_row:
         raise ValueError("Rule not found.")
-    cols = [d[0] for d in c.description]
-    old_data = dict(zip(cols, old_row))
-    if old_data["APPROVAL_STATUS"] != "APPROVED":
-        raise ValueError("Rule not fully approved.")
-    if old_data["IS_GLOBAL"] == 1 and user_group != "Admin":
+    cols=[d[0] for d in c.description]
+    old_data=dict(zip(cols, old_row))
+
+    if old_data["APPROVAL_STATUS"]!="APPROVED":
+        raise ValueError("Cannot deactivate => not fully APPROVED.")
+    if old_data["IS_GLOBAL"]==1 and user_group!="Admin":
         raise ValueError("Only Admin can deactivate a global rule.")
-    inf = LockManager.rule_current_lock_owner(conn, rule_id)
-    if user_group != "Admin" and (not inf or inf[0] != user_id):
-        raise ValueError("You do not have the lock.")
-    c.execute("SELECT 1 FROM BRM_RULES WHERE PARENT_RULE_ID=? AND STATUS='ACTIVE'", (rule_id,))
-    if c.fetchone():
-        raise ValueError("Active child rules exist.")
-    c.execute("UPDATE BRM_RULES SET STATUS='INACTIVE', UPDATED_BY=?, VERSION=VERSION+1, LIFECYCLE_STATE='INACTIVE' WHERE RULE_ID=?", (str(user_id), rule_id))
-    new_data = dict(old_data)
-    new_data.update({"STATUS": "INACTIVE", "VERSION": old_data["VERSION"]+1, "LIFECYCLE_STATE": "INACTIVE"})
-    insert_audit_log(conn, "DEACTIVATE", "BRM_RULES", rule_id, str(user_id), old_data, new_data)
+
+    inf=LockManager.rule_current_lock_owner(conn, rule_id)
+    if user_group!="Admin":
+        if not inf:
+            raise ValueError("Rule not locked => cannot deactivate.")
+        if inf[0]!=user_id:
+            raise ValueError("You do not own lock => cannot deactivate.")
+
+    # check if children are active
+    c.execute("SELECT 1 FROM BRM_RULES WHERE PARENT_RULE_ID=? AND STATUS='ACTIVE'",(rule_id,))
+    rowch=c.fetchone()
+    if rowch:
+        raise ValueError("Some child rules are ACTIVE => deactivate them first.")
+
+    c.execute("""
+        UPDATE BRM_RULES
+        SET STATUS='INACTIVE', UPDATED_BY=?, VERSION=VERSION+1, LIFECYCLE_STATE='INACTIVE'
+        WHERE RULE_ID=?
+    """,(str(user_id), rule_id))
+    new_data=dict(old_data)
+    new_data["STATUS"]="INACTIVE"
+    new_data["VERSION"]=old_data["VERSION"]+1
+    new_data["LIFECYCLE_STATE"]="INACTIVE"
+    insert_audit_log(conn,"DEACTIVATE","BRM_RULES",rule_id,str(user_id),old_data,new_data)
     conn.commit()
+
 
 def delete_rule(conn, rule_id, user_id, user_group):
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-    old_row = c.fetchone()
+    """
+    Normal delete => must be fully approved => inactive => no children => if global => admin only => must have lock
+    """
+    c=conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    old_row=c.fetchone()
     if not old_row:
         raise ValueError("Rule not found.")
-    cols = [d[0] for d in c.description]
-    old_data = dict(zip(cols, old_row))
-    if old_data["IS_GLOBAL"] == 1 and user_group != "Admin":
+    cols=[d[0] for d in c.description]
+    old_data=dict(zip(cols, old_row))
+
+    if old_data["IS_GLOBAL"]==1 and user_group!="Admin":
         raise ValueError("Only Admin can delete a global rule.")
-    if old_data["APPROVAL_STATUS"] != "APPROVED":
-        raise ValueError("Rule not fully approved.")
-    if old_data["STATUS"] != "INACTIVE":
-        raise ValueError("Rule must be inactive before deletion.")
-    if user_group != "Admin":
-        inf = LockManager.rule_current_lock_owner(conn, rule_id)
-        if not inf or inf[0] != user_id:
-            raise ValueError("Lock not held by you.")
-    c.execute("SELECT 1 FROM BRM_RULES WHERE PARENT_RULE_ID=?", (rule_id,))
-    if c.fetchone():
-        raise ValueError("Child rules exist; delete them first.")
-    c.execute("SELECT 1 FROM BRM_COLUMN_MAPPING WHERE SOURCE_RULE_ID=? OR RULE_ID=?", (rule_id, rule_id))
+    if old_data["APPROVAL_STATUS"]!="APPROVED":
+        raise ValueError("Cannot delete => not fully APPROVED.")
+    if old_data["STATUS"]!="INACTIVE":
+        raise ValueError("Must be INACTIVE first.")
+
+    if user_group!="Admin":
+        inf=LockManager.rule_current_lock_owner(conn, rule_id)
+        if not inf:
+            raise ValueError("Rule not locked => cannot delete.")
+        if inf[0]!=user_id:
+            raise ValueError("You do not own lock => cannot delete.")
+
+    # check children
+    c.execute("SELECT 1 FROM BRM_RULES WHERE PARENT_RULE_ID=?",(rule_id,))
+    rch=c.fetchone()
+    if rch:
+        raise ValueError("Child rules exist => cannot delete. Deactivate them first.")
+
+    # references
+    c.execute("SELECT 1 FROM BRM_COLUMN_MAPPING WHERE SOURCE_RULE_ID=? OR RULE_ID=?",(rule_id, rule_id))
     if c.fetchone():
         raise ValueError("Remove references from BRM_COLUMN_MAPPING first.")
-    c.execute("DELETE FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-    insert_audit_log(conn, "DELETE", "BRM_RULES", rule_id, str(user_id), old_data, None)
+
+    c.execute("DELETE FROM BRM_RULES WHERE RULE_ID=?",(rule_id,))
+    insert_audit_log(conn,"DELETE","BRM_RULES",rule_id,str(user_id),old_data,None)
     conn.commit()
 
+
+###############################################################################
+# 7) Additional BFS for chain or group, partial or advanced
+###############################################################################
 def gather_all_related_rule_ids(conn, start_rule_id):
-    adjacency, _ = load_rule_relationships(conn)
-    visited = set()
-    queue = [start_rule_id]
+    """
+    BFS from one rule => gather all reachable. Used for advanced impact analysis or warnings.
+    """
+    adjacency,_=load_rule_relationships(conn)
+    visited=set()
+    queue=[start_rule_id]
     while queue:
-        rid = queue.pop(0)
+        rid=queue.pop(0)
         if rid in visited:
             continue
         visited.add(rid)
         if rid in adjacency:
-            queue.extend(child for child in adjacency[rid] if child not in visited)
+            for ch_ in adjacency[rid]:
+                if ch_ not in visited:
+                    queue.append(ch_)
     return visited
 
-def parse_sql_dependencies(sql_text):
-    statements = sqlparse.parse(sql_text)
-    all_tables = []
-    cte_info = []
-    alias_map = {}
-    columns = []
-    for stmt in statements:
-        ctes = _extract_with_clauses(stmt)
-        for cname, crefs in ctes.items():
-            cte_info.append((cname, crefs))
-        main_refs, main_alias = _extract_main_from(stmt.tokens, set(ctes.keys()))
-        all_tables.extend(main_refs)
-        alias_map.update(main_alias)
-        col_refs = _extract_columns(stmt)
-        columns.extend(col_refs)
-    unique_tables = list({x for x in all_tables})
-    return {"tables": unique_tables, "cte_tables": cte_info, "alias_map": alias_map, "columns": columns}
 
-def _extract_with_clauses(statement):
-    cte_map = {}
-    tokens = list(statement.tokens)
-    i = 0
-    from sqlparse.tokens import Keyword
-    while i < len(tokens):
-        tk = tokens[i]
-        if tk.ttype is Keyword and tk.value.upper() == "WITH":
-            i += 1
-            i = _parse_cte_block(tokens, i, cte_map)
-            continue
-        i += 1
-    return cte_map
-
-def _parse_cte_block(tokens, i, cte_map):
-    from sqlparse.sql import Identifier, Parenthesis
-    from sqlparse.tokens import Keyword
-    while i < len(tokens):
-        tk = tokens[i]
-        if isinstance(tk, Identifier):
-            cte_name = tk.get_real_name()
-            i += 1
-            i = _parse_cte_as_clause(tokens, i, cte_name, cte_map)
-        elif tk.ttype is Keyword and tk.value.upper() in ("SELECT", "INSERT", "UPDATE", "DELETE"):
-            return i
-        else:
-            i += 1
-    return i
-
-def _parse_cte_as_clause(tokens, i, cte_name, cte_map):
-    from sqlparse.sql import Parenthesis
-    while i < len(tokens):
-        tk = tokens[i]
-        if tk.value.upper() == "AS":
-            i += 1
-            if i < len(tokens):
-                sub = tokens[i]
-                if isinstance(sub, Parenthesis):
-                    sub_refs = _extract_subselect_tokens(sub.tokens)
-                    cte_map[cte_name] = sub_refs
-                    i += 1
-                    return i
-        else:
-            i += 1
-    return i
-
-def _extract_subselect_tokens(tokens):
-    from sqlparse.sql import IdentifierList, Identifier, Parenthesis
-    from sqlparse.tokens import Keyword, DML
-    results = []
-    from_seen = False
-    i = 0
-    while i < len(tokens):
-        tk = tokens[i]
-        if hasattr(tk, "is_group") and tk.is_group and _is_subselect(tk):
-            results.extend(_extract_subselect_tokens(tk.tokens))
-        if tk.ttype is Keyword:
-            upv = tk.value.upper()
-            from_seen = upv in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN")
-        if from_seen:
-            if isinstance(tk, IdentifierList):
-                for ident in tk.get_identifiers():
-                    st = _parse_identifier(ident, set())
-                    results.append((st[0], st[1], st[2], True))
-            elif isinstance(tk, Identifier):
-                st = _parse_identifier(tk, set())
-                results.append((st[0], st[1], st[2], True))
-        i += 1
-    return results
-
-def _is_subselect(token):
-    from sqlparse.tokens import DML
-    if not token.is_group:
-        return False
-    return any(sub.ttype is DML and sub.value.upper() == "SELECT" for sub in token.tokens)
-
-def _extract_main_from(tokenlist, known_ctes):
-    from sqlparse.tokens import Keyword
-    from sqlparse.sql import IdentifierList, Identifier
-    results = []
-    alias_map = {}
-    tokens = list(tokenlist)
-    from_seen = False
-    i = 0
-    while i < len(tokens):
-        tk = tokens[i]
-        if hasattr(tk, "is_group") and tk.is_group and _is_subselect(tk):
-            results.extend(_extract_subselect_tokens(tk.tokens))
-        if tk.ttype is Keyword:
-            from_seen = tk.value.upper() in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN")
-        if from_seen:
-            if isinstance(tk, IdentifierList):
-                for ident in tk.get_identifiers():
-                    st = _parse_identifier(ident, known_ctes)
-                    results.append(st)
-                    if st[2]:
-                        alias_map[st[2]] = (st[0], st[1])
-            elif isinstance(tk, Identifier):
-                st = _parse_identifier(tk, known_ctes)
-                results.append(st)
-                if st[2]:
-                    alias_map[st[2]] = (st[0], st[1])
-        i += 1
-    return (results, alias_map)
-
-def _parse_identifier(ident, known_cte_names):
-    alias = ident.get_alias()
-    real_name = ident.get_real_name()
-    schema = ident.get_parent_name()
-    if real_name and any(real_name.upper() == n.upper() for n in known_cte_names):
-        return (None, f"(CTE) {real_name}", alias, False)
-    return (schema, real_name, alias, False)
-
-def _extract_columns(statement):
-    from sqlparse.tokens import DML, Keyword
-    from sqlparse.sql import IdentifierList, Identifier, Parenthesis
-    results = []
-    tokens = list(statement.tokens)
-    i = 0
-    while i < len(tokens):
-        tk = tokens[i]
-        if tk.ttype is DML:
-            upv = tk.value.upper()
-            if upv == "SELECT":
-                results.extend(_parse_select_list(tokens, i+1))
-            elif upv in ("INSERT", "UPDATE"):
-                results.extend(_parse_dml_columns(tokens, i, upv))
-        i += 1
-    return results
-
-def _parse_select_list(tokens, start_idx):
-    from sqlparse.tokens import Keyword
-    from sqlparse.sql import IdentifierList, Identifier
-    columns = []
-    i = start_idx
-    while i < len(tokens):
-        tk = tokens[i]
-        if tk.ttype is Keyword and tk.value.upper() in ("FROM", "JOIN", "WHERE", "GROUP", "ORDER", "UNION", "INTERSECT"):
-            break
-        if isinstance(tk, IdentifierList):
-            for ident in tk.get_identifiers():
-                nm = ident.get_name()
-                if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
-                    columns.append(nm)
-        elif isinstance(tk, Identifier):
-            nm = tk.get_name()
-            if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
-                columns.append(nm)
-        i += 1
-    return columns
-
-def _parse_dml_columns(tokens, start_idx, dml_word):
-    from sqlparse.tokens import Keyword
-    from sqlparse.sql import Parenthesis, IdentifierList, Identifier
-    columns = []
-    if dml_word == "INSERT":
-        i = start_idx
-        while i < len(tokens):
-            tk = tokens[i]
-            if tk.is_group and isinstance(tk, Parenthesis):
-                for sub in tk.tokens:
-                    if isinstance(sub, IdentifierList):
-                        for ident in sub.get_identifiers():
-                            columns.append(ident.get_name())
-                    elif isinstance(sub, Identifier):
-                        columns.append(sub.get_name())
-                return columns
-            i += 1
-    elif dml_word == "UPDATE":
-        i = start_idx
-        while i < len(tokens):
-            tk = tokens[i]
-            if tk.ttype is Keyword and tk.value.upper() == "SET":
-                i += 1
-                columns.extend(_parse_update_set_list(tokens, i))
-                break
-            i += 1
-    return columns
-
-def _parse_update_set_list(tokens, start_i):
-    from sqlparse.tokens import Keyword
-    from sqlparse.sql import Identifier
-    cols = []
-    i = start_i
-    while i < len(tokens):
-        tk = tokens[i]
-        if tk.ttype is Keyword and tk.value.upper() in ("WHERE", "FROM"):
-            break
-        if isinstance(tk, Identifier):
-            cols.append(tk.get_name())
-        i += 1
-    return cols
+###############################################################################
+# End of brm_rule_engine
+###############################################################################
