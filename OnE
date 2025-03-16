@@ -815,6 +815,104 @@ Advanced functionality includes:
 """
 
 
+def run_data_validations(conn):
+    """
+    Executes all data validations defined in the DATA_VALIDATIONS table.
+    For each validation, it runs a query based on the validation type:
+      - For "NOT NULL": checks that the specified column contains no NULL values.
+      - For "RANGE": expects parameters like "min=0;max=100" and checks that numeric values in the column fall within this range.
+      - For "UNIQUE": checks that the specified column does not contain duplicate values.
+    The results are logged into the DATA_VALIDATION_LOGS table.
+    """
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
+            FROM DATA_VALIDATIONS
+        """)
+        validations = cursor.fetchall()
+    except Exception as e:
+        logger.error("Error fetching validations: %s", e)
+        return
+
+    for val in validations:
+        validation_id, table_name, column_name, validation_type, params = val
+        result_flag = "PASS"
+        details = ""
+        try:
+            if validation_type.upper() == "NOT NULL":
+                # Check that the specified column contains no NULL values.
+                query = f"SELECT COUNT(*) FROM {table_name} WHERE {column_name} IS NULL"
+                cursor.execute(query)
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    result_flag = "FAIL"
+                    details = f"{count} rows have NULL in column '{column_name}'."
+                else:
+                    details = f"All rows have non-NULL values in column '{column_name}'."
+            elif validation_type.upper() == "RANGE":
+                # Expecting parameters in the format: "min=0;max=100"
+                min_val = None
+                max_val = None
+                if params:
+                    for part in params.split(";"):
+                        part = part.strip()
+                        if part.lower().startswith("min="):
+                            min_val = float(part.split("=")[1])
+                        elif part.lower().startswith("max="):
+                            max_val = float(part.split("=")[1])
+                if min_val is None or max_val is None:
+                    result_flag = "FAIL"
+                    details = "Invalid parameters for RANGE validation."
+                else:
+                    # Check that all numeric values in the column are within the given range.
+                    query = f"""
+                        SELECT COUNT(*) FROM {table_name}
+                        WHERE TRY_CAST({column_name} AS FLOAT) IS NOT NULL 
+                          AND (TRY_CAST({column_name} AS FLOAT) < {min_val} OR TRY_CAST({column_name} AS FLOAT) > {max_val})
+                    """
+                    cursor.execute(query)
+                    count = cursor.fetchone()[0]
+                    if count > 0:
+                        result_flag = "FAIL"
+                        details = f"{count} rows have values outside the range [{min_val}, {max_val}]."
+                    else:
+                        details = f"All rows have values within the range [{min_val}, {max_val}]."
+            elif validation_type.upper() == "UNIQUE":
+                # Check that the column values are unique.
+                query = f"""
+                    SELECT COUNT(*) FROM (
+                        SELECT {column_name}, COUNT(*) AS cnt
+                        FROM {table_name}
+                        GROUP BY {column_name}
+                        HAVING COUNT(*) > 1
+                    ) AS duplicates
+                """
+                cursor.execute(query)
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    result_flag = "FAIL"
+                    details = f"{count} duplicate value(s) found in column '{column_name}'."
+                else:
+                    details = f"All values in column '{column_name}' are unique."
+            else:
+                result_flag = "FAIL"
+                details = f"Validation type '{validation_type}' not implemented."
+        except Exception as ex:
+            result_flag = "FAIL"
+            details = f"Error during validation: {ex}"
+
+        # Log the result in DATA_VALIDATION_LOGS.
+        try:
+            cursor.execute("""
+                INSERT INTO DATA_VALIDATION_LOGS(VALIDATION_ID, RESULT_FLAG, DETAILS, VALIDATION_TIMESTAMP)
+                VALUES(?, ?, ?, GETDATE())
+            """, (validation_id, result_flag, details))
+            conn.commit()
+        except Exception as log_ex:
+            logger.error(f"Error logging validation {validation_id}: {log_ex}")
+
 
 ###############################################################################
 # 1) BFS RULE EXECUTION (UNIFIED)
@@ -3216,6 +3314,57 @@ class RuleEditorDialog(QDialog):
         except Exception as ex:
             QMessageBox.critical(self, "Error", str(ex))
 
+
+def create_multistep_approvals(conn, rule_id, initiated_by):
+    """
+    Create multi‑step approval process records for a rule in the BRM_RULE_APPROVALS table.
+
+    This function determines the impacted business groups and inserts approval records for each stage.
+    In this example, it creates two stages:
+      • Stage 1: The rule owner's business group must approve.
+      • Stage 2: A global approval from the 'GlobalApprovers' group.
+
+    All approval records are inserted with APPROVED_FLAG = 0 (pending).
+
+    Parameters:
+      conn          : Database connection object.
+      rule_id       : The ID of the rule that requires approval.
+      initiated_by  : The username of the user who initiated the rule creation/update.
+
+    Returns:
+      None
+    """
+    c = conn.cursor()
+    try:
+        # Fetch rule details to determine the owner group.
+        c.execute("SELECT OWNER_GROUP FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+        row = c.fetchone()
+        if not row:
+            raise ValueError("Rule not found for approvals")
+        owner_group = row[0]
+
+        # Insert Stage 1 approval record for the owner's business group.
+        c.execute("""
+            INSERT INTO BRM_RULE_APPROVALS 
+            (RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVAL_STAGE)
+            VALUES (?, ?, ?, 0, 1)
+        """, (rule_id, owner_group, initiated_by))
+
+        # Insert Stage 2 approval record for a global approver group.
+        c.execute("""
+            INSERT INTO BRM_RULE_APPROVALS 
+            (RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVAL_STAGE)
+            VALUES (?, ?, ?, 0, 2)
+        """, (rule_id, "GlobalApprovers", initiated_by))
+
+        conn.commit()
+        logger.info(f"Multi‑step approvals created for rule {rule_id} by {initiated_by}")
+    except Exception as ex:
+        conn.rollback()
+        logger.error(f"Error creating multi‑step approvals for rule {rule_id}: {ex}")
+        raise
+
+
 # End of PART 4
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
@@ -4911,7 +5060,7 @@ class AlertsAndDashboardsTab(QWidget):
 ###############################################################################
 # End of PART 7
 ###############################################################################
-# !/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
@@ -4926,17 +5075,20 @@ This module integrates all functionalities from Parts 1–7 and adds advanced fe
   • A unified main window with a modern flat UI, wizard‑based flows, real‑time notifications, and admin impersonation.
 
 Assumptions:
-  - Helper functions (e.g. insert_audit_log, LockManager, detect_operation_type, parse_sql_dependencies) and modules from Parts 1–7 are available.
-  - A HELP_CONTENT table exists in the database with the following (example) schema:
-      CREATE TABLE dbo.HELP_CONTENT (
-          HELP_ID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-          CATEGORY VARCHAR(50) NOT NULL,  -- 'FAQ' or 'Guide'
-          TITLE VARCHAR(200) NOT NULL,
-          CONTENT VARCHAR(MAX) NOT NULL,
-          LAST_UPDATED DATETIME NOT NULL DEFAULT(GETDATE())
-      );
-
-All features are fully implemented with robust error handling.
+  - All helper functions and classes (e.g. insert_audit_log, LockManager, detect_operation_type,
+    parse_sql_dependencies, run_data_validations, create_multistep_approvals, load_rule_relationships,
+    BusinessRulesTab, ApprovalsTab, SchedulingTab, DefectManagementTab, MetricsDashboardTab,
+    CompositeRulesTab, WhatIfTestTab, HierarchyViewTab, MultiStepApprovalTab, GlobalCriticalAdminTab,
+    CollaborationTab, CtrlTablesTab, GroupManagementTab, UserManagementTab, CustomRuleGroupEnhancedTab,
+    AlertsAndDashboardsTab, ConflictPriorityTab, VersionHistoryDialog) are defined earlier in this integrated file.
+  - A HELP_CONTENT table exists in the database with the following schema:
+        CREATE TABLE dbo.HELP_CONTENT (
+            HELP_ID INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            CATEGORY VARCHAR(50) NOT NULL,  -- 'FAQ' or 'Guide'
+            TITLE VARCHAR(200) NOT NULL,
+            CONTENT VARCHAR(MAX) NOT NULL,
+            LAST_UPDATED DATETIME NOT NULL DEFAULT(GETDATE())
+        );
 """
 
 import sys, os, json, csv, math, logging
@@ -4944,24 +5096,21 @@ from datetime import datetime, timedelta
 
 # PyQt5 and pyqtgraph imports
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QDateTime
+from PyQt5.QtCore import Qt, QTimer, QDateTime, QPointF
 from PyQt5.QtGui import QPen, QBrush, QColor, QFont, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QLabel,
     QPushButton, QDockWidget, QLineEdit, QMessageBox, QComboBox, QTableWidget, QTableWidgetItem,
     QPlainTextEdit, QInputDialog, QFileDialog, QTreeWidget, QTreeWidgetItem, QGraphicsView,
-    QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem, QProgressDialog, QSplitter
+    QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem, QProgressDialog, QSplitter, QStyle, QCalendarWidget, QTimeEdit, QFormLayout, QGroupBox, QCheckBox
 )
 import pyqtgraph as pg
-
-# For predictive analytics
 from sklearn.linear_model import LinearRegression
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# Help & Feedback Tab – Database-backed dynamic help
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# HELP & FEEDBACK TAB – Database-backed dynamic help
+# -----------------------------------------------------------------------------
 class HelpFeedbackTab(QWidget):
     def __init__(self, connection, parent=None):
         super().__init__(parent)
@@ -4995,12 +5144,10 @@ class HelpFeedbackTab(QWidget):
         self.populate_help_content()
 
     def populate_help_content(self):
-        """Fetch help content dynamically from the HELP_CONTENT table."""
         c = self.connection.cursor()
         try:
             c.execute("SELECT CATEGORY, TITLE, CONTENT FROM HELP_CONTENT ORDER BY CATEGORY, LAST_UPDATED DESC")
             rows = c.fetchall()
-            # Clear previous content
             self.faq_widget.clear()
             self.guides_widget.clear()
             for row in rows:
@@ -5014,7 +5161,6 @@ class HelpFeedbackTab(QWidget):
             QMessageBox.critical(self, "Help Content Error", f"Error fetching help content: {ex}")
 
     def filter_help(self):
-        """Filter both FAQs and Guides based on search text."""
         text = self.help_search.text().lower()
         for tree in [self.faq_widget, self.guides_widget]:
             for i in range(tree.topLevelItemCount()):
@@ -5022,17 +5168,15 @@ class HelpFeedbackTab(QWidget):
                 visible = text in item.text(0).lower() or text in item.text(1).lower()
                 item.setHidden(not visible)
 
-
-# ---------------------------------------------------------------------------
-# Enhanced Audit Log Analysis Tab with Progress & Status Icons
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# ENHANCED AUDIT LOG ANALYSIS TAB
+# -----------------------------------------------------------------------------
 class EnhancedAuditLogAnalysisTab(QWidget):
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
         layout = QVBoxLayout(self)
 
-        # Search bar
         search_layout = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search audit logs (action, table, actor)...")
@@ -5041,7 +5185,6 @@ class EnhancedAuditLogAnalysisTab(QWidget):
         search_layout.addWidget(self.search_edit)
         layout.addLayout(search_layout)
 
-        # Audit log table (extra column for status icon)
         self.audit_table = QTableWidget(0, 9)
         self.audit_table.setHorizontalHeaderLabels([
             "AuditID", "Action", "Table", "RecordID", "ActionBy", "OldData", "NewData", "Timestamp", "Status"
@@ -5049,7 +5192,6 @@ class EnhancedAuditLogAnalysisTab(QWidget):
         self.audit_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.audit_table)
 
-        # Button row: Refresh, Export, Diff
         btn_layout = QHBoxLayout()
         refresh_btn = QPushButton("Refresh Logs")
         refresh_btn.clicked.connect(self.load_logs)
@@ -5069,7 +5211,6 @@ class EnhancedAuditLogAnalysisTab(QWidget):
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
-        # Trend chart using pyqtgraph
         self.trend_chart = pg.PlotWidget(title="Audit Log Trend (Last 30 Days)")
         self.trend_chart.setBackground('w')
         layout.addWidget(self.trend_chart)
@@ -5101,15 +5242,14 @@ class EnhancedAuditLogAnalysisTab(QWidget):
                         except Exception:
                             pass
                     self.audit_table.setItem(row_index, col, QTableWidgetItem(str(val) if val is not None else ""))
-                # Add a status icon based on the action type
-                action = row[1].upper() if row[1] else ""
+                action = (row[1] or "").upper()
                 status_item = QTableWidgetItem()
                 if "APPROVE" in action:
-                    status_item.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton))
+                    status_item.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
                 elif "REJECT" in action:
-                    status_item.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_MessageBoxCritical))
+                    status_item.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxCritical))
                 else:
-                    status_item.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogDetailedView))
+                    status_item.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
                 self.audit_table.setItem(row_index, 8, status_item)
         except Exception as ex:
             QMessageBox.critical(self, "Audit Log Error", str(ex))
@@ -5138,8 +5278,7 @@ class EnhancedAuditLogAnalysisTab(QWidget):
             for i in range(total_rows):
                 if self.audit_table.isRowHidden(i):
                     continue
-                row_data = [self.audit_table.item(i, j).text() if self.audit_table.item(i, j) else "" for j in
-                            range(self.audit_table.columnCount())]
+                row_data = [self.audit_table.item(i, j).text() if self.audit_table.item(i, j) else "" for j in range(self.audit_table.columnCount())]
                 data.append(row_data)
                 progress.setValue(int((i / total_rows) * 100))
                 QApplication.processEvents()
@@ -5194,17 +5333,15 @@ class EnhancedAuditLogAnalysisTab(QWidget):
         except Exception as ex:
             QMessageBox.critical(self, "Trend Chart Error", str(ex))
 
-
-###############################################################################
-# Predictive Analytics Tab with Advanced Filtering
-###############################################################################
+# -----------------------------------------------------------------------------
+# PREDICTIVE ANALYTICS TAB
+# -----------------------------------------------------------------------------
 class PredictiveAnalyticsTab(QWidget):
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
         layout = QVBoxLayout(self)
 
-        # Filtering controls
         filter_layout = QHBoxLayout()
         self.rule_filter_edit = QLineEdit()
         self.rule_filter_edit.setPlaceholderText("Filter by rule name...")
@@ -5221,10 +5358,10 @@ class PredictiveAnalyticsTab(QWidget):
         filter_layout.addWidget(QLabel("Column:"))
         filter_layout.addWidget(self.column_filter_edit)
 
-        self.db_filter_edit = QLineEdit()
-        self.db_filter_edit.setPlaceholderText("Filter by database...")
+        self.database_filter_edit = QLineEdit()
+        self.database_filter_edit.setPlaceholderText("Filter by database...")
         filter_layout.addWidget(QLabel("Database:"))
-        filter_layout.addWidget(self.db_filter_edit)
+        filter_layout.addWidget(self.database_filter_edit)
 
         self.ug_filter_edit = QLineEdit()
         self.ug_filter_edit.setPlaceholderText("Filter by user group...")
@@ -5233,7 +5370,6 @@ class PredictiveAnalyticsTab(QWidget):
 
         layout.addLayout(filter_layout)
 
-        # Performance forecasting chart
         self.chart = pg.PlotWidget(title="Forecast: Average Execution Time")
         self.chart.setBackground('w')
         layout.addWidget(self.chart)
@@ -5249,7 +5385,6 @@ class PredictiveAnalyticsTab(QWidget):
     def run_forecast(self):
         c = self.connection.cursor()
         try:
-            # For demo purposes, forecast on last 30 days (filters can be integrated further)
             c.execute("""
                 SELECT CONVERT(date, ACTION_TIMESTAMP) as LogDate, AVG(EXEC_TIME_MS) as AvgTime
                 FROM RULE_PERF_STATS
@@ -5263,18 +5398,17 @@ class PredictiveAnalyticsTab(QWidget):
                 return
             dates = [row[0] for row in rows]
             avg_times = [row[1] for row in rows]
-            X = [[i] for i in range(len(avg_times))]
-            y = avg_times
+            X = np.array([[i] for i in range(len(avg_times))])
+            y = np.array(avg_times)
             model = LinearRegression()
             model.fit(X, y)
             forecast_index = len(avg_times)
-            forecast = model.predict([[forecast_index]])[0]
+            forecast = model.predict(np.array([[forecast_index]]))[0]
             anomaly = forecast > 2000
             self.chart.clear()
             x_vals = list(range(len(avg_times)))
             self.chart.plot(x_vals, avg_times, pen=pg.mkPen('b', width=2), symbol='o', name="Historical AvgTime")
-            self.chart.plot([forecast_index], [forecast], pen=pg.mkPen('r', width=2), symbol='x', symbolSize=14,
-                            name="Forecast")
+            self.chart.plot([forecast_index], [forecast], pen=pg.mkPen('r', width=2), symbol='x', symbolSize=14, name="Forecast")
             self.chart.getAxis("bottom").setLabel("Day Index (Last 30 Days)")
             self.chart.getAxis("left").setLabel("Average Execution Time (ms)")
             if anomaly:
@@ -5284,17 +5418,15 @@ class PredictiveAnalyticsTab(QWidget):
         except Exception as ex:
             QMessageBox.critical(self, "Forecast Error", str(ex))
 
-
-###############################################################################
-# Enhanced Lineage Analysis Tab with Advanced Filtering
-###############################################################################
+# -----------------------------------------------------------------------------
+# ENHANCED LINEAGE ANALYSIS TAB
+# -----------------------------------------------------------------------------
 class EnhancedLineageAnalysisTab(QWidget):
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
         layout = QVBoxLayout(self)
 
-        # Advanced filtering controls for lineage graph
         filter_layout = QHBoxLayout()
         self.rule_name_filter = QLineEdit()
         self.rule_name_filter.setPlaceholderText("Rule Name...")
@@ -5326,8 +5458,7 @@ class EnhancedLineageAnalysisTab(QWidget):
         filter_layout.addWidget(apply_filter_btn)
         layout.addLayout(filter_layout)
 
-        # Interactive lineage graph widget
-        from part5 import EnhancedLineageGraphWidget  # Fully implemented in Part 5
+        # Interactive lineage graph widget (from Part 5 – assumed fully implemented)
         self.lineage_graph = EnhancedLineageGraphWidget(self.connection)
         layout.addWidget(self.lineage_graph, stretch=2)
 
@@ -5384,7 +5515,7 @@ class EnhancedLineageAnalysisTab(QWidget):
         details = item.data(0, Qt.UserRole)
         dlg = QDialog(self)
         dlg.setWindowTitle("Version Details")
-        dlg.resize(600, 400)
+        dlg.resize(800, 600)
         layout = QVBoxLayout(dlg)
         text_edit = QPlainTextEdit()
         text_edit.setReadOnly(True)
@@ -5396,10 +5527,10 @@ class EnhancedLineageAnalysisTab(QWidget):
         layout.addWidget(close_btn)
         dlg.exec_()
 
-
-###############################################################################
-# Admin Tab (User Mgmt, Group Mgmt, Control Tables)
-###############################################################################
+# -----------------------------------------------------------------------------
+# ADMIN TAB – Aggregates user management, group management, control tables, etc.
+# (Assumes that UserManagementTab, GroupManagementTab, and CtrlTablesTab are fully implemented in Parts 6–7)
+# -----------------------------------------------------------------------------
 class AdminTab(QWidget):
     def __init__(self, connection, user_id, user_group, parent=None):
         super().__init__(parent)
@@ -5411,10 +5542,12 @@ class AdminTab(QWidget):
             layout.addWidget(QLabel("Access Denied: Admin only."))
             self.setLayout(layout)
             return
+
         self.inner_tabs = QTabWidget()
         layout.addWidget(self.inner_tabs)
 
-        from part6 import UserManagementTab, GroupManagementTab, CtrlTablesTab
+        # The following classes are assumed to be defined in this integrated system:
+        # UserManagementTab, GroupManagementTab, CtrlTablesTab.
         self.user_mgmt_tab = UserManagementTab(self.connection)
         self.inner_tabs.addTab(self.user_mgmt_tab, "User Management")
 
@@ -5423,12 +5556,12 @@ class AdminTab(QWidget):
 
         self.ctrl_tables_tab = CtrlTablesTab(self.connection, self.user_group)
         self.inner_tabs.addTab(self.ctrl_tables_tab, "Control Tables")
+
         self.setLayout(layout)
 
-
-###############################################################################
-# Main Window
-###############################################################################
+# -----------------------------------------------------------------------------
+# MAIN WINDOW
+# -----------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self, connection, user_id, user_group):
         super().__init__()
@@ -5451,7 +5584,7 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         central_layout = QVBoxLayout(central_widget)
 
-        # Admin impersonation panel (for Admins)
+        # Admin impersonation panel (only for Admin)
         if self.user_group == "Admin":
             imp_layout = QHBoxLayout()
             self.impersonation_combo = QComboBox()
@@ -5467,17 +5600,11 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         central_layout.addWidget(self.tabs)
 
-        try:
-            from part1 import BusinessRulesTab, LoginDialog
-            from part2 import ApprovalsTab, SchedulingTab, DefectManagementTab
-            from part3 import MetricsDashboardTab, CompositeRulesTab, WhatIfTestTab
-            from part5 import HierarchyViewTab, MultiStepApprovalTab, GlobalCriticalAdminTab, CollaborationTab
-            from part6 import CtrlTablesTab, GroupManagementTab, UserManagementTab
-            from part7 import CustomRuleGroupEnhancedTab, AlertsAndDashboardsTab, ConflictPriorityTab, \
-                VersionHistoryDialog
-        except Exception:
-            BusinessRulesTab = ApprovalsTab = SchedulingTab = DefectManagementTab = MetricsDashboardTab = CompositeRulesTab = WhatIfTestTab = HierarchyViewTab = MultiStepApprovalTab = GlobalCriticalAdminTab = CollaborationTab = CtrlTablesTab = GroupManagementTab = UserManagementTab = CustomRuleGroupEnhancedTab = AlertsAndDashboardsTab = ConflictPriorityTab = VersionHistoryDialog = QWidget
-
+        # For the integrated system, the following classes are assumed to be defined:
+        # BusinessRulesTab, ApprovalsTab, SchedulingTab, DefectManagementTab, MetricsDashboardTab,
+        # CompositeRulesTab, WhatIfTestTab, HierarchyViewTab, MultiStepApprovalTab, GlobalCriticalAdminTab,
+        # CollaborationTab, EnhancedAuditLogAnalysisTab, PredictiveAnalyticsTab, EnhancedLineageAnalysisTab,
+        # HelpFeedbackTab, and AdminTab.
         self.dashboard_tab = MetricsDashboardTab(self.connection)
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
 
@@ -5534,13 +5661,11 @@ class MainWindow(QMainWindow):
         central_widget.setLayout(central_layout)
         self.setCentralWidget(central_widget)
 
-        # Real-time notifications dock widget
         self.notifications_dock = QDockWidget("Real-Time Notifications", self)
         self.notifications_widget = AlertsAndDashboardsTab(self.connection)
         self.notifications_dock.setWidget(self.notifications_widget)
         self.addDockWidget(Qt.RightDockWidgetArea, self.notifications_dock)
 
-        # Timer for periodic refresh
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_tabs)
         self.refresh_timer.start(30000)
@@ -5585,7 +5710,7 @@ class MainWindow(QMainWindow):
                 break
 
     def create_collaboration_manager(self):
-        from part5 import CollaborationManager
+        from CollaborationManager import CollaborationManager  # Assume CollaborationManager is defined in the integrated system.
         return CollaborationManager(self.connection, poll_ms=5000)
 
     def refresh_tabs(self):
@@ -5598,15 +5723,14 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             logging.error(f"Error refreshing tabs: {ex}")
 
-
-###############################################################################
-# Main Application Launcher
-###############################################################################
+# -----------------------------------------------------------------------------
+# MAIN APPLICATION LAUNCHER
+# -----------------------------------------------------------------------------
 def main():
     app = QApplication(sys.argv)
 
-    # Step 1: Database Connection
-    from part1 import DatabaseConnectionDialog
+    # Database Connection
+    from DatabaseConnectionDialog import DatabaseConnectionDialog  # Assumed defined in integrated system
     db_dialog = DatabaseConnectionDialog()
     if db_dialog.exec_() != QDialog.Accepted:
         sys.exit(0)
@@ -5614,19 +5738,17 @@ def main():
     if not conn:
         sys.exit(1)
 
-    # Step 2: Login
-    from part1 import LoginDialog
+    # Login (plain text as requested)
+    from LoginDialog import LoginDialog  # Assumed defined in integrated system
     login_dialog = LoginDialog(conn)
     if login_dialog.exec_() != QDialog.Accepted:
         sys.exit(0)
     user_id = login_dialog.user_id
     user_group = login_dialog.user_group
 
-    # Step 3: Launch Main Window
     main_window = MainWindow(conn, user_id, user_group)
     main_window.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
