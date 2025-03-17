@@ -1,0 +1,361 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+GlobalCriticalAdminTab – Admin-Only Interface for Managing Global/Critical Rules
+
+Features:
+  • Displays a table of rules from BRM_RULES filtered by IS_GLOBAL=1 or CRITICAL_RULE=1.
+  • Allows force activation and deactivation of rules.
+  • Provides controls to link/unlink parent-child relationships in the 
+    BRM_GLOBAL_CRITICAL_LINKS table.
+  • Includes refresh functionality.
+  
+Assumes that the database tables (BRM_RULES, BRM_GLOBAL_CRITICAL_LINKS, BRM_RULE_LOCKS) exist 
+with the appropriate columns as defined in the DDL examples.
+"""
+
+import sys
+import math
+import json
+import logging
+from collections import defaultdict
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QPushButton,
+    QAbstractItemView, QMessageBox, QComboBox, QLabel, QLineEdit, QInputDialog
+)
+
+logger = logging.getLogger("GlobalCriticalAdminTab")
+
+# Assume insert_audit_log is defined elsewhere (or use the version provided earlier)
+def insert_audit_log(conn, action, table_name, record_id, actor, old_data=None, new_data=None):
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO BRM_AUDIT_LOG (ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, GETDATE())
+        """, (action, table_name, str(record_id) if record_id else None, actor,
+              json.dumps(old_data) if old_data else None,
+              json.dumps(new_data) if new_data else None))
+        conn.commit()
+        logger.debug(f"Audit log inserted: {action} on {table_name} (Record: {record_id})")
+    except Exception as e:
+        logger.error(f"Error inserting audit log: {e}")
+
+class GlobalCriticalAdminTab(QWidget):
+    def __init__(self, connection, user_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_group = user_group
+        layout = QVBoxLayout(self)
+        if self.user_group != "Admin":
+            layout.addWidget(QLabel("Access Denied: Admin only"))
+            self.setLayout(layout)
+            return
+
+        # Top controls: refresh and show-only checkbox
+        top_layout = QHBoxLayout()
+        self.show_only_gcr = QCheckBox("Show only Global/Critical rules")
+        self.show_only_gcr.setChecked(True)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_rule_list)
+        top_layout.addWidget(self.show_only_gcr)
+        top_layout.addWidget(refresh_btn)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
+
+        # Table for listing rules
+        self.rule_table = QTableWidget(0, 9)
+        self.rule_table.setHorizontalHeaderLabels([
+            "RuleID", "RuleName", "OwnerGroup", "IS_GLOBAL", "CRITICAL_RULE",
+            "CRITICAL_SCOPE", "Status", "UpdatedBy", "Force Act/Deact"
+        ])
+        self.rule_table.horizontalHeader().setStretchLastSection(True)
+        self.rule_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.rule_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.rule_table)
+
+        # Linking controls for Global/Critical relationships
+        link_layout = QHBoxLayout()
+        self.gcr_parent_combo = QComboBox()
+        link_layout.addWidget(QLabel("Parent GCR Rule:"))
+        link_layout.addWidget(self.gcr_parent_combo)
+        self.gcr_child_combo = QComboBox()
+        link_layout.addWidget(QLabel("Child Rule:"))
+        link_layout.addWidget(self.gcr_child_combo)
+        link_btn = QPushButton("Link Child")
+        link_btn.clicked.connect(self.link_child)
+        unlink_btn = QPushButton("Unlink Child")
+        unlink_btn.clicked.connect(self.unlink_child)
+        link_layout.addWidget(link_btn)
+        link_layout.addWidget(unlink_btn)
+        link_layout.addStretch()
+        layout.addLayout(link_layout)
+
+        # Table for viewing existing global-critical links
+        self.link_view = QTableWidget(0, 2)
+        self.link_view.setHorizontalHeaderLabels(["Parent GCR Rule", "Child Rule"])
+        self.link_view.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.link_view)
+
+        refresh_all_btn = QPushButton("Refresh All")
+        refresh_all_btn.clicked.connect(self.refresh_all)
+        layout.addWidget(refresh_all_btn)
+        self.setLayout(layout)
+        self.refresh_all()
+
+    def refresh_all(self):
+        self.load_rule_list()
+        self.load_link_view()
+        self.populate_gcr_combo()
+        self.populate_child_combo()
+
+    def load_rule_list(self):
+        self.rule_table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            if self.show_only_gcr.isChecked():
+                c.execute("""
+                    SELECT RULE_ID, RULE_NAME, OWNER_GROUP, IS_GLOBAL, CRITICAL_RULE,
+                           CRITICAL_SCOPE, STATUS, UPDATED_BY
+                    FROM BRM_RULES
+                    WHERE IS_GLOBAL=1 OR CRITICAL_RULE=1
+                    ORDER BY RULE_ID DESC
+                """)
+            else:
+                c.execute("""
+                    SELECT RULE_ID, RULE_NAME, OWNER_GROUP, IS_GLOBAL, CRITICAL_RULE,
+                           CRITICAL_SCOPE, STATUS, UPDATED_BY
+                    FROM BRM_RULES
+                    ORDER BY RULE_ID DESC
+                """)
+            rows = c.fetchall()
+            for row in rows:
+                row_index = self.rule_table.rowCount()
+                self.rule_table.insertRow(row_index)
+                for col, val in enumerate(row):
+                    self.rule_table.setItem(row_index, col, QTableWidgetItem(str(val) if val is not None else ""))
+                # Last column: Action buttons for force activate/deactivate
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(0, 0, 0, 0)
+                force_act_btn = QPushButton("ForceActivate")
+                force_act_btn.clicked.connect(lambda _, rid=row[0]: self.force_activate(rid))
+                force_deact_btn = QPushButton("ForceDeactivate")
+                force_deact_btn.clicked.connect(lambda _, rid=row[0]: self.force_deactivate(rid))
+                action_layout.addWidget(force_act_btn)
+                action_layout.addWidget(force_deact_btn)
+                action_layout.addStretch()
+                self.rule_table.setCellWidget(row_index, 8, action_widget)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def load_link_view(self):
+        self.link_view.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS ORDER BY GCR_RULE_ID")
+            rows = c.fetchall()
+            for row in rows:
+                row_index = self.link_view.rowCount()
+                self.link_view.insertRow(row_index)
+                self.link_view.setItem(row_index, 0, QTableWidgetItem(str(row[0])))
+                self.link_view.setItem(row_index, 1, QTableWidgetItem(str(row[1])))
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def populate_gcr_combo(self):
+        self.gcr_parent_combo.clear()
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT RULE_ID, RULE_NAME
+                FROM BRM_RULES
+                WHERE IS_GLOBAL=1 OR CRITICAL_RULE=1
+                ORDER BY RULE_ID
+            """)
+            for (rid, rn) in c.fetchall():
+                self.gcr_parent_combo.addItem(f"{rid} - {rn}", rid)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def populate_child_combo(self):
+        self.gcr_child_combo.clear()
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+            for (rid, rn) in c.fetchall():
+                self.gcr_child_combo.addItem(f"{rid} - {rn}", rid)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def link_child(self):
+        parent_id = self.gcr_parent_combo.currentData()
+        child_id = self.gcr_child_combo.currentData()
+        if not parent_id or not child_id:
+            QMessageBox.warning(self, "Missing", "Both parent and child must be selected.")
+            return
+        confirm = QMessageBox.question(self, "Link", f"Link child {child_id} to parent {parent_id}?")
+        if confirm != QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("INSERT INTO BRM_GLOBAL_CRITICAL_LINKS (GCR_RULE_ID, TARGET_RULE_ID) VALUES (?, ?)",
+                      (parent_id, child_id))
+            insert_audit_log(self.connection, "LINK_GCR", "BRM_GLOBAL_CRITICAL_LINKS",
+                             f"{parent_id}->{child_id}", "Admin", None, {"parent": parent_id, "child": child_id})
+            self.connection.commit()
+            QMessageBox.information(self, "Linked", f"Child {child_id} linked to parent {parent_id}.")
+            self.load_link_view()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def unlink_child(self):
+        parent_id = self.gcr_parent_combo.currentData()
+        child_id = self.gcr_child_combo.currentData()
+        if not parent_id or not child_id:
+            QMessageBox.warning(self, "Missing", "Both parent and child must be selected.")
+            return
+        confirm = QMessageBox.question(self, "Unlink", f"Unlink child {child_id} from parent {parent_id}?")
+        if confirm != QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("DELETE FROM BRM_GLOBAL_CRITICAL_LINKS WHERE GCR_RULE_ID=? AND TARGET_RULE_ID=?",
+                      (parent_id, child_id))
+            insert_audit_log(self.connection, "UNLINK_GCR", "BRM_GLOBAL_CRITICAL_LINKS",
+                             f"{parent_id}->{child_id}", "Admin", {"parent": parent_id, "child": child_id}, None)
+            self.connection.commit()
+            QMessageBox.information(self, "Unlinked", f"Child {child_id} unlinked from parent {parent_id}.")
+            self.load_link_view()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def force_activate(self, rule_id):
+        confirm = QMessageBox.question(self, "Force Activate", f"Force activate rule {rule_id}?")
+        if confirm != QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT STATUS FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+            row = c.fetchone()
+            if row and row[0].upper() == "ACTIVE":
+                QMessageBox.information(self, "Already Active", "Rule is already active.")
+                return
+            c.execute("""
+                UPDATE BRM_RULES
+                SET STATUS='ACTIVE', LIFECYCLE_STATE='ACTIVE', APPROVAL_STATUS='FORCE_ACTIVATED'
+                WHERE RULE_ID=?
+            """, (rule_id,))
+            insert_audit_log(self.connection, "FORCE_ACTIVATE", "BRM_RULES", rule_id, "Admin",
+                             {"old_status": row[0] if row else None}, {"new_status": "ACTIVE"})
+            self.connection.commit()
+            QMessageBox.information(self, "Activated", f"Rule {rule_id} force-activated.")
+            self.load_rule_list()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def force_deactivate(self, rule_id):
+        confirm = QMessageBox.question(self, "Force Deactivate", f"Force deactivate rule {rule_id}?")
+        if confirm != QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            # Check for active children; if any, confirm deactivation.
+            c.execute("SELECT RULE_ID FROM BRM_RULES WHERE PARENT_RULE_ID=? AND STATUS='ACTIVE'", (rule_id,))
+            children = c.fetchall()
+            if children:
+                confirm_children = QMessageBox.question(self, "Active Children",
+                                                         "Active child rules exist. Deactivate them as well?",
+                                                         QMessageBox.Yes | QMessageBox.No)
+                if confirm_children != QMessageBox.Yes:
+                    return
+                descendants = self.get_all_descendants(rule_id)
+                for child_id in descendants:
+                    c.execute("""
+                        UPDATE BRM_RULES
+                        SET STATUS='INACTIVE', LIFECYCLE_STATE='INACTIVE'
+                        WHERE RULE_ID=?
+                    """, (child_id,))
+                    insert_audit_log(self.connection, "FORCE_DEACTIVATE", "BRM_RULES", child_id, "Admin", None, {"status": "INACTIVE"})
+            c.execute("SELECT STATUS FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+            row = c.fetchone()
+            old_status = row[0] if row else None
+            c.execute("""
+                UPDATE BRM_RULES
+                SET STATUS='INACTIVE', LIFECYCLE_STATE='INACTIVE', APPROVAL_STATUS='FORCE_DEACTIVATED'
+                WHERE RULE_ID=?
+            """, (rule_id,))
+            insert_audit_log(self.connection, "FORCE_DEACTIVATE", "BRM_RULES", rule_id, "Admin",
+                             {"old_status": old_status}, {"new_status": "INACTIVE"})
+            self.connection.commit()
+            QMessageBox.information(self, "Deactivated", f"Rule {rule_id} force-deactivated.")
+            self.load_rule_list()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def get_all_descendants(self, start_id):
+        c = self.connection.cursor()
+        c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
+        rows = c.fetchall()
+        children_map = defaultdict(list)
+        for rid, pid in rows:
+            if pid:
+                children_map[pid].append(rid)
+        visited = set()
+        queue = [start_id]
+        descendants = []
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            for child in children_map.get(current, []):
+                descendants.append(child)
+                queue.append(child)
+        return descendants
+
+    def load_rule_list_internal(self):
+        # Helper function to reload rule list.
+        self.rule_table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT RULE_ID, RULE_NAME, OWNER_GROUP, IS_GLOBAL, CRITICAL_RULE,
+                       CRITICAL_SCOPE, STATUS, UPDATED_BY
+                FROM BRM_RULES
+                ORDER BY RULE_ID DESC
+            """)
+            rows = c.fetchall()
+            for row in rows:
+                row_index = self.rule_table.rowCount()
+                self.rule_table.insertRow(row_index)
+                for col, val in enumerate(row):
+                    self.rule_table.setItem(row_index, col, QTableWidgetItem(str(val) if val is not None else ""))
+                self.rule_table.setItem(row_index, 8, QTableWidgetItem(""))
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def load_rule_list(self):
+        self.load_rule_list_internal()
+
+
+# ---------------------- Testing GlobalCriticalAdminTab ----------------------
+if __name__ == "__main__":
+    from PyQt5 import QtWidgets
+    import pyodbc
+    import sys
+
+    app = QtWidgets.QApplication(sys.argv)
+    # Update DSN/connection string as needed
+    conn_str = "DSN=YourDSNName;Trusted_Connection=yes;"
+    try:
+        conn = pyodbc.connect(conn_str)
+    except Exception as ex:
+        print(f"Database connection error: {ex}")
+        sys.exit(1)
+    widget = GlobalCriticalAdminTab(conn, "Admin")
+    widget.show()
+    sys.exit(app.exec_())
