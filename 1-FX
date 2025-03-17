@@ -1,49 +1,286 @@
-Below is a complete, self‑contained code snippet for a new lineage tab (named “LineageTab”) that uses your existing EnhancedLineageGraphWidget. You can replace your old lineage tab (the textual one) with this code. Then, in your MainWindow (or wherever you build your tabs), update the reference so that the “Enhanced Lineage” tab instantiates LineageTab instead.
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+EnhancedLineageGraphWidget – Advanced End‑to‑End Lineage Visualization
 
-from PyQt5.QtWidgets import QWidget, QVBoxLayout
+Features:
+  • Advanced force‑directed layout with repulsion and spring forces.
+  • Table‑like node visualization: each node displays rule name (in header), owner, operation type,
+    plus a summary of source and target tables.
+  • Directional edges with arrowheads and an edge label showing the linking table name.
+  • A public setSearchQuery(query) method to filter nodes by any searchable attribute.
+  • Constructs lineage based on BRM_RULES and BRM_RULE_TABLE_DEPENDENCIES:
+       – For each rule, “READ” dependencies become its source tables and “WRITE” dependencies its target tables.
+       – An edge is drawn from rule A to rule B when a table written by A is read by B.
+  • Colors and text indicate special types of rules (e.g. if CRITICAL_RULE is set or if OPERATION_TYPE is DATA_VALIDATION).
 
-# Ensure that EnhancedLineageGraphWidget is imported from your Part 5 code
-# from your_module import EnhancedLineageGraphWidget
+Note: This code assumes you are using a pyodbc connection and that your database tables are named as in your DDL.
+"""
 
-class LineageTab(QWidget):
-    """
-    LineageTab – This tab displays the end-to‑end lineage using the EnhancedLineageGraphWidget.
-    It leverages the force‑directed layout algorithm to present a MANTA‑like interactive view.
-    """
+import math, json
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QTimer, QPointF
+from PyQt5.QtGui import QBrush, QPen, QColor, QPolygonF
+from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsItem
+
+# ---------------------- RuleNodeItem Class ----------------------
+class RuleNodeItem(QtWidgets.QGraphicsItem):
+    def __init__(self, rule_data, width=220, height=90):
+        super().__init__()
+        self.rule_data = rule_data
+        self.width = width
+        self.height = height
+        self.force = QPointF(0, 0)
+        self.velocity = QPointF(0, 0)
+        # Determine background color based on rule type:
+        # Critical rules in light red; Data Validation in light green; otherwise light blue.
+        if rule_data.get("CRITICAL_RULE") == 1:
+            self.bg_color = QColor("#FFCCCC")
+        elif (rule_data.get("OPERATION_TYPE") or "").upper() == "DATA_VALIDATION":
+            self.bg_color = QColor("#CCFFCC")
+        else:
+            self.bg_color = QColor("#CCCCFF")
+        # Enable moving and geometry-change notifications.
+        self.setFlags(QtWidgets.QGraphicsItem.ItemIsMovable | QtWidgets.QGraphicsItem.ItemSendsGeometryChanges)
+    
+    def boundingRect(self):
+        return QtCore.QRectF(0, 0, self.width, self.height)
+    
+    def paint(self, painter, option, widget):
+        # Draw the node as a rounded rectangle with two sections.
+        rect = self.boundingRect()
+        # Main rectangle:
+        painter.setPen(QPen(Qt.black))
+        painter.setBrush(QBrush(self.bg_color))
+        painter.drawRoundedRect(rect, 5, 5)
+        # Header: rule name
+        header_rect = QtCore.QRectF(0, 0, self.width, 25)
+        painter.setBrush(QBrush(Qt.darkGray))
+        painter.drawRoundedRect(header_rect, 5, 5)
+        painter.setPen(Qt.white)
+        painter.drawText(header_rect, Qt.AlignCenter, self.rule_data.get("RULE_NAME", ""))
+        # Body: display owner, operation type, and summary of source/target tables
+        painter.setPen(Qt.black)
+        body_rect = QtCore.QRectF(5, 30, self.width - 10, self.height - 35)
+        owner = self.rule_data.get("OWNER_GROUP", "Unknown")
+        op_type = self.rule_data.get("OPERATION_TYPE", "N/A")
+        src_tables = sorted({tbl for db, tbl, col in self.rule_data.get("source_tables", set())})
+        tgt_tables = sorted({tbl for db, tbl, col in self.rule_data.get("target_tables", set())})
+        text = f"Owner: {owner}\nType: {op_type}"
+        if src_tables:
+            text += f"\nSrc: {', '.join(src_tables)}"
+        if tgt_tables:
+            text += f"\nTgt: {', '.join(tgt_tables)}"
+        painter.drawText(body_rect, Qt.AlignLeft | Qt.AlignTop, text)
+    
+    def itemChange(self, change, value):
+        if change == QtWidgets.QGraphicsItem.ItemPositionChange:
+            # Update connected edges when node moves.
+            for item in self.scene().items():
+                if isinstance(item, EdgeItem):
+                    if item.source == self or item.dest == self:
+                        item.updatePosition()
+        return super().itemChange(change, value)
+
+# ---------------------- EdgeItem Class ----------------------
+class EdgeItem(QtWidgets.QGraphicsLineItem):
+    def __init__(self, source, dest, table_info):
+        super().__init__()
+        self.source = source
+        self.dest = dest
+        self.table_info = table_info  # tuple (dbname, tblname) representing the linking table
+        self.setPen(QPen(Qt.gray, 2))
+        self.arrow_head = None
+        self.label_item = None
+    
+    def updatePosition(self):
+        # Compute line from center of source to center of destination
+        src_center = self.source.pos() + QPointF(self.source.width / 2, self.source.height / 2)
+        dst_center = self.dest.pos() + QPointF(self.dest.width / 2, self.dest.height / 2)
+        line = QtCore.QLineF(src_center, dst_center)
+        self.setLine(line)
+        self.update_arrowhead(line)
+    
+    def update_arrowhead(self, line):
+        # Remove previous arrowhead if any
+        scene = self.scene()
+        if self.arrow_head:
+            scene.removeItem(self.arrow_head)
+            self.arrow_head = None
+        # Calculate arrowhead points
+        angle = math.atan2(-line.dy(), line.dx())
+        arrow_size = 10.0
+        p1 = line.p2() - QPointF(math.cos(angle - math.pi / 6) * arrow_size,
+                                  -math.sin(angle - math.pi / 6) * arrow_size)
+        p2 = line.p2() - QPointF(math.cos(angle + math.pi / 6) * arrow_size,
+                                  -math.sin(angle + math.pi / 6) * arrow_size)
+        polygon = QPolygonF([line.p2(), p1, p2])
+        self.arrow_head = scene.addPolygon(polygon, self.pen(), QBrush(Qt.gray))
+        # Draw label (table name) at midpoint of line
+        mid_point = (line.p1() + line.p2()) / 2
+        if self.label_item is None:
+            self.label_item = scene.addText("")
+            self.label_item.setDefaultTextColor(Qt.darkGray)
+        self.label_item.setPlainText(f"{self.table_info[1]}")  # show table name
+        self.label_item.setPos(mid_point)
+
+# ---------------------- EnhancedLineageGraphWidget Class ----------------------
+class EnhancedLineageGraphWidget(QGraphicsView):
     def __init__(self, connection, parent=None):
         super().__init__(parent)
         self.connection = connection
-        layout = QVBoxLayout(self)
-        
-        # Instantiate your existing EnhancedLineageGraphWidget.
-        self.graph_widget = EnhancedLineageGraphWidget(self.connection)
-        layout.addWidget(self.graph_widget)
-        
-        self.setLayout(layout)
-
-    def refresh_lineage(self):
-        """
-        Call this method to refresh or re-run the force-directed layout.
-        For example, you can bind this to a refresh button.
-        """
-        self.graph_widget.setup_force_directed()
-
-How to Integrate
-	1.	Replace the Old Tab:
-Remove the old code for your textual EnhancedLineageAnalysisTab and replace it with the above LineageTab class.
-	2.	Update MainWindow:
-In your MainWindow (or the central tab widget creation), replace the line where you create the lineage tab. For example, change:
-
-self.lineage_tab = EnhancedLineageAnalysisTab(self.connection)
-self.tabs.addTab(self.lineage_tab, QIcon(), "Enhanced Lineage")
-
-to:
-
-self.lineage_tab = LineageTab(self.connection)
-self.tabs.addTab(self.lineage_tab, QIcon(), "Enhanced Lineage")
-
-
-	3.	Optional Refresh Button:
-If you need to allow users to refresh the graph, you can add a refresh button in the LineageTab that calls self.refresh_lineage().
-
-This snippet is complete and can be used to replace your old lineage tab code so that your “Enhanced Lineage” tab now shows the interactive, graphical view using your EnhancedLineageGraphWidget.
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+        self.setRenderHint(QtGui.QPainter.Antialiasing)
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.nodes = {}   # rule_id -> RuleNodeItem
+        self.edges = []   # list of EdgeItem
+        self.search_query = ""
+        self.load_data()
+        # Start a timer for force-directed layout simulation
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_forces)
+        self.timer.start(30)
+    
+    def load_data(self):
+        """Load rules and dependencies from the database and build the graph."""
+        c = self.connection.cursor()
+        # Query rule data from BRM_RULES
+        c.execute("""
+            SELECT RULE_ID, RULE_NAME, OWNER_GROUP, DESCRIPTION, OPERATION_TYPE, CRITICAL_RULE 
+            FROM BRM_RULES
+        """)
+        rules = c.fetchall()
+        self.rule_data = {}  # rule_id -> dict with details and sets for source/target tables
+        for row in rules:
+            rid, rname, owner, desc, op_type, critical = row
+            self.rule_data[rid] = {
+                "RULE_ID": rid,
+                "RULE_NAME": rname,
+                "OWNER_GROUP": owner,
+                "DESCRIPTION": desc,
+                "OPERATION_TYPE": op_type,
+                "CRITICAL_RULE": critical,
+                "source_tables": set(),  # set of tuples (dbname, tblname, column)
+                "target_tables": set()
+            }
+        # Query dependencies from BRM_RULE_TABLE_DEPENDENCIES
+        c.execute("""
+            SELECT RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_NAME, COLUMN_OP 
+            FROM BRM_RULE_TABLE_DEPENDENCIES
+        """)
+        deps = c.fetchall()
+        for dep in deps:
+            rid, dbname, tblname, colname, col_op = dep
+            if rid in self.rule_data:
+                if col_op.upper() == "READ":
+                    self.rule_data[rid]["source_tables"].add((dbname, tblname, colname))
+                elif col_op.upper() == "WRITE":
+                    self.rule_data[rid]["target_tables"].add((dbname, tblname, colname))
+        # Create node items for each rule
+        for rid, data in self.rule_data.items():
+            node = RuleNodeItem(data)
+            # Place node at a semi-random initial position based on rule id.
+            node.setPos(50 + (rid % 10) * 80, 50 + (rid // 10) * 80)
+            self.scene.addItem(node)
+            self.nodes[rid] = node
+        # Build edges: For each pair of rules, if a target table in rule A matches a source table in rule B, create an edge.
+        added_edges = set()
+        for rid_a, data_a in self.rule_data.items():
+            # Create a set of (dbname, tblname) for target tables of rule A.
+            targets = { (db, tbl) for db, tbl, col in data_a["target_tables"] }
+            for rid_b, data_b in self.rule_data.items():
+                if rid_a == rid_b:
+                    continue
+                sources = { (db, tbl) for db, tbl, col in data_b["source_tables"] }
+                common = targets & sources
+                if common:
+                    for table in common:
+                        edge_key = (rid_a, rid_b, table)
+                        if edge_key in added_edges:
+                            continue
+                        edge = EdgeItem(self.nodes[rid_a], self.nodes[rid_b], table)
+                        self.scene.addItem(edge)
+                        self.edges.append(edge)
+                        added_edges.add(edge_key)
+    
+    def update_forces(self):
+        """Simple force-directed layout: apply repulsion between all nodes and spring attraction along edges."""
+        repulsion = 1000.0
+        spring_length = 150.0
+        spring_strength = 0.05
+        damping = 0.85
+        # Reset forces for all nodes.
+        for node in self.nodes.values():
+            node.force = QPointF(0, 0)
+        node_list = list(self.nodes.values())
+        # Repulsive forces:
+        for i in range(len(node_list)):
+            for j in range(i + 1, len(node_list)):
+                node_a = node_list[i]
+                node_b = node_list[j]
+                delta = node_a.pos() - node_b.pos()
+                distance = max(1.0, math.hypot(delta.x(), delta.y()))
+                force_magnitude = repulsion / (distance * distance)
+                force = (delta / distance) * force_magnitude
+                node_a.force += force
+                node_b.force -= force
+        # Attractive (spring) forces along edges:
+        for edge in self.edges:
+            delta = edge.source.pos() - edge.dest.pos()
+            distance = max(1.0, math.hypot(delta.x(), delta.y()))
+            displacement = distance - spring_length
+            force = (delta / distance) * (spring_strength * displacement)
+            edge.source.force -= force
+            edge.dest.force += force
+        # Update node positions:
+        for node in self.nodes.values():
+            velocity = node.velocity + node.force * 0.1
+            velocity *= damping
+            node.velocity = velocity
+            new_pos = node.pos() + velocity
+            node.setPos(new_pos)
+        # Update all edges:
+        for edge in self.edges:
+            edge.updatePosition()
+        # Apply search filter after layout update:
+        self.apply_search_filter()
+    
+    def setSearchQuery(self, query):
+        """Set the search query (a string) and update node visibility."""
+        self.search_query = query.lower()
+        self.apply_search_filter()
+    
+    def apply_search_filter(self):
+        """Hide nodes that do not match the search query in any searchable field."""
+        for node in self.nodes.values():
+            data = node.rule_data
+            # Concatenate searchable attributes: rule name, owner, operation type, and table names from source and target.
+            searchable = " ".join([
+                str(data.get("RULE_NAME", "")),
+                str(data.get("OWNER_GROUP", "")),
+                " ".join([tbl for db, tbl, col in data.get("source_tables", set())]),
+                " ".join([tbl for db, tbl, col in data.get("target_tables", set())]),
+                str(data.get("OPERATION_TYPE", ""))
+            ]).lower()
+            if self.search_query in searchable:
+                node.setVisible(True)
+            else:
+                node.setVisible(False)
+        # Also hide edges if either connected node is hidden.
+        for edge in self.edges:
+            if edge.source.isVisible() and edge.dest.isVisible():
+                edge.setVisible(True)
+                if edge.label_item:
+                    edge.label_item.setVisible(True)
+            else:
+                edge.setVisible(False)
+                if edge.label_item:
+                    edge.label_item.setVisible(False)
+    
+    def refresh(self):
+        """Clear and reload the graph."""
+        self.scene.clear()
+        self.nodes.clear()
+        self.edges.clear()
+        self.load_data()
