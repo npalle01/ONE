@@ -1,68 +1,137 @@
-def load_approvals(self):
-    """
-    Loads pending approval records for the current user.
-    Retrieves the lock owner from BRM_RULE_LOCKS via a LEFT JOIN.
-    Filters the approvals to display only those for which the approval stage
-    is the minimum for each rule.
-    """
-    self.approvals_table.setRowCount(0)
-    c = self.connection.cursor()
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+GroupApproverTab: A fully implemented tab to add an approver to an existing group.
+This tab allows the admin to:
+  • Select an existing group from a dropdown (populated from BUSINESS_GROUPS)
+  • Enter the approver's username
+  • Click "Add Approver" to insert the record into the GROUP_APPROVERS table
+  • View the current approvers for the selected group in a table
+
+Assumptions:
+  – The BUSINESS_GROUPS table exists and has a GROUP_NAME column.
+  – The GROUP_APPROVERS table exists with the following DDL:
+  
+      CREATE TABLE GROUP_APPROVERS (
+          APPROVER_ID INT IDENTITY(1,1) PRIMARY KEY,
+          GROUP_NAME VARCHAR(100) NOT NULL,
+          APPROVER_USERNAME VARCHAR(100) NOT NULL,
+          CREATED_TIMESTAMP DATETIME DEFAULT GETDATE()
+      );
+
+  – A helper function `insert_audit_log(conn, action, table_name, record_id, actor, old_data, new_data)`
+     is available for logging.
+"""
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QPushButton, QLabel,
+    QTableWidget, QTableWidgetItem, QMessageBox
+)
+
+# Dummy implementation of audit log helper (replace with your real one)
+def insert_audit_log(conn, action, table_name, record_id, actor, old_data=None, new_data=None):
+    # This function should insert an audit log record into your audit table.
+    print(f"Audit Log: {action} on {table_name} for record {record_id} by {actor}. Details: {new_data}")
+
+class GroupApproverTab(QWidget):
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Form layout: select group and enter approver username
+        form_layout = QHBoxLayout()
+        form_layout.addWidget(QLabel("Select Group:"))
+        self.group_combo = QComboBox()
+        form_layout.addWidget(self.group_combo)
+        form_layout.addWidget(QLabel("Approver Username:"))
+        self.approver_edit = QLineEdit()
+        form_layout.addWidget(self.approver_edit)
+        add_btn = QPushButton("Add Approver")
+        add_btn.clicked.connect(self.add_approver)
+        form_layout.addWidget(add_btn)
+        layout.addLayout(form_layout)
+
+        # Table to display current approvers for the selected group
+        self.approvers_table = QTableWidget(0, 3)
+        self.approvers_table.setHorizontalHeaderLabels(["Approver ID", "Group", "Approver Username"])
+        self.approvers_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.approvers_table)
+
+        self.setLayout(layout)
+        self.load_groups()
+        self.group_combo.currentIndexChanged.connect(self.load_approvers)
+
+    def load_groups(self):
+        """Load group names from BUSINESS_GROUPS table into the combo box."""
+        self.group_combo.clear()
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT GROUP_NAME FROM BUSINESS_GROUPS ORDER BY GROUP_NAME")
+            rows = c.fetchall()
+            for row in rows:
+                group_name = row[0]
+                self.group_combo.addItem(group_name)
+        except Exception as ex:
+            QMessageBox.critical(self, "Load Groups Error", str(ex))
+    
+    def load_approvers(self):
+        """Load existing approvers for the currently selected group."""
+        self.approvers_table.setRowCount(0)
+        group_name = self.group_combo.currentText()
+        if not group_name:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT APPROVER_ID, GROUP_NAME, APPROVER_USERNAME FROM GROUP_APPROVERS WHERE GROUP_NAME = ? ORDER BY APPROVER_ID", (group_name,))
+            rows = c.fetchall()
+            for i, row in enumerate(rows):
+                self.approvers_table.insertRow(i)
+                for j, val in enumerate(row):
+                    self.approvers_table.setItem(i, j, QTableWidgetItem(str(val)))
+        except Exception as ex:
+            QMessageBox.critical(self, "Load Approvers Error", str(ex))
+    
+    def add_approver(self):
+        """Add the entered approver to the selected group."""
+        group_name = self.group_combo.currentText()
+        approver_username = self.approver_edit.text().strip()
+        if not group_name or not approver_username:
+            QMessageBox.warning(self, "Input Error", "Please select a group and enter an approver username.")
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("INSERT INTO GROUP_APPROVERS (GROUP_NAME, APPROVER_USERNAME, CREATED_TIMESTAMP) VALUES (?, ?, GETDATE())", (group_name, approver_username))
+            self.connection.commit()
+            insert_audit_log(self.connection, "INSERT", "GROUP_APPROVERS", None, "Admin", None, {"group": group_name, "approver": approver_username})
+            QMessageBox.information(self, "Success", f"Approver '{approver_username}' added to group '{group_name}'.")
+            self.approver_edit.clear()
+            self.load_approvers()
+        except Exception as ex:
+            QMessageBox.critical(self, "Add Approver Error", str(ex))
+
+# For testing purposes, you can run this widget standalone:
+if __name__ == "__main__":
+    import pyodbc
+    import sys
+
+    app = QtWidgets.QApplication(sys.argv)
+    # Adjust your connection string as needed for your SQL Server environment.
+    conn_str = "DSN=YourDSNName;Trusted_Connection=yes;"
     try:
-        query = """
-            SELECT 
-                A.RULE_ID, 
-                A.GROUP_NAME, 
-                R.RULE_NAME, 
-                A.APPROVAL_STAGE, 
-                A.APPROVED_FLAG,
-                ISNULL(L.LOCKED_BY, 'Unlocked') AS LOCKED_BY
-            FROM BRM_RULE_APPROVALS A
-            JOIN BRM_RULES R ON A.RULE_ID = R.RULE_ID
-            LEFT JOIN BRM_RULE_LOCKS L 
-                ON R.RULE_ID = L.RULE_ID AND L.ACTIVE_LOCK = 1
-            WHERE A.USERNAME = ? AND A.APPROVED_FLAG = 0
-            ORDER BY A.RULE_ID
-        """
-        c.execute(query, (self.logged_in_username,))
-        rows = c.fetchall()
-
-        # Helper to fetch the current minimum approval stage for a given rule.
-        def get_min_stage(rule_id):
-            cur = self.connection.cursor()
-            cur.execute("""
-                SELECT MIN(APPROVAL_STAGE)
-                FROM BRM_RULE_APPROVALS
-                WHERE RULE_ID = ? AND APPROVED_FLAG = 0
-            """, (rule_id,))
-            res = cur.fetchone()
-            return res[0] if res and res[0] is not None else None
-
-        # Filter rows: Only include rows where the approval stage equals the minimum stage.
-        filtered = [row for row in rows if row[3] == get_min_stage(row[0])]
-
-        self.approvals_table.setRowCount(len(filtered))
-        for i, row in enumerate(filtered):
-            rule_id, group_name, rule_name, stage, approved_flag, locked_by = row
-            self.approvals_table.setItem(i, 0, QTableWidgetItem(str(rule_id)))
-            self.approvals_table.setItem(i, 1, QTableWidgetItem(str(group_name)))
-            self.approvals_table.setItem(i, 2, QTableWidgetItem(str(rule_name)))
-            self.approvals_table.setItem(i, 3, QTableWidgetItem(str(stage)))
-            self.approvals_table.setItem(i, 4, QTableWidgetItem(str(approved_flag)))
-            # Approve button
-            approve_btn = QPushButton("Approve")
-            # Capture current row index using default argument to avoid late binding.
-            approve_btn.clicked.connect(lambda _, idx=i: self.do_approve(idx))
-            self.approvals_table.setCellWidget(i, 5, approve_btn)
-            # Reject button
-            reject_btn = QPushButton("Reject")
-            reject_btn.clicked.connect(lambda _, idx=i: self.do_reject(idx))
-            self.approvals_table.setCellWidget(i, 6, reject_btn)
-            # Display lock status from BRM_RULE_LOCKS
-            self.approvals_table.setItem(i, 7, QTableWidgetItem(str(locked_by)))
-            # Force Unlock button (enabled only for admin users)
-            force_btn = QPushButton("ForceUnlock")
-            force_btn.setEnabled(self.user_group == "Admin")
-            force_btn.clicked.connect(lambda _, idx=i: self.do_forceunlock(idx))
-            self.approvals_table.setCellWidget(i, 8, force_btn)
+        connection = pyodbc.connect(conn_str)
     except Exception as ex:
-        QMessageBox.critical(self, "Approval Load Error", str(ex))
+        print("Database connection error:", ex)
+        sys.exit(1)
+
+    # Create and show the GroupApproverTab widget
+    widget = GroupApproverTab(connection)
+    widget.setWindowTitle("Group Approver Tab (Admin)")
+    widget.resize(600, 400)
+    widget.show()
+    sys.exit(app.exec_())
