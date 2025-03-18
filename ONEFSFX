@@ -1,0 +1,985 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Fully Integrated Advanced BRM Tool Components
+  • Advanced SQL parsing with mapping tables: tables, cte_tables, alias_map, columns.
+  • RuleEditorDialog: When adding/editing a rule it (a) uses advanced parsing to extract dependencies,
+    (b) validates against duplicate rule names or identical SQL (normalized) within the same owner group,
+    and (c) checks that the user’s group has permission on every referenced table.
+  • EnhancedLineageGraphWidget: Displays rule nodes in a grid‐layout with connected lines (with arrowheads).
+    A search bar lets you filter nodes by matching any table, column, or database referenced in the rule SQL.
+  
+Assumptions:
+  – The database contains at least these tables:
+       BRM_RULES (columns: RULE_ID, RULE_NAME, RULE_SQL, OWNER_GROUP, …),
+       GROUP_PERMISSIONS (columns: GROUP_NAME, TARGET_TABLE),
+       BRM_AUDIT_LOG (for audit logging).
+  – Advanced SQL parsing is based on sqlparse.
+  
+Replace your current rule editor and lineage modules with the code below.
+"""
+
+import sys, re, json, math, sqlite3, logging
+from datetime import datetime
+
+import sqlparse
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtWidgets import (
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QMessageBox, QFormLayout, QPlainTextEdit, QWidget,
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem,
+    QGraphicsLineItem
+)
+from PyQt5.QtCore import Qt, QPointF, QLineF, QRectF
+from PyQt5.QtGui import QPen, QBrush, QPolygonF
+
+# ---------------------- Logging Setup ----------------------
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("AdvancedBRM")
+
+# =============================================================================
+# Advanced SQL Parsing Functions (integrated from existing code)
+# =============================================================================
+
+def detect_operation_type(sql_text: str) -> str:
+    cleaned = re.sub(r'(--.*?$)|(/\*.*?\*/)', '', sql_text, flags=re.MULTILINE | re.DOTALL).lstrip()
+    up = cleaned.upper()
+    if up.startswith("INSERT"):
+        return "INSERT"
+    elif up.startswith("UPDATE"):
+        return "UPDATE"
+    elif up.startswith("DELETE"):
+        return "DELETE"
+    elif up.startswith("SELECT"):
+        return "SELECT"
+    else:
+        return "OTHER"
+
+def parse_sql_dependencies(sql_text: str):
+    """
+    Uses sqlparse to extract:
+      • tables (a list of referenced tables)
+      • cte_tables (list of tuples: (CTE name, its table references))
+      • alias_map (mapping from alias to (schema, real table))
+      • columns (list of column references from SELECT or DML statements)
+    """
+    try:
+        statements = sqlparse.parse(sql_text)
+    except Exception as ex:
+        logger.error(f"SQL parsing error: {ex}")
+        return {"tables": [], "cte_tables": [], "alias_map": {}, "columns": []}
+    all_tables = []
+    cte_info = []
+    alias_map = {}
+    columns = []
+    for stmt in statements:
+        ctes = _extract_with_clauses(stmt)
+        for cName, cRefs in ctes.items():
+            cte_info.append((cName, cRefs))
+        main_refs, main_alias = _extract_main_from(stmt.tokens, set(ctes.keys()))
+        all_tables.extend(main_refs)
+        alias_map.update(main_alias)
+        col_refs = _extract_columns(stmt)
+        columns.extend(col_refs)
+    unique_tables = list({x for x in all_tables if x})
+    return {"tables": unique_tables, "cte_tables": cte_info, "alias_map": alias_map, "columns": columns}
+
+def _extract_with_clauses(statement):
+    tokens = list(statement.tokens)
+    i = 0
+    cte_map = {}
+    from sqlparse.tokens import Keyword
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is Keyword and tk.value.upper() == "WITH":
+            i += 1
+            i = _parse_cte_block(tokens, i, cte_map)
+            continue
+        i += 1
+    return cte_map
+
+def _parse_cte_block(tokens, i, cte_map):
+    from sqlparse.sql import Identifier, Parenthesis
+    from sqlparse.tokens import Keyword
+    while i < len(tokens):
+        tk = tokens[i]
+        if isinstance(tk, Identifier):
+            cte_name = tk.get_real_name()
+            i += 1
+            i = _parse_cte_as_clause(tokens, i, cte_name, cte_map)
+        elif tk.ttype is Keyword and tk.value.upper() in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            return i
+        else:
+            i += 1
+    return i
+
+def _parse_cte_as_clause(tokens, i, cte_name, cte_map):
+    from sqlparse.sql import Parenthesis
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.value.upper() == "AS":
+            i += 1
+            if i < len(tokens):
+                sub = tokens[i]
+                if isinstance(sub, Parenthesis):
+                    sub_refs = _extract_subselect_tokens(sub.tokens)
+                    cte_map[cte_name] = sub_refs
+                    i += 1
+                    return i
+        else:
+            i += 1
+    return i
+
+def _extract_subselect_tokens(tokens):
+    from sqlparse.sql import IdentifierList, Identifier
+    from sqlparse.tokens import Keyword
+    results = []
+    from_seen = False
+    for tk in tokens:
+        if hasattr(tk, "is_group") and tk.is_group and _is_subselect(tk):
+            results.extend(_extract_subselect_tokens(tk.tokens))
+        if tk.ttype is Keyword:
+            upv = tk.value.upper()
+            if upv in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
+        if from_seen:
+            if isinstance(tk, IdentifierList):
+                for ident in tk.get_identifiers():
+                    results.append(_parse_identifier(ident, set()))
+            elif isinstance(tk, Identifier):
+                results.append(_parse_identifier(tk, set()))
+    return results
+
+def _is_subselect(token):
+    from sqlparse.tokens import DML
+    if not token.is_group:
+        return False
+    for sub in token.tokens:
+        if sub.ttype is DML and sub.value.upper() == "SELECT":
+            return True
+    return False
+
+def _extract_main_from(tokenlist, known_cte_names):
+    from sqlparse.tokens import Keyword
+    from sqlparse.sql import IdentifierList, Identifier
+    results = []
+    alias_map = {}
+    tokens = list(tokenlist)
+    from_seen = False
+    for tk in tokens:
+        if hasattr(tk, "is_group") and tk.is_group and _is_subselect(tk):
+            results.extend(_extract_subselect_tokens(tk.tokens))
+        if tk.ttype is Keyword:
+            upv = tk.value.upper()
+            if upv in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
+        if from_seen:
+            if isinstance(tk, IdentifierList):
+                for ident in tk.get_identifiers():
+                    st = _parse_identifier(ident, known_cte_names)
+                    results.append(st[1])  # Append real table name
+                    if st[2]:
+                        alias_map[st[2]] = (st[0], st[1])
+            elif isinstance(tk, Identifier):
+                st = _parse_identifier(tk, known_cte_names)
+                results.append(st[1])
+                if st[2]:
+                    alias_map[st[2]] = (st[0], st[1])
+    return (results, alias_map)
+
+def _parse_identifier(ident, known_cte_names):
+    alias = ident.get_alias()
+    real_name = ident.get_real_name()
+    schema = ident.get_parent_name()
+    if real_name and any(real_name.upper() == n.upper() for n in known_cte_names):
+        return (None, f"(CTE) {real_name}", alias, False)
+    return (schema, real_name, alias, False)
+
+def _extract_columns(statement):
+    from sqlparse.tokens import DML, Keyword
+    from sqlparse.sql import IdentifierList, Identifier, Parenthesis
+    results = []
+    tokens = list(statement.tokens)
+    for tk in tokens:
+        if tk.ttype is DML:
+            upv = tk.value.upper()
+            if upv == "SELECT":
+                results.extend(_parse_select_list(tokens))
+            elif upv in ("INSERT", "UPDATE"):
+                results.extend(_parse_dml_columns(tokens, upv))
+    return results
+
+def _parse_select_list(tokens):
+    from sqlparse.tokens import Keyword
+    from sqlparse.sql import IdentifierList, Identifier
+    columns = []
+    for tk in tokens:
+        if tk.ttype is Keyword and tk.value.upper() in ("FROM", "JOIN", "WHERE", "GROUP", "ORDER", "UNION", "INTERSECT"):
+            break
+        if isinstance(tk, IdentifierList):
+            for ident in tk.get_identifiers():
+                nm = ident.get_name()
+                if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
+                    columns.append(nm)
+        elif isinstance(tk, Identifier):
+            nm = tk.get_name()
+            if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
+                columns.append(nm)
+    return columns
+
+def _parse_dml_columns(tokens, dml_word):
+    from sqlparse.tokens import Keyword
+    from sqlparse.sql import Parenthesis, IdentifierList, Identifier
+    columns = []
+    if dml_word == "INSERT":
+        for tk in tokens:
+            if tk.is_group and isinstance(tk, Parenthesis):
+                for sub in tk.tokens:
+                    if isinstance(sub, IdentifierList):
+                        for ident in sub.get_identifiers():
+                            columns.append(ident.get_name())
+                    elif isinstance(sub, Identifier):
+                        columns.append(sub.get_name())
+                break
+    elif dml_word == "UPDATE":
+        found_set = False
+        for tk in tokens:
+            if tk.ttype is Keyword and tk.value.upper() == "SET":
+                found_set = True
+            elif found_set:
+                if tk.ttype is Keyword and tk.value.upper() in ("WHERE", "FROM"):
+                    break
+                if isinstance(tk, Identifier):
+                    columns.append(tk.get_name())
+    return columns
+
+# =============================================================================
+# User Permissions Checker
+# =============================================================================
+
+def check_user_table_permissions(conn, user_group, tables):
+    """
+    Checks that each table in the list 'tables' is allowed for the given user_group.
+    Assumes GROUP_PERMISSIONS table with columns GROUP_NAME and TARGET_TABLE.
+    Returns a list of tables missing permission.
+    """
+    missing = []
+    c = conn.cursor()
+    c.execute("SELECT TARGET_TABLE FROM GROUP_PERMISSIONS WHERE GROUP_NAME=?", (user_group,))
+    allowed = {row[0].lower() for row in c.fetchall()}
+    for tbl in tables:
+        if tbl.lower() not in allowed:
+            missing.append(tbl)
+    return missing
+
+# =============================================================================
+# Rule Editor Dialog (Add/Edit) with Advanced SQL Parsing & Permissions
+# =============================================================================
+
+class RuleEditorDialog(QDialog):
+    """
+    Dialog for adding or editing a rule.
+      - Validates that rule name (and normalized SQL) are unique in the same owner group.
+      - Uses advanced SQL parsing to extract mapping tables.
+      - Checks that all tables referenced in the rule SQL are allowed for the user’s group.
+    """
+    def __init__(self, conn, user_group, rule_data=None, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.user_group = user_group
+        self.rule_data = rule_data  # If provided, this is an edit; otherwise, add new.
+        self.setWindowTitle("Edit Rule" if rule_data else "Add Rule")
+        self.resize(600, 500)
+        self.setup_ui()
+        if self.rule_data:
+            self.load_existing_data()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.rule_name_edit = QLineEdit()
+        form.addRow("Rule Name:", self.rule_name_edit)
+        self.rule_sql_edit = QPlainTextEdit()
+        self.rule_sql_edit.setPlaceholderText("Enter rule SQL here...")
+        form.addRow("Rule SQL:", self.rule_sql_edit)
+        layout.addLayout(form)
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.save_rule)
+        btn_layout.addWidget(save_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def load_existing_data(self):
+        self.rule_name_edit.setText(self.rule_data.get("RULE_NAME", ""))
+        self.rule_sql_edit.setPlainText(self.rule_data.get("RULE_SQL", ""))
+
+    def save_rule(self):
+        rule_name = self.rule_name_edit.text().strip()
+        rule_sql = self.rule_sql_edit.toPlainText().strip()
+        if not rule_name:
+            QMessageBox.warning(self, "Validation Error", "Rule name cannot be empty.")
+            return
+        if not rule_sql:
+            QMessageBox.warning(self, "Validation Error", "Rule SQL cannot be empty.")
+            return
+
+        normalized_sql = re.sub(r'\s+', ' ', rule_sql).strip().lower()
+        # Advanced SQL parsing to extract mapping tables.
+        deps = parse_sql_dependencies(rule_sql)
+        tables_referenced = deps.get("tables", [])
+        # Duplicate validation: check for duplicate rule name or duplicate normalized SQL.
+        c = self.conn.cursor()
+        if self.rule_data:
+            current_id = self.rule_data.get("RULE_ID")
+            query = "SELECT RULE_ID, RULE_NAME, RULE_SQL FROM BRM_RULES WHERE OWNER_GROUP=? AND RULE_ID<>?"
+            c.execute(query, (self.user_group, current_id))
+        else:
+            query = "SELECT RULE_ID, RULE_NAME, RULE_SQL FROM BRM_RULES WHERE OWNER_GROUP=?"
+            c.execute(query, (self.user_group,))
+        duplicates = c.fetchall()
+        for rid, existing_name, existing_sql in duplicates:
+            if existing_name.strip().lower() == rule_name.lower():
+                QMessageBox.critical(self, "Duplicate Error", f"A rule with the name '{rule_name}' already exists.")
+                return
+            if re.sub(r'\s+', ' ', existing_sql).strip().lower() == normalized_sql:
+                QMessageBox.critical(self, "Duplicate Error", "A rule with identical SQL already exists in your group.")
+                return
+
+        # Validate table-level permissions.
+        missing_perms = check_user_table_permissions(self.conn, self.user_group, tables_referenced)
+        if missing_perms:
+            QMessageBox.critical(self, "Permission Error",
+                f"User group '{self.user_group}' does not have permission on the following tables:\n{', '.join(missing_perms)}")
+            return
+
+        try:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if self.rule_data:
+                rule_id = self.rule_data.get("RULE_ID")
+                c.execute("""
+                    UPDATE BRM_RULES
+                    SET RULE_NAME=?, RULE_SQL=?, UPDATED_BY='CurrentUser', UPDATED_TIMESTAMP=?
+                    WHERE RULE_ID=?
+                """, (rule_name, rule_sql, now_str, rule_id))
+                action = "UPDATE"
+            else:
+                c.execute("""
+                    INSERT INTO BRM_RULES (RULE_NAME, RULE_SQL, OWNER_GROUP, CREATED_BY, CREATED_TIMESTAMP)
+                    VALUES (?, ?, ?, 'CurrentUser', ?)
+                """, (rule_name, rule_sql, self.user_group, now_str))
+                action = "INSERT"
+            self.conn.commit()
+            insert_audit_log(self.conn, action, "BRM_RULES",
+                             self.rule_data.get("RULE_ID") if self.rule_data else None,
+                             "CurrentUser", None, {"RULE_NAME": rule_name, "RULE_SQL": rule_sql})
+            QMessageBox.information(self, "Success", "Rule saved successfully.")
+            self.accept()
+        except Exception as e:
+            self.conn.rollback()
+            QMessageBox.critical(self, "Database Error", str(e))
+
+# =============================================================================
+# Enhanced Lineage Graph Widget with Search
+# =============================================================================
+
+class NodeItem(QGraphicsRectItem):
+    """
+    Represents a rule node with its mapping info.
+    """
+    def __init__(self, rule_id, rule_name, dependencies, width=140, height=60, parent=None):
+        super().__init__(parent)
+        self.rule_id = rule_id
+        self.rule_name = rule_name
+        self.dependencies = dependencies  # dict with keys "tables", "cte_tables", "alias_map", "columns"
+        self.setRect(0, 0, width, height)
+        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+        self.text = QtWidgets.QGraphicsTextItem(rule_name, self)
+        self.text.setDefaultTextColor(Qt.black)
+        text_rect = self.text.boundingRect()
+        self.text.setPos((width - text_rect.width()) / 2, (height - text_rect.height()) / 2)
+
+class EdgeItem(QGraphicsLineItem):
+    """
+    Represents a directed edge (with arrowhead) between two nodes.
+    """
+    def __init__(self, source, dest, arrow_size=10, parent=None):
+        super().__init__(parent)
+        self.source = source
+        self.dest = dest
+        self.arrow_size = arrow_size
+        self.setPen(QPen(Qt.black, 2))
+        self.adjust()
+        
+    def adjust(self):
+        line = QLineF(self.source.sceneBoundingRect().center(), self.dest.sceneBoundingRect().center())
+        self.setLine(line)
+        
+    def paint(self, painter, option, widget=None):
+        if self.source is None or self.dest is None:
+            return
+        line = self.line()
+        if line.length() == 0:
+            return
+        painter.setPen(self.pen())
+        painter.drawLine(line)
+        # Draw arrowhead at the destination end.
+        angle = math.acos(line.dx() / line.length())
+        if line.dy() >= 0:
+            angle = (2 * math.pi) - angle
+        dest_point = line.p2()
+        arrow_p1 = dest_point + QPointF(math.sin(angle - math.pi / 3) * self.arrow_size,
+                                         math.cos(angle - math.pi / 3) * self.arrow_size)
+        arrow_p2 = dest_point + QPointF(math.sin(angle - math.pi + math.pi / 3) * self.arrow_size,
+                                         math.cos(angle - math.pi + math.pi / 3) * self.arrow_size)
+        arrow_head = QPolygonF([dest_point, arrow_p1, arrow_p2])
+        painter.setBrush(Qt.black)
+        painter.drawPolygon(arrow_head)
+
+class EnhancedLineageGraphWidget(QWidget):
+    """
+    Displays an interactive lineage graph.
+      - Uses advanced SQL parsing from each rule to store dependency info.
+      - Provides a search bar to filter nodes by table, column, or database.
+      - Arranges nodes in a grid layout.
+    """
+    def __init__(self, rules, relationships, parent=None):
+        """
+        :param rules: List of dicts with keys: RULE_ID, RULE_NAME, RULE_SQL, OWNER_GROUP, etc.
+        :param relationships: List of tuples (parent_rule_id, child_rule_id)
+        """
+        super().__init__(parent)
+        self.all_rules = rules
+        self.all_relationships = relationships
+        self.filtered_rules = []   # Filtered by search
+        self.filtered_relationships = []
+        self.setup_ui()
+        self.apply_search_filter()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        search_layout = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search by table, column, or database...")
+        self.search_edit.textChanged.connect(self.apply_search_filter)
+        search_layout.addWidget(QLabel("Lineage Search:"))
+        search_layout.addWidget(self.search_edit)
+        layout.addLayout(search_layout)
+        self.graphics_view = QGraphicsView()
+        self.graphics_view.setRenderHint(QtGui.QPainter.Antialiasing)
+        self.graphics_view.setDragMode(QGraphicsView.ScrollHandDrag)
+        layout.addWidget(self.graphics_view)
+        self.setLayout(layout)
+        self.scene = QGraphicsScene()
+        self.graphics_view.setScene(self.scene)
+
+    def build_graph(self):
+        self.scene.clear()
+        self.node_items = {}
+        # Create nodes; ensure each rule has advanced dependency info.
+        for rule in self.filtered_rules:
+            rule_id = rule.get("RULE_ID")
+            rule_name = rule.get("RULE_NAME", f"Rule {rule_id}")
+            if "dependencies" not in rule or not rule["dependencies"]:
+                rule["dependencies"] = parse_sql_dependencies(rule.get("RULE_SQL", ""))
+            node = NodeItem(rule_id, rule_name, rule["dependencies"])
+            self.node_items[rule_id] = node
+            self.scene.addItem(node)
+        # Simple grid layout
+        margin_x, margin_y = 20, 20
+        spacing_x, spacing_y = 180, 100
+        x, y = margin_x, margin_y
+        count = 0
+        for node in self.node_items.values():
+            node.setPos(x, y)
+            x += spacing_x
+            count += 1
+            if count % 4 == 0:
+                x = margin_x
+                y += spacing_y
+        # Filter relationships: only include if both parent and child are in filtered nodes.
+        filtered_ids = set(self.node_items.keys())
+        self.filtered_relationships = [(p, c) for (p, c) in self.all_relationships if p in filtered_ids and c in filtered_ids]
+        for parent_id, child_id in self.filtered_relationships:
+            edge = EdgeItem(self.node_items[parent_id], self.node_items[child_id])
+            self.scene.addItem(edge)
+
+    def apply_search_filter(self):
+        search_text = self.search_edit.text().strip().lower()
+        if not search_text:
+            self.filtered_rules = self.all_rules
+        else:
+            self.filtered_rules = []
+            for rule in self.all_rules:
+                # Ensure dependencies are parsed.
+                deps = rule.get("dependencies")
+                if not deps:
+                    deps = parse_sql_dependencies(rule.get("RULE_SQL", ""))
+                    rule["dependencies"] = deps
+                combined = " ".join(deps.get("tables", []) + deps.get("columns", []) + deps.get("databases", []))
+                if search_text in combined.lower():
+                    self.filtered_rules.append(rule)
+        self.build_graph()
+
+# =============================================================================
+# Main Function for Testing the Integrated Components
+# =============================================================================
+
+def main():
+    app = QApplication(sys.argv)
+    
+    # --- Set up an in-memory SQLite database for testing.
+    conn = sqlite3.connect(":memory:")
+    c = conn.cursor()
+    
+    # Create dummy tables: BRM_RULES, GROUP_PERMISSIONS, BRM_AUDIT_LOG
+    c.execute("""
+        CREATE TABLE BRM_RULES (
+            RULE_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            RULE_NAME TEXT,
+            RULE_SQL TEXT,
+            OWNER_GROUP TEXT,
+            CREATED_BY TEXT,
+            CREATED_TIMESTAMP TEXT,
+            UPDATED_BY TEXT,
+            UPDATED_TIMESTAMP TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE GROUP_PERMISSIONS (
+            PERMISSION_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            GROUP_NAME TEXT,
+            TARGET_TABLE TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE BRM_AUDIT_LOG (
+            AUDIT_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            ACTION TEXT,
+            TABLE_NAME TEXT,
+            RECORD_ID TEXT,
+            ACTION_BY TEXT,
+            OLD_DATA TEXT,
+            NEW_DATA TEXT,
+            ACTION_TIMESTAMP TEXT
+        )
+    """)
+    
+    # Insert sample permissions: For user group 'BG1'
+    c.execute("INSERT INTO GROUP_PERMISSIONS (GROUP_NAME, TARGET_TABLE) VALUES (?, ?)", ("BG1", "sales.orders"))
+    c.execute("INSERT INTO GROUP_PERMISSIONS (GROUP_NAME, TARGET_TABLE) VALUES (?, ?)", ("BG1", "inventory.products"))
+    conn.commit()
+    
+    # Insert sample rules
+    sample_rules = [
+        ("Order Entry", "SELECT * FROM sales.orders WHERE order_date > '2020-01-01'", "BG1"),
+        ("Product Check", "SELECT product_id, product_name FROM inventory.products", "BG1"),
+        ("Combined Rule", "SELECT o.order_id, p.product_name FROM sales.orders o JOIN inventory.products p ON o.product_id = p.product_id", "BG1")
+    ]
+    for rn, rs, og in sample_rules:
+        c.execute("""
+            INSERT INTO BRM_RULES (RULE_NAME, RULE_SQL, OWNER_GROUP, CREATED_BY, CREATED_TIMESTAMP)
+            VALUES (?, ?, ?, 'Tester', ?)
+        """, (rn, rs, og, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    
+    # Define relationships for lineage visualization.
+    # For instance, rule 1 and rule 2 are parents of rule 3.
+    relationships = [(1, 3), (2, 3)]
+    
+    # Fetch rules into list of dicts.
+    c.execute("SELECT RULE_ID, RULE_NAME, RULE_SQL, OWNER_GROUP FROM BRM_RULES")
+    rules = []
+    for row in c.fetchall():
+        rules.append({
+            "RULE_ID": row[0],
+            "RULE_NAME": row[1],
+            "RULE_SQL": row[2],
+            "OWNER_GROUP": row[3]
+        })
+    
+    # --- Show the Enhanced Lineage Graph Widget.
+    lineage_widget = EnhancedLineageGraphWidget(rules=rules, relationships=relationships)
+    lineage_widget.setWindowTitle("Enhanced Lineage Visualization")
+    lineage_widget.resize(800, 600)
+    lineage_widget.show()
+    
+    # --- Test the Rule Editor Dialog.
+    # First, attempt to add a new rule.
+    def test_rule_editor():
+        editor = RuleEditorDialog(conn, user_group="BG1")
+        # Prepopulate with a rule name and SQL (use a distinct name to pass duplicate check)
+        editor.rule_name_edit.setText("New Order Check")
+        editor.rule_sql_edit.setPlainText("SELECT * FROM sales.orders WHERE order_total > 100")
+        if editor.exec_() == QDialog.Accepted:
+            QMessageBox.information(None, "Success", "Rule added successfully.")
+        else:
+            QMessageBox.information(None, "Cancelled", "Rule addition cancelled or failed validation.")
+    test_rule_editor()
+    
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Advanced Lineage Visualization and Rule Editor with Duplicate Validation
+
+This snippet provides:
+  • An EnhancedLineageGraphWidget that displays rules as nodes in a hierarchical (table-like)
+    layout with connected lines and arrowheads.
+  • A RuleEditorDialog that allows adding or editing a rule while validating against duplicate
+    rule names in the same owner group.
+
+Assumptions:
+  - A database connection object is provided.
+  - The rules are stored in a table BRM_RULES with at least the following columns:
+       RULE_ID, RULE_NAME, RULE_SQL, OWNER_GROUP, CREATED_BY, CREATED_TIMESTAMP, etc.
+"""
+
+import sys
+import math
+import sqlite3  # For testing purposes; replace with your DB connection module
+import json
+import logging
+from datetime import datetime
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtWidgets import (
+    QApplication, QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsRectItem,
+    QGraphicsLineItem, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QMessageBox, QFormLayout, QPlainTextEdit
+)
+from PyQt5.QtCore import Qt, QPointF, QLineF, QRectF
+from PyQt5.QtGui import QPainter, QPen, QBrush, QPolygonF
+
+# ---------------------- Logging Setup ----------------------
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("LineageAndRuleEditor")
+
+# ---------------------- Enhanced Lineage Graph Visualization ----------------------
+class NodeItem(QGraphicsRectItem):
+    """
+    NodeItem represents a rule as a rectangular node.
+    """
+    def __init__(self, rule_id, rule_name, width=120, height=50, parent=None):
+        super().__init__(parent)
+        self.rule_id = rule_id
+        self.rule_name = rule_name
+        self.setRect(0, 0, width, height)
+        self.setFlags(QGraphicsItem.ItemIsMovable | QGraphicsItem.ItemIsSelectable)
+        # Create a text item (centered)
+        self.text = QtWidgets.QGraphicsTextItem(rule_name, self)
+        self.text.setDefaultTextColor(Qt.black)
+        text_rect = self.text.boundingRect()
+        rect = self.rect()
+        self.text.setPos(rect.center() - text_rect.center())
+
+    def paint(self, painter, option, widget=None):
+        painter.setBrush(QBrush(Qt.white))
+        painter.setPen(QPen(Qt.black, 2))
+        painter.drawRect(self.rect())
+        # The QGraphicsTextItem already draws the text.
+
+class EdgeItem(QGraphicsLineItem):
+    """
+    EdgeItem represents a directed edge from a source node to a destination node.
+    It draws a line and an arrowhead at the destination.
+    """
+    def __init__(self, source, dest, parent=None):
+        super().__init__(parent)
+        self.source = source
+        self.dest = dest
+        self.arrow_size = 10
+        self.setPen(QPen(Qt.black, 2))
+        self.adjust()
+        
+    def adjust(self):
+        # Calculate the line between the centers of the two nodes.
+        line = QLineF(self.source.sceneBoundingRect().center(), self.dest.sceneBoundingRect().center())
+        self.setLine(line)
+        
+    def paint(self, painter, option, widget=None):
+        if self.source is None or self.dest is None:
+            return
+        line = self.line()
+        if line.length() == 0:
+            return
+        painter.setPen(self.pen())
+        painter.drawLine(line)
+        # Draw arrowhead at the destination end.
+        angle = math.acos(line.dx() / line.length())
+        if line.dy() >= 0:
+            angle = (2 * math.pi) - angle
+        dest_point = line.p2()
+        arrow_p1 = dest_point + QPointF(math.sin(angle - math.pi / 3) * self.arrow_size,
+                                         math.cos(angle - math.pi / 3) * self.arrow_size)
+        arrow_p2 = dest_point + QPointF(math.sin(angle - math.pi + math.pi / 3) * self.arrow_size,
+                                         math.cos(angle - math.pi + math.pi / 3) * self.arrow_size)
+        arrow_head = QPolygonF([dest_point, arrow_p1, arrow_p2])
+        painter.setBrush(Qt.black)
+        painter.drawPolygon(arrow_head)
+
+class EnhancedLineageGraphWidget(QGraphicsView):
+    """
+    EnhancedLineageGraphWidget creates a hierarchical (table-like) visualization of rule nodes,
+    connecting them with directed edges (with arrowheads).
+    
+    Parameters:
+      - rules: list of dictionaries, each with keys "RULE_ID" and "RULE_NAME"
+      - relationships: list of tuples (parent_rule_id, child_rule_id)
+    """
+    def __init__(self, parent=None, rules=None, relationships=None):
+        super().__init__(parent)
+        self.setRenderHint(QPainter.Antialiasing)
+        self.scene = QGraphicsScene(self)
+        self.setScene(self.scene)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.nodes = {}
+        self.edges = []
+        self.rules = rules if rules is not None else []
+        self.relationships = relationships if relationships is not None else []
+        self.build_graph()
+
+    def build_graph(self):
+        self.scene.clear()
+        self.nodes = {}
+        self.edges = []
+        # Create NodeItems for each rule.
+        for rule in self.rules:
+            rule_id = rule.get("RULE_ID")
+            rule_name = rule.get("RULE_NAME", f"Rule {rule_id}")
+            node = NodeItem(rule_id, rule_name)
+            self.nodes[rule_id] = node
+            self.scene.addItem(node)
+        # Apply a simple hierarchical layout.
+        self.apply_hierarchical_layout()
+        # Create EdgeItems for each relationship.
+        for parent_id, child_id in self.relationships:
+            if parent_id in self.nodes and child_id in self.nodes:
+                edge = EdgeItem(self.nodes[parent_id], self.nodes[child_id])
+                self.edges.append(edge)
+                self.scene.addItem(edge)
+
+    def apply_hierarchical_layout(self):
+        """
+        Arrange nodes in layers based on parent–child relationships.
+        This is a simple top-down layout that calculates each node's layer (depth) and assigns
+        horizontal positions based on subtree widths.
+        """
+        # Build parent-child mapping.
+        children_map = {}
+        parent_map = {}
+        for parent, child in self.relationships:
+            children_map.setdefault(parent, []).append(child)
+            parent_map[child] = parent
+        # Identify root nodes.
+        roots = [rid for rid in self.nodes if rid not in parent_map]
+        layer_gap = 100
+        node_gap = 150
+
+        def layout_subtree(node_id, layer, x_offset):
+            node = self.nodes[node_id]
+            y = layer * layer_gap
+            children = children_map.get(node_id, [])
+            if not children:
+                node.setPos(x_offset, y)
+                return x_offset + node_gap, x_offset
+            else:
+                current_x = x_offset
+                child_centers = []
+                for child in children:
+                    current_x, child_center = layout_subtree(child, layer + 1, current_x)
+                    child_centers.append(child_center)
+                # Center this node above its children.
+                node_x = (min(child_centers) + max(child_centers)) / 2
+                node.setPos(node_x, y)
+                return current_x, node_x
+
+        current_x = 0
+        for root in roots:
+            current_x, _ = layout_subtree(root, 0, current_x)
+        
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+# ---------------------- Rule Editor Dialog with Duplicate Validation ----------------------
+class RuleEditorDialog(QDialog):
+    """
+    RuleEditorDialog lets you add or edit a rule. It validates that the rule name
+    does not duplicate an existing rule in the same owner group.
+    
+    Parameters:
+      - connection: DB connection object.
+      - user_group: Current user’s owner group (used for validation).
+      - rule_data: (Optional) dict of existing rule data for editing.
+    """
+    def __init__(self, connection, user_group, rule_data=None, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_group = user_group
+        self.rule_data = rule_data  # If provided, this is an edit; otherwise, an add.
+        self.setWindowTitle("Edit Rule" if rule_data else "Add Rule")
+        self.resize(500, 400)
+        self.setup_ui()
+        if self.rule_data:
+            self.load_existing_data()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.rule_name_edit = QLineEdit()
+        form.addRow("Rule Name:", self.rule_name_edit)
+        self.owner_group_edit = QLineEdit()
+        self.owner_group_edit.setText(self.user_group)
+        self.owner_group_edit.setReadOnly(True)
+        form.addRow("Owner Group:", self.owner_group_edit)
+        self.rule_sql_edit = QPlainTextEdit()
+        self.rule_sql_edit.setPlaceholderText("Enter rule SQL here...")
+        form.addRow("Rule SQL:", self.rule_sql_edit)
+        layout.addLayout(form)
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.save_rule)
+        btn_layout.addWidget(save_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def load_existing_data(self):
+        self.rule_name_edit.setText(self.rule_data.get("RULE_NAME", ""))
+        self.rule_sql_edit.setPlainText(self.rule_data.get("RULE_SQL", ""))
+
+    def save_rule(self):
+        rule_name = self.rule_name_edit.text().strip()
+        rule_sql = self.rule_sql_edit.toPlainText().strip()
+        if not rule_name:
+            QMessageBox.warning(self, "Validation Error", "Rule name cannot be empty.")
+            return
+        # Duplicate validation: check whether a rule with the same name exists in this group.
+        c = self.connection.cursor()
+        if self.rule_data:
+            rule_id = self.rule_data.get("RULE_ID")
+            query = "SELECT RULE_ID FROM BRM_RULES WHERE RULE_NAME=? AND OWNER_GROUP=? AND RULE_ID<>?"
+            c.execute(query, (rule_name, self.user_group, rule_id))
+        else:
+            query = "SELECT RULE_ID FROM BRM_RULES WHERE RULE_NAME=? AND OWNER_GROUP=?"
+            c.execute(query, (rule_name, self.user_group))
+        if c.fetchone():
+            QMessageBox.critical(self, "Duplicate Error", "A rule with this name already exists in your group.")
+            return
+        try:
+            if self.rule_data:
+                # Update existing rule.
+                rule_id = self.rule_data.get("RULE_ID")
+                c.execute("""
+                    UPDATE BRM_RULES
+                    SET RULE_NAME=?, RULE_SQL=?, UPDATED_BY='CurrentUser', UPDATED_TIMESTAMP=?
+                    WHERE RULE_ID=?
+                """, (rule_name, rule_sql, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), rule_id))
+                action = "UPDATE"
+            else:
+                # Insert new rule.
+                c.execute("""
+                    INSERT INTO BRM_RULES (RULE_NAME, RULE_SQL, OWNER_GROUP, CREATED_BY, CREATED_TIMESTAMP)
+                    VALUES (?, ?, ?, 'CurrentUser', ?)
+                """, (rule_name, rule_sql, self.user_group, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                action = "INSERT"
+            self.connection.commit()
+            # Insert an audit log record.
+            insert_audit_log(self.connection, action, "BRM_RULES",
+                             self.rule_data.get("RULE_ID") if self.rule_data else None,
+                             "CurrentUser", None, {"RULE_NAME": rule_name})
+            QMessageBox.information(self, "Success", "Rule saved successfully.")
+            self.accept()
+        except Exception as e:
+            self.connection.rollback()
+            QMessageBox.critical(self, "Database Error", str(e))
+
+# ---------------------- Helper: Insert Audit Log ----------------------
+def insert_audit_log(conn, action, table_name, record_id, actor, old_data=None, new_data=None):
+    """
+    Inserts an audit log record.
+    """
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO BRM_AUDIT_LOG (ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (action, table_name, str(record_id) if record_id else None, actor,
+              json.dumps(old_data) if old_data else None,
+              json.dumps(new_data) if new_data else None,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        logger.debug(f"Audit log inserted: {action} on {table_name} (Record: {record_id})")
+    except Exception as ex:
+        logger.error(f"Error inserting audit log: {ex}")
+
+# ---------------------- Main for Testing the Components ----------------------
+def main():
+    app = QApplication(sys.argv)
+
+    # --- Test the EnhancedLineageGraphWidget ---
+    # Simulated list of rules and relationships.
+    rules = [
+        {"RULE_ID": 1, "RULE_NAME": "Start Rule"},
+        {"RULE_ID": 2, "RULE_NAME": "Intermediate Rule A"},
+        {"RULE_ID": 3, "RULE_NAME": "Intermediate Rule B"},
+        {"RULE_ID": 4, "RULE_NAME": "Final Rule"}
+    ]
+    relationships = [
+        (1, 2),
+        (1, 3),
+        (2, 4),
+        (3, 4)
+    ]
+    lineage_widget = EnhancedLineageGraphWidget(rules=rules, relationships=relationships)
+    lineage_widget.setWindowTitle("Enhanced Lineage Visualization")
+    lineage_widget.resize(800, 600)
+    lineage_widget.show()
+
+    # --- Test the RuleEditorDialog with duplicate validation ---
+    # For testing purposes, we create an in-memory SQLite database and a dummy BRM_RULES table.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE BRM_RULES (
+            RULE_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            RULE_NAME TEXT,
+            RULE_SQL TEXT,
+            OWNER_GROUP TEXT,
+            CREATED_BY TEXT,
+            CREATED_TIMESTAMP TEXT,
+            UPDATED_BY TEXT,
+            UPDATED_TIMESTAMP TEXT
+        )
+    """)
+    # Insert a sample rule to test duplication.
+    conn.execute("""
+        INSERT INTO BRM_RULES (RULE_NAME, RULE_SQL, OWNER_GROUP, CREATED_BY, CREATED_TIMESTAMP)
+        VALUES ('Duplicate Rule', 'SELECT 1', 'BG1', 'User', '2020-01-01 00:00:00')
+    """)
+    conn.commit()
+
+    # Create and show the rule editor (for adding a new rule).
+    editor = RuleEditorDialog(conn, user_group="BG1")
+    editor.setWindowTitle("Rule Editor (Add New)")
+    editor.show()
+
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
