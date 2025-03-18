@@ -4547,6 +4547,540 @@ class UserManagementTab(QWidget):
 # =============================================================================
 # End of Part 6 Module
 # =============================================================================
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+BRM TOOL – PART 7 of 8 (DEFECT MANAGEMENT, ACTIVITY LOGGING, COLLABORATION, PREDICTIVE ANALYTICS)
+----------------------------------------------------------------------------------------------
+This module provides fully advanced implementations for:
+  • DefectManagementTab – A complete, production‑ready defect logging and management UI with full CRUD.
+  • record_activity_event – A robust function for logging activity events to the ACTIVITY_LOG table.
+  • ActivityTrackingTab – An advanced UI for filtering and exporting activity logs.
+  • CollaborationManager – A real‑time presence manager that polls for active locks.
+  • CollaborationTab – A UI that displays current locks and allows Admin users to force unlock.
+  • PredictiveAnalyticsTab – An advanced analytics UI that retrieves historical rule execution data and forecasts future performance.
+  
+Note: This code assumes that the underlying database tables (e.g. ACTIVITY_LOG, BRM_DEFECT_LOGS, etc.) exist with appropriate schemas.
+"""
+
+import sys
+import json
+import csv
+import math
+from datetime import datetime, timedelta
+
+from PyQt5 import QtCore, QtWidgets
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTableWidget, QTableWidgetItem,
+    QLineEdit, QMessageBox, QComboBox, QInputDialog, QFileDialog, QDialog
+)
+import pyqtgraph as pg
+
+# =============================================================================
+# Helper Function: record_activity_event
+# =============================================================================
+def record_activity_event(conn, event_type, description, user, additional_data=None):
+    """
+    Logs an activity event to the ACTIVITY_LOG table.
+    Expects ACTIVITY_LOG to have columns:
+      - ACTIVITY_ID (INT IDENTITY PRIMARY KEY)
+      - EVENT_TYPE (NVARCHAR(50))
+      - DESCRIPTION (NVARCHAR(MAX))
+      - [USER] (NVARCHAR(100))
+      - TIMESTAMP (DATETIME DEFAULT GETDATE())
+      - ADDITIONAL_DATA (NVARCHAR(MAX))
+    """
+    cursor = conn.cursor()
+    additional = json.dumps(additional_data) if additional_data else None
+    try:
+        cursor.execute("""
+            INSERT INTO ACTIVITY_LOG (EVENT_TYPE, DESCRIPTION, [USER], TIMESTAMP, ADDITIONAL_DATA)
+            VALUES (?, ?, ?, GETDATE(), ?)
+        """, (event_type, description, user, additional))
+        conn.commit()
+    except Exception as ex:
+        # In production, use a proper logging mechanism.
+        print(f"Error recording activity event: {ex}")
+
+# =============================================================================
+# Defect Management
+# =============================================================================
+class DefectManagementTab(QWidget):
+    """
+    Provides a comprehensive defect management interface with full CRUD functionality.
+    """
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.init_ui()
+        self.load_defects()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        # Table for defect logs
+        self.defect_table = QTableWidget(0, 7)
+        self.defect_table.setHorizontalHeaderLabels([
+            "Defect ID", "Rule ID", "Description", "Severity", "Reporter", "Status", "Timestamp"
+        ])
+        self.defect_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.defect_table)
+
+        # CRUD buttons
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add Defect")
+        add_btn.clicked.connect(self.add_defect)
+        btn_layout.addWidget(add_btn)
+        update_btn = QPushButton("Update Defect")
+        update_btn.clicked.connect(self.update_defect)
+        btn_layout.addWidget(update_btn)
+        delete_btn = QPushButton("Delete Defect")
+        delete_btn.clicked.connect(self.delete_defect)
+        btn_layout.addWidget(delete_btn)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_defects)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def load_defects(self):
+        self.defect_table.setRowCount(0)
+        cur = self.conn.cursor()
+        try:
+            cur.execute("""
+                SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP 
+                FROM BRM_DEFECT_LOGS
+                ORDER BY TIMESTAMP DESC
+            """)
+            for row in cur.fetchall():
+                r = self.defect_table.rowCount()
+                self.defect_table.insertRow(r)
+                for col, val in enumerate(row):
+                    self.defect_table.setItem(r, col, QTableWidgetItem(str(val)))
+            self.defect_table.resizeColumnsToContents()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Error loading defects: {ex}")
+
+    def add_defect(self):
+        dlg = DefectDialog(self.conn, defect_data=None, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.load_defects()
+
+    def update_defect(self):
+        row = self.defect_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Selection Error", "Select a defect to update.")
+            return
+        defect_id = self.defect_table.item(row, 0).text()
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT DEFECT_ID, RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP 
+            FROM BRM_DEFECT_LOGS WHERE DEFECT_ID = ?
+        """, (defect_id,))
+        data = cur.fetchone()
+        if not data:
+            QMessageBox.warning(self, "Error", "Defect not found.")
+            return
+        defect_data = {
+            "DEFECT_ID": data[0],
+            "RULE_ID": data[1],
+            "DESCRIPTION": data[2],
+            "SEVERITY": data[3],
+            "REPORTER": data[4],
+            "STATUS": data[5],
+            "TIMESTAMP": data[6]
+        }
+        dlg = DefectDialog(self.conn, defect_data=defect_data, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self.load_defects()
+
+    def delete_defect(self):
+        row = self.defect_table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Selection Error", "Select a defect to delete.")
+            return
+        defect_id = self.defect_table.item(row, 0).text()
+        confirm = QMessageBox.question(self, "Confirm", f"Delete defect {defect_id}?",
+                                        QMessageBox.Yes | QMessageBox.No)
+        if confirm == QMessageBox.Yes:
+            cur = self.conn.cursor()
+            try:
+                cur.execute("DELETE FROM BRM_DEFECT_LOGS WHERE DEFECT_ID = ?", (defect_id,))
+                self.conn.commit()
+                self.load_defects()
+            except Exception as ex:
+                QMessageBox.critical(self, "Error", f"Error deleting defect: {ex}")
+
+
+class DefectDialog(QDialog):
+    """
+    A complete dialog for adding or updating defects.
+    """
+    def __init__(self, conn, defect_data=None, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.defect_data = defect_data
+        self.init_ui()
+        if self.defect_data:
+            self.load_data()
+
+    def init_ui(self):
+        self.setWindowTitle("Defect Management")
+        layout = QVBoxLayout(self)
+        form_layout = QVBoxLayout()
+
+        self.rule_id_edit = QLineEdit()
+        form_layout.addWidget(QLabel("Rule ID:"))
+        form_layout.addWidget(self.rule_id_edit)
+
+        self.desc_edit = QLineEdit()
+        form_layout.addWidget(QLabel("Description:"))
+        form_layout.addWidget(self.desc_edit)
+
+        self.severity_combo = QComboBox()
+        self.severity_combo.addItems(["Low", "Medium", "High", "Critical"])
+        form_layout.addWidget(QLabel("Severity:"))
+        form_layout.addWidget(self.severity_combo)
+
+        self.reporter_edit = QLineEdit()
+        form_layout.addWidget(QLabel("Reporter:"))
+        form_layout.addWidget(self.reporter_edit)
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["Open", "In Progress", "Resolved", "Closed"])
+        form_layout.addWidget(QLabel("Status:"))
+        form_layout.addWidget(self.status_combo)
+
+        layout.addLayout(form_layout)
+
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.on_save)
+        btn_layout.addWidget(save_btn)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def load_data(self):
+        self.rule_id_edit.setText(str(self.defect_data.get("RULE_ID", "")))
+        self.desc_edit.setText(self.defect_data.get("DESCRIPTION", ""))
+        severity = self.defect_data.get("SEVERITY", "Low")
+        idx = self.severity_combo.findText(severity, Qt.MatchFixedString)
+        if idx >= 0:
+            self.severity_combo.setCurrentIndex(idx)
+        self.reporter_edit.setText(self.defect_data.get("REPORTER", ""))
+        status = self.defect_data.get("STATUS", "Open")
+        idx2 = self.status_combo.findText(status, Qt.MatchFixedString)
+        if idx2 >= 0:
+            self.status_combo.setCurrentIndex(idx2)
+
+    def on_save(self):
+        rule_id = self.rule_id_edit.text().strip()
+        description = self.desc_edit.text().strip()
+        severity = self.severity_combo.currentText()
+        reporter = self.reporter_edit.text().strip()
+        status = self.status_combo.currentText()
+        cur = self.conn.cursor()
+        try:
+            if self.defect_data:
+                defect_id = self.defect_data.get("DEFECT_ID")
+                cur.execute("""
+                    UPDATE BRM_DEFECT_LOGS
+                    SET RULE_ID = ?, DESCRIPTION = ?, SEVERITY = ?, REPORTER = ?, STATUS = ?
+                    WHERE DEFECT_ID = ?
+                """, (rule_id, description, severity, reporter, status, defect_id))
+            else:
+                cur.execute("""
+                    INSERT INTO BRM_DEFECT_LOGS (RULE_ID, DESCRIPTION, SEVERITY, REPORTER, STATUS, TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, GETDATE())
+                """, (rule_id, description, severity, reporter, status))
+            self.conn.commit()
+            self.accept()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Error saving defect: {ex}")
+
+
+# =============================================================================
+# Activity Tracking
+# =============================================================================
+class ActivityTrackingTab(QWidget):
+    """
+    Provides an advanced UI to filter and export activity logs from the ACTIVITY_LOG table.
+    """
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.init_ui()
+        self.load_activities()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        filter_layout = QHBoxLayout()
+        self.user_filter = QLineEdit()
+        self.user_filter.setPlaceholderText("Filter by user")
+        filter_layout.addWidget(self.user_filter)
+        self.event_filter = QLineEdit()
+        self.event_filter.setPlaceholderText("Filter by event type")
+        filter_layout.addWidget(self.event_filter)
+        self.text_filter = QLineEdit()
+        self.text_filter.setPlaceholderText("Text search")
+        filter_layout.addWidget(self.text_filter)
+        filter_btn = QPushButton("Apply Filters")
+        filter_btn.clicked.connect(self.load_activities)
+        filter_layout.addWidget(filter_btn)
+        layout.addLayout(filter_layout)
+
+        self.activity_table = QTableWidget(0, 6)
+        self.activity_table.setHorizontalHeaderLabels([
+            "Activity ID", "Event Type", "Description", "User", "Timestamp", "Additional Data"
+        ])
+        self.activity_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.activity_table)
+
+        btn_layout = QHBoxLayout()
+        export_btn = QPushButton("Export to CSV")
+        export_btn.clicked.connect(self.export_csv)
+        btn_layout.addWidget(export_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def load_activities(self):
+        user_f = self.user_filter.text().strip()
+        event_f = self.event_filter.text().strip()
+        text_f = self.text_filter.text().strip()
+        cur = self.conn.cursor()
+        query = "SELECT ACTIVITY_ID, EVENT_TYPE, DESCRIPTION, [USER], TIMESTAMP, ADDITIONAL_DATA FROM ACTIVITY_LOG WHERE 1=1"
+        params = []
+        if user_f:
+            query += " AND [USER] LIKE ?"
+            params.append(f"%{user_f}%")
+        if event_f:
+            query += " AND EVENT_TYPE LIKE ?"
+            params.append(f"%{event_f}%")
+        if text_f:
+            query += " AND (DESCRIPTION LIKE ? OR ADDITIONAL_DATA LIKE ?)"
+            params.extend([f"%{text_f}%", f"%{text_f}%"])
+        query += " ORDER BY TIMESTAMP DESC"
+        cur.execute(query, params)
+        self.activity_table.setRowCount(0)
+        for row in cur.fetchall():
+            r = self.activity_table.rowCount()
+            self.activity_table.insertRow(r)
+            for col, val in enumerate(row):
+                # Attempt to pretty-print JSON for additional data
+                if col == 5 and val:
+                    try:
+                        val = json.dumps(json.loads(val), indent=2)
+                    except Exception:
+                        pass
+                self.activity_table.setItem(r, col, QTableWidgetItem(str(val) if val is not None else ""))
+        self.activity_table.resizeColumnsToContents()
+
+    def export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Activity Log to CSV", "", "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                headers = [self.activity_table.horizontalHeaderItem(i).text() for i in range(self.activity_table.columnCount())]
+                writer.writerow(headers)
+                for r in range(self.activity_table.rowCount()):
+                    rowdata = []
+                    for c in range(self.activity_table.columnCount()):
+                        item = self.activity_table.item(r, c)
+                        rowdata.append(item.text() if item else "")
+                    writer.writerow(rowdata)
+            QMessageBox.information(self, "Exported", f"Activity log exported to {path}.")
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+
+# =============================================================================
+# CollaborationManager
+# =============================================================================
+class CollaborationManager(QObject):
+    """
+    Implements real‑time presence management by polling the database for active locks.
+    Emits a signal with the list of active locks.
+    """
+    locksUpdated = pyqtSignal(list)
+
+    def __init__(self, conn, poll_interval=5000, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.poll_interval = poll_interval
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll_locks)
+        self.timer.start(self.poll_interval)
+
+    def poll_locks(self):
+        cur = self.conn.cursor()
+        try:
+            cur.execute("""
+                SELECT RULE_ID, LOCKED_BY, LOCK_TIMESTAMP, EXPIRY_TIMESTAMP, FORCE_LOCK
+                FROM BRM_RULE_LOCKS WHERE ACTIVE_LOCK = 1
+            """)
+            locks = []
+            for row in cur.fetchall():
+                locks.append({
+                    "RULE_ID": row[0],
+                    "LOCKED_BY": row[1],
+                    "LOCK_TIMESTAMP": row[2],
+                    "EXPIRY_TIMESTAMP": row[3],
+                    "FORCE_LOCK": row[4]
+                })
+            self.locksUpdated.emit(locks)
+        except Exception as ex:
+            print(f"Error polling locks: {ex}")
+
+
+# =============================================================================
+# CollaborationTab
+# =============================================================================
+class CollaborationTab(QWidget):
+    """
+    Displays current active locks in a table.
+    Admin users may force unlock selected rules.
+    """
+    def __init__(self, conn, user_group, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.user_group = user_group
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        self.locks_table = QTableWidget(0, 5)
+        self.locks_table.setHorizontalHeaderLabels(["Rule ID", "Locked By", "Lock Timestamp", "Expiry", "Force Lock"])
+        self.locks_table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.locks_table)
+
+        btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_locks)
+        btn_layout.addWidget(refresh_btn)
+        self.force_unlock_btn = QPushButton("Force Unlock Selected")
+        self.force_unlock_btn.clicked.connect(self.force_unlock_selected)
+        if self.user_group != "Admin":
+            self.force_unlock_btn.setEnabled(False)
+        btn_layout.addWidget(self.force_unlock_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+        self.load_locks()
+
+    def load_locks(self):
+        self.locks_table.setRowCount(0)
+        cur = self.conn.cursor()
+        try:
+            cur.execute("""
+                SELECT RULE_ID, LOCKED_BY, LOCK_TIMESTAMP, EXPIRY_TIMESTAMP, FORCE_LOCK
+                FROM BRM_RULE_LOCKS WHERE ACTIVE_LOCK = 1
+            """)
+            for row in cur.fetchall():
+                r = self.locks_table.rowCount()
+                self.locks_table.insertRow(r)
+                for col, val in enumerate(row):
+                    self.locks_table.setItem(r, col, QTableWidgetItem(str(val)))
+            self.locks_table.resizeColumnsToContents()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Error loading locks: {ex}")
+
+    def force_unlock_selected(self):
+        selected = self.locks_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Selection Error", "Select a lock to force unlock.")
+            return
+        rows = set(item.row() for item in selected)
+        cur = self.conn.cursor()
+        for row in rows:
+            rule_item = self.locks_table.item(row, 0)
+            if rule_item:
+                rule_id = rule_item.text()
+                try:
+                    # Assume unlock_rule_for_edit is a fully implemented function available in the environment.
+                    unlock_rule_for_edit(self.conn, rule_id, user_id="Admin", admin_override=True)
+                except Exception as ex:
+                    QMessageBox.critical(self, "Error", f"Error unlocking rule {rule_id}: {ex}")
+        self.load_locks()
+
+
+# =============================================================================
+# PredictiveAnalyticsTab
+# =============================================================================
+class PredictiveAnalyticsTab(QWidget):
+    """
+    Retrieves historical execution data from RULE_EXECUTION_LOGS and forecasts the average execution
+    time for the next 7 days using a simple moving average.
+    Displays the results in an interactive line chart.
+    """
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        self.conn = conn
+        self.init_ui()
+        self.load_analytics()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        self.chart = pg.PlotWidget(title="Historical & Predicted Execution Time (ms)")
+        self.chart.setBackground('w')
+        layout.addWidget(self.chart)
+        btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh Analytics")
+        refresh_btn.clicked.connect(self.load_analytics)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def load_analytics(self):
+        cur = self.conn.cursor()
+        try:
+            cur.execute("""
+                SELECT CAST(EXECUTION_TIMESTAMP AS date) as exec_date, AVG(EXECUTION_TIME_MS)
+                FROM RULE_EXECUTION_LOGS
+                WHERE EXECUTION_TIMESTAMP >= DATEADD(day, -7, GETDATE())
+                GROUP BY CAST(EXECUTION_TIMESTAMP AS date)
+                ORDER BY exec_date
+            """)
+            rows = cur.fetchall()
+            if not rows:
+                self.chart.clear()
+                return
+            dates = [str(r[0]) for r in rows]
+            avg_times = [r[1] for r in rows]
+            x_hist = list(range(len(dates)))
+            self.chart.clear()
+            self.chart.plot(x_hist, avg_times, pen=pg.mkPen(color="blue", width=2),
+                            symbol='o', symbolBrush="blue", name="Historical")
+
+            # Forecast using a moving average over the last 3 days
+            if len(avg_times) >= 3:
+                moving_avg = sum(avg_times[-3:]) / 3
+            else:
+                moving_avg = sum(avg_times) / len(avg_times)
+            predictions = [moving_avg for _ in range(7)]
+            x_pred = list(range(len(x_hist), len(x_hist) + 7))
+            self.chart.plot(x_pred, predictions, pen=pg.mkPen(color="red", width=2, style=QtCore.Qt.DashLine),
+                            symbol='x', symbolBrush="red", name="Predicted")
+            all_x = x_hist + x_pred
+            x_labels = [(i, f"Day {i+1}") for i in range(len(all_x))]
+            self.chart.getAxis("bottom").setTicks([x_labels])
+            self.chart.setLabel("left", "Avg Execution Time (ms)")
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Error loading analytics: {ex}")
+
+
+# =============================================================================
+# End of Part 7 Module
+# =============================================================================
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
