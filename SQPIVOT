@@ -1,0 +1,156 @@
+Below is a common pattern you can use (with window functions) to achieve:
+	1.	Identify the “month-end” rows (i.e. the max date in each month for every person/ID).
+	2.	Label the most recent month as current and the prior month as previous.
+	3.	Return them in two rows per ID (or however you prefer).
+
+⸻
+
+Example Schema
+
+Assume a table called employee_salary:
+
+CREATE TABLE employee_salary (
+    emp_id         INT,
+    salary_date    DATE,
+    salary_amount  DECIMAL(10,2)
+);
+
+Where:
+	•	emp_id is the employee identifier,
+	•	salary_date is the date on which that salary record is valid (or paid),
+	•	salary_amount is the salary on that specific date.
+
+⸻
+
+Step 1: Get the last date of each month
+
+We first need to find, for each emp_id and each calendar month, which date is the maximum (the “month-end” record in your table). You can do this by grouping on (emp_id, year(salary_date), month(salary_date)) (functions vary by SQL dialect), for example:
+
+WITH monthly_max AS (
+    SELECT
+        emp_id,
+        /* Use your dialect’s method of truncating or extracting year/month. 
+           For example, in SQL Server you might do:
+           YEAR(salary_date) AS yr,
+           MONTH(salary_date) AS mon
+           
+           In Postgres you can do:
+           DATE_TRUNC('month', salary_date) AS month_start
+        */
+        MAX(salary_date) AS max_salary_date
+    FROM employee_salary
+    GROUP BY
+        emp_id,
+        DATE_TRUNC('month', salary_date)       -- or YEAR(...) and MONTH(...)
+)
+
+Now monthly_max holds one row per (emp_id, month) with the latest date of that month.
+
+⸻
+
+Step 2: Join back to get the salary amounts
+
+We join monthly_max back to the original table to pick up the actual salary amounts on those max dates:
+
+WITH monthly_max AS (
+    SELECT
+        emp_id,
+        DATE_TRUNC('month', salary_date) AS month_start,
+        MAX(salary_date) AS max_salary_date
+    FROM employee_salary
+    GROUP BY
+        emp_id,
+        DATE_TRUNC('month', salary_date)
+),
+month_end_salaries AS (
+    SELECT
+        m.emp_id,
+        m.max_salary_date,
+        s.salary_amount
+    FROM monthly_max m
+    JOIN employee_salary s
+        ON  s.emp_id       = m.emp_id
+        AND s.salary_date  = m.max_salary_date
+)
+
+At this stage, month_end_salaries has only the last-record-per-month for every employee and the associated salary.
+
+⸻
+
+Step 3: Rank the months (find current vs. previous)
+
+We want exactly the two most recent “month-end” records for each employee:
+	•	The latest month-end (rank = 1),
+	•	The previous month-end (rank = 2).
+
+We can use a window function (ROW_NUMBER or RANK) to order the rows descending by date:
+
+WITH monthly_max AS (
+    ...  -- same as above
+),
+month_end_salaries AS (
+    ...  -- same as above
+),
+ranked AS (
+    SELECT
+        emp_id,
+        max_salary_date,
+        salary_amount,
+        ROW_NUMBER() OVER (
+            PARTITION BY emp_id
+            ORDER BY max_salary_date DESC
+        ) AS rn
+    FROM month_end_salaries
+)
+SELECT
+    emp_id,
+    max_salary_date,
+    salary_amount,
+    CASE 
+       WHEN rn = 1 THEN 'Current Salary'
+       WHEN rn = 2 THEN 'Previous Salary'
+    END AS salary_label
+FROM ranked
+WHERE rn <= 2
+ORDER BY emp_id, rn;
+
+What this final query does
+	1.	ranked: We label each row in descending order of max_salary_date, partitioned by emp_id, so that for each employee:
+	•	rn = 1 is that employee’s most recent month-end,
+	•	rn = 2 is that employee’s second-most recent month-end, etc.
+	2.	We then filter to keep only rn <= 2, i.e. current and previous.
+	3.	The CASE statement assigns a more readable label to each row (Current Salary vs. Previous Salary).
+
+Result Format
+
+You will get two rows per employee (assuming they have at least two months of data), something like:
+
+emp_id	max_salary_date	salary_amount	salary_label
+1001	2025-03-01	4500.00	Current Salary
+1001	2025-02-01	4500.00	Previous Salary
+1002	2025-03-01	6000.00	Current Salary
+1002	2025-02-01	6000.00	Previous Salary
+…	…	…	…
+
+(Exact date values depend on your data.)
+
+⸻
+
+Adjusting to Your Dialect
+	•	SQL Server: Instead of DATE_TRUNC, you can do:
+
+YEAR(salary_date) AS yr,
+MONTH(salary_date) AS mon
+
+and group by (emp_id, YEAR(salary_date), MONTH(salary_date)). Then you’d need to join on year & month and the max date to pick up the correct row.
+
+	•	PostgreSQL: DATE_TRUNC('month', salary_date) works as shown.
+	•	Oracle: Instead of ROW_NUMBER() with PARTITION BY ... ORDER BY ..., you might do ROW_NUMBER() OVER (...) similarly. For date truncation: TRUNC(salary_date, 'MONTH').
+	•	MySQL: You can do YEAR(salary_date) and MONTH(salary_date), or use DATE_FORMAT(salary_date, '%Y-%m-01') to mimic “start of month.”
+
+However, the overall approach is the same in all major SQL databases:
+	1.	Identify the last date of each month per user (or grouping).
+	2.	Join to get the actual salary on that last date.
+	3.	Apply a window function (or a self-join approach) to label the two most recent months as “current” and “previous” in your result set.
+
+That should give you the “max date of every month” plus the current month’s salary and the previous month’s salary in exactly 2 rows (per ID).
