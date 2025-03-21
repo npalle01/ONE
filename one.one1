@@ -928,3 +928,685 @@ def sync_metadata_improved(conn):
     except Exception as ex:
         logger.error(f"Sync metadata error: {ex}")
         return f"Sync error: {ex}"
+        
+###############################################################################
+# PART 2: ADVANCED FUNCTIONALITY
+# BFS-based rule execution, collaboration, multi-step approvals, etc.
+###############################################################################
+
+def run_data_validations(conn):
+    """
+    Executes all data validations defined in the DATA_VALIDATIONS table.
+    Each validation can be of type:
+      - "NOT NULL": checks if specified column has NULLs
+      - "RANGE": expects params like "min=0;max=100"
+      - "UNIQUE": checks if specified column has duplicates
+    Results are logged into DATA_VALIDATION_LOGS.
+    """
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
+            FROM DATA_VALIDATIONS
+        """)
+        validations = cursor.fetchall()
+    except Exception as e:
+        logger.error("Error fetching validations: %s", e)
+        return
+
+    for val in validations:
+        validation_id, table_name, column_name, validation_type, params = val
+        result_flag = "PASS"
+        details = ""
+        try:
+            if validation_type.upper() == "NOT NULL":
+                query = f"SELECT COUNT(*) FROM {table_name} WHERE {column_name} IS NULL"
+                cursor.execute(query)
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    result_flag = "FAIL"
+                    details = f"{count} rows have NULL in column '{column_name}'."
+                else:
+                    details = f"All rows have non-NULL values in column '{column_name}'."
+            elif validation_type.upper() == "RANGE":
+                # Expecting params like "min=0;max=100"
+                min_val = None
+                max_val = None
+                if params:
+                    for part in params.split(";"):
+                        part = part.strip().lower()
+                        if part.startswith("min="):
+                            min_val = float(part.split("=")[1])
+                        elif part.startswith("max="):
+                            max_val = float(part.split("=")[1])
+                if min_val is None or max_val is None:
+                    result_flag = "FAIL"
+                    details = "Invalid parameters for RANGE validation."
+                else:
+                    query = f"""
+                        SELECT COUNT(*) FROM {table_name}
+                        WHERE TRY_CAST({column_name} AS FLOAT) IS NOT NULL
+                          AND (TRY_CAST({column_name} AS FLOAT) < {min_val}
+                               OR TRY_CAST({column_name} AS FLOAT) > {max_val})
+                    """
+                    cursor.execute(query)
+                    count = cursor.fetchone()[0]
+                    if count > 0:
+                        result_flag = "FAIL"
+                        details = f"{count} rows out of range [{min_val}, {max_val}]."
+                    else:
+                        details = f"All rows within range [{min_val}, {max_val}]."
+            elif validation_type.upper() == "UNIQUE":
+                query = f"""
+                    SELECT COUNT(*) FROM (
+                        SELECT {column_name}, COUNT(*) AS cnt
+                        FROM {table_name}
+                        GROUP BY {column_name}
+                        HAVING COUNT(*) > 1
+                    ) AS duplicates
+                """
+                cursor.execute(query)
+                count = cursor.fetchone()[0]
+                if count > 0:
+                    result_flag = "FAIL"
+                    details = f"{count} duplicate value(s) found in column '{column_name}'."
+                else:
+                    details = f"All values in column '{column_name}' are unique."
+            else:
+                result_flag = "FAIL"
+                details = f"Validation type '{validation_type}' not implemented."
+        except Exception as ex:
+            result_flag = "FAIL"
+            details = f"Error during validation: {ex}"
+
+        # Log the result in DATA_VALIDATION_LOGS
+        try:
+            cursor.execute("""
+                INSERT INTO DATA_VALIDATION_LOGS(VALIDATION_ID, RESULT_FLAG, DETAILS, VALIDATION_TIMESTAMP)
+                VALUES(?, ?, ?, GETDATE())
+            """, (validation_id, result_flag, details))
+            conn.commit()
+        except Exception as log_ex:
+            logger.error(f"Error logging validation {validation_id}: {log_ex}")
+
+
+###############################################################################
+# BFS RULE EXECUTION (UNIFIED)
+###############################################################################
+
+def execute_rules_unified_bfs(conn, dry_run=False):
+    """
+    Executes rules using a BFS approach:
+      1. Runs data validations first (if desired).
+      2. Processes each rule in BFS order (roots to children).
+      3. Skips child rules if a critical/global rule fails.
+    Logs execution outcomes into RULE_EXECUTION_LOGS.
+    Returns two lists: (executed_rule_ids, skipped_rule_ids).
+    """
+    run_data_validations(conn)  # Potentially optional
+
+    adjacency, roots, parent_map = load_rule_relationships(conn)
+    rule_lookup = get_all_rules_map(conn)
+    executed = []
+    skipped = set()
+    queue = list(roots)
+
+    while queue:
+        rid = queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_lookup:
+            skipped.add(rid)
+            continue
+
+        info = rule_lookup[rid]
+        ok, msg, rec_count = run_single_rule_in_transaction(conn, info, is_dry_run=dry_run)
+        insert_rule_execution_log(conn, rid, ok, msg, rec_count)
+
+        if ok:
+            executed.append(rid)
+            if rid in adjacency:
+                for child_id in adjacency[rid]:
+                    if child_id not in skipped:
+                        queue.append(child_id)
+        else:
+            # For critical or global rules, skip all descendants
+            is_crit = (info.get("CRITICAL_RULE", 0) == 1 or info.get("IS_GLOBAL", 0) == 1)
+            if is_crit and rid in adjacency:
+                for ch in adjacency[rid]:
+                    skip_all_descendants(ch, adjacency, skipped)
+            if rid in adjacency:
+                for ch in adjacency[rid]:
+                    skip_all_descendants(ch, adjacency, skipped)
+            skipped.add(rid)
+
+    return (executed, list(skipped))
+
+
+def skip_all_descendants(start_id, adjacency, skipped):
+    """
+    Recursively marks all descendants reachable from start_id as skipped.
+    """
+    stack = [start_id]
+    while stack:
+        cur = stack.pop()
+        if cur in skipped:
+            continue
+        skipped.add(cur)
+        if cur in adjacency:
+            for child in adjacency[cur]:
+                if child not in skipped:
+                    stack.append(child)
+
+
+def load_rule_relationships(conn):
+    """
+    Constructs adjacency list for BFS: PARENT_RULE_ID -> [child rule IDs].
+    Also handles conflict links, global-critical links, composite references (if needed).
+    Returns (adjacency, roots, parent_map).
+    """
+    c = conn.cursor()
+    c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
+    rows = c.fetchall()
+    adjacency = {}
+    parent_map = {}
+    all_ids = set()
+    for (rid, pid) in rows:
+        all_ids.add(rid)
+        if pid:
+            adjacency.setdefault(pid, set()).add(rid)
+            parent_map[rid] = pid
+
+    # Conflicts are bidirectional, but for BFS we can handle them differently if needed.
+    # For example:
+    c.execute("SELECT RULE_ID1, RULE_ID2 FROM RULE_CONFLICTS")
+    conflict_rows = c.fetchall()
+    for (r1, r2) in conflict_rows:
+        adjacency.setdefault(r1, set()).add(r2)
+        adjacency.setdefault(r2, set()).add(r1)
+
+    # Global-critical links (one directional: GCR_RULE_ID -> TARGET_RULE_ID).
+    c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
+    gcrs = c.fetchall()
+    for (gcr, tgt) in gcrs:
+        adjacency.setdefault(gcr, set()).add(tgt)
+
+    # Composite links (e.g., sub-rule -> composite rule).
+    c.execute("SELECT COMPOSITE_RULE_ID, LOGIC_EXPR FROM COMPOSITE_RULES")
+    comp_rows = c.fetchall()
+    pat = re.compile(r"Rule(\d+)")
+    for (comp_id, expr) in comp_rows:
+        if expr:
+            matches = pat.findall(expr)
+            for m in matches:
+                try:
+                    sub_id = int(m)
+                    adjacency.setdefault(sub_id, set()).add(comp_id)
+                except Exception as ex:
+                    logger.error(f"Error parsing composite rule expr: {ex}")
+                    continue
+
+    child_ids = set(parent_map.keys())
+    roots = [rid for rid in all_ids if rid not in child_ids]
+    return (adjacency, roots, parent_map)
+
+def get_all_rules_map(conn):
+    """
+    Returns a dict: RULE_ID -> {rule data from BRM_RULES}.
+    """
+    c = conn.cursor()
+    c.execute("SELECT * FROM BRM_RULES")
+    rows = c.fetchall()
+    colnames = [desc[0] for desc in c.description]
+    rule_map = {}
+    for row in rows:
+        d = dict(zip(colnames, row))
+        rule_map[d["RULE_ID"]] = d
+    return rule_map
+
+
+def run_single_rule_in_transaction(conn, rule_info, is_dry_run=False):
+    """
+    Executes a single rule in a transaction:
+      - If OPERATION_TYPE = 'DECISION_TABLE', runs decision table logic
+      - Else runs the RULE_SQL
+    Returns (success_flag, message, record_count).
+    Rolls back if is_dry_run or if result fails.
+    """
+    op_type = (rule_info.get("OPERATION_TYPE") or "").upper()
+    rule_sql = rule_info.get("RULE_SQL") or ""
+    dt_id = rule_info.get("DECISION_TABLE_ID")
+
+    if op_type == "DECISION_TABLE":
+        if not dt_id:
+            return (False, "No DECISION_TABLE_ID provided", 0)
+        return execute_decision_table(conn, dt_id, dry_run=True)
+
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN TRANSACTION")
+    except Exception as ex:
+        logger.error(f"Error beginning transaction for rule {rule_info.get('RULE_ID')}: {ex}")
+        return (False, str(ex), 0)
+
+    success = False
+    msg = ""
+    rec_count = 0
+
+    try:
+        c.execute(rule_sql)
+        try:
+            rows = c.fetchall()
+        except Exception:
+            rows = []
+        rec_count = len(rows)
+        if rows:
+            val = rows[0][0]
+            success = (val == 1)
+            msg = f"Returned: {val}"
+        else:
+            success = True
+            msg = "No rows returned => PASS"
+
+        if is_dry_run or not success:
+            c.execute("ROLLBACK")
+        else:
+            c.execute("COMMIT")
+    except Exception as ex:
+        try:
+            c.execute("ROLLBACK")
+        except Exception:
+            pass
+        success = False
+        msg = str(ex)
+
+    return (success, msg, rec_count)
+
+
+def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count):
+    """
+    Inserts an execution log in RULE_EXECUTION_LOGS.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO RULE_EXECUTION_LOGS(
+              RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG,
+              MESSAGE, RECORD_COUNT, EXECUTION_TIME_MS,
+              CPU_USAGE, MEM_USAGE
+            )
+            VALUES(?, GETDATE(), ?, ?, ?, 0, 0, 0)
+        """, (rule_id, 1 if pass_flag else 0, message, record_count))
+        conn.commit()
+    except Exception as ex:
+        logger.error(f"Error inserting rule execution log for rule {rule_id}: {ex}")
+
+###############################################################################
+# DECISION TABLE EXECUTION
+###############################################################################
+
+def execute_decision_table(conn, dt_id, dry_run=True):
+    """
+    Runs a DECISION_TABLE:
+      - Fetches DECISION_QUERY from DECISION_TABLES by dt_id
+      - Executes it in a transaction
+      - If first column of first row == 1 => PASS
+      - Always rollbacks if dry_run
+    Returns (success_flag, message, record_count).
+    """
+    c_dt = conn.cursor()
+    c_dt.execute("SELECT DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?", (dt_id,))
+    row = c_dt.fetchone()
+    if not row:
+        return (False, f"Decision table {dt_id} not found.", 0)
+
+    decision_query = row[0] or ""
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN TRANSACTION")
+    except Exception as ex:
+        logger.error(f"Error starting transaction for decision table {dt_id}: {ex}")
+        return (False, str(ex), 0)
+
+    success = False
+    msg = ""
+    rec_count = 0
+
+    try:
+        c.execute(decision_query)
+        try:
+            rows = c.fetchall()
+        except Exception:
+            rows = []
+        rec_count = len(rows)
+        if rows:
+            val = rows[0][0]
+            success = (val == 1)
+            msg = f"Decision table returned: {val}"
+        else:
+            success = True
+            msg = "No rows returned => PASS"
+
+        c.execute("ROLLBACK")  # always rollback for a "dry_run"
+    except Exception as ex:
+        try:
+            c.execute("ROLLBACK")
+        except:
+            pass
+        success = False
+        msg = str(ex)
+
+    return (success, msg, rec_count)
+
+
+def insert_decision_table_log(conn, dt_id, pass_flag, message, record_count):
+    """
+    Inserts a log into DECISION_TABLE_EXEC_LOGS.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO DECISION_TABLE_EXEC_LOGS(
+              DECISION_TABLE_ID, EXEC_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT
+            )
+            VALUES(?, GETDATE(), ?, ?, ?)
+        """, (dt_id, 1 if pass_flag else 0, message, record_count))
+        conn.commit()
+    except Exception as ex:
+        logger.error(f"Error inserting decision table log for DT {dt_id}: {ex}")
+
+###############################################################################
+# DRY-RUN SIMULATIONS (CHAIN & CUSTOM GROUP)
+###############################################################################
+
+def dry_run_rule_sql(conn, sql_text):
+    """
+    Runs given SQL in a transaction, returns PASS if first column == 1, else FAIL.
+    Always rollbacks. Used for "What-If" tests.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("BEGIN TRANSACTION")
+    except Exception as ex:
+        return (False, f"Transaction start error: {ex}")
+    success = True
+    message = ""
+    try:
+        c.execute(sql_text)
+        try:
+            rows = c.fetchall()
+        except Exception:
+            rows = []
+        if rows:
+            val = rows[0][0]
+            success = (val == 1)
+            message = f"Returned: {val}"
+        else:
+            success = True
+            message = "No rows returned => PASS"
+        c.execute("ROLLBACK")
+    except Exception as ex:
+        try:
+            c.execute("ROLLBACK")
+        except:
+            pass
+        success = False
+        message = str(ex)
+    return (success, message)
+
+
+def simulate_chain_bfs(conn, parent_rule_id):
+    """
+    Simulates a BFS chain dry-run from parent_rule_id:
+      - For DECISION_TABLE rules, runs the table logic
+      - For others, does dry_run_rule_sql
+    Returns (executed, skipped) lists.
+    """
+    adjacency, roots, parent_map = load_rule_relationships(conn)
+    c = conn.cursor()
+    c.execute("SELECT RULE_ID, RULE_SQL, OPERATION_TYPE, DECISION_TABLE_ID FROM BRM_RULES")
+    rows = c.fetchall()
+    rule_map = {}
+    for (rid, sql_, op_type, dt_id) in rows:
+        rule_map[rid] = (sql_ or "", op_type or "OTHER", dt_id)
+    executed = []
+    skipped = set()
+    queue = [parent_rule_id]
+
+    while queue:
+        rid = queue.pop(0)
+        if rid in skipped:
+            continue
+        if rid not in rule_map:
+            skipped.add(rid)
+            continue
+
+        sql_text, op_type, dt_id = rule_map[rid]
+        if op_type.upper() == "DECISION_TABLE":
+            ok, msg, _ = execute_decision_table(conn, dt_id, dry_run=True)
+        else:
+            ok, msg = dry_run_rule_sql(conn, sql_text)
+
+        if ok:
+            executed.append(rid)
+            if rid in adjacency:
+                for child_id in adjacency[rid]:
+                    if child_id not in skipped:
+                        queue.append(child_id)
+        else:
+            if rid in adjacency:
+                for ch in adjacency[rid]:
+                    skip_all_descendants(ch, adjacency, skipped)
+            skipped.add(rid)
+    return (executed, list(skipped))
+
+
+def simulate_custom_group_rules(conn, custom_group_id):
+    """
+    Simulates each rule in a custom group via dry_run_rule_sql or decision_table logic.
+    Returns (passed_ids, failed_ids).
+    """
+    c = conn.cursor()
+    c.execute("SELECT RULE_ID FROM BRM_CUSTOM_GROUP_MEMBERS WHERE CUSTOM_GROUP_ID=?", (custom_group_id,))
+    rule_ids = [r[0] for r in c.fetchall()]
+    c.execute("SELECT RULE_ID, RULE_SQL, OPERATION_TYPE, DECISION_TABLE_ID FROM BRM_RULES")
+    all_rows = c.fetchall()
+    rule_map = {}
+    for (rid, sql_, op_type, dt_id) in all_rows:
+        rule_map[rid] = (sql_ or "", op_type or "OTHER", dt_id)
+
+    passed = []
+    failed = []
+
+    for rid in rule_ids:
+        if rid not in rule_map:
+            failed.append(rid)
+            continue
+        sql_text, op_type, dt_id = rule_map[rid]
+        if op_type.upper() == "DECISION_TABLE":
+            ok, msg, _ = execute_decision_table(conn, dt_id, dry_run=True)
+            if ok:
+                passed.append(rid)
+            else:
+                failed.append(rid)
+        else:
+            ok, msg = dry_run_rule_sql(conn, sql_text)
+            if ok:
+                passed.append(rid)
+            else:
+                failed.append(rid)
+
+    return (passed, failed)
+
+###############################################################################
+# PART 3: UI FOR ADVANCED SCHEDULING, SIMULATIONS, ETC.
+###############################################################################
+
+class EnhancedScheduleDialog(QtWidgets.QDialog):
+    """
+    Fully functional scheduling dialog to pick a rule, date/time,
+    and optional run_validations. Inserts into RULE_SCHEDULES.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Enhanced Scheduling")
+        self.resize(400, 300)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.rule_combo = QComboBox()
+        c = connection.cursor()
+        c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+        for (rid, rn) in c.fetchall():
+            disp = f"{rid} - {rn}"
+            self.rule_combo.addItem(disp, rid)
+        form.addRow("Select Rule:", self.rule_combo)
+
+        self.calendar = QCalendarWidget()
+        self.calendar.setSelectedDate(QtCore.QDate.currentDate())
+        self.calendar.setGridVisible(True)
+        form.addRow("Select Date:", self.calendar)
+
+        self.time_edit = QTimeEdit(QtCore.QTime.currentTime())
+        self.time_edit.setDisplayFormat("HH:mm:ss")
+        form.addRow("Select Time:", self.time_edit)
+
+        self.run_val_checkbox = QCheckBox("Run Data Validations Before Rule?")
+        self.run_val_checkbox.setChecked(False)
+        form.addRow(self.run_val_checkbox)
+
+        layout.addLayout(form)
+
+        btn_layout = QHBoxLayout()
+        sch_btn = QPushButton("Schedule")
+        sch_btn.clicked.connect(self.do_schedule)
+        btn_layout.addWidget(sch_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(close_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def do_schedule(self):
+        rid = self.rule_combo.currentData()
+        date_str = self.calendar.selectedDate().toString("yyyy-MM-dd")
+        time_str = self.time_edit.time().toString("HH:mm:ss")
+        dt_str = f"{date_str} {time_str}"
+        run_val_flag = 1 if self.run_val_checkbox.isChecked() else 0
+
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                INSERT INTO RULE_SCHEDULES(
+                  RULE_ID, SCHEDULE_TIME, STATUS, CREATED_TIMESTAMP, RUN_DATA_VALIDATIONS
+                )
+                VALUES(?, ?, 'Scheduled', GETDATE(), ?)
+            """, (rid, dt_str, run_val_flag))
+            self.connection.commit()
+            QMessageBox.information(self, "Scheduled", f"Rule {rid} scheduled at {dt_str}.")
+            self.close()
+        except Exception as ex:
+            QMessageBox.critical(self, "Schedule Error", str(ex))
+
+class ScheduleManagementTab(QtWidgets.QWidget):
+    """
+    Displays RULE_SCHEDULES with CRUD operations: Refresh, Add, Update, Delete.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        layout = QVBoxLayout(self)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["ScheduleID", "RuleID", "ScheduleTime", "Status", "RunVal?", "Actions"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_schedules)
+        btn_layout.addWidget(refresh_btn)
+
+        add_btn = QPushButton("Add New Schedule")
+        add_btn.clicked.connect(self.add_schedule)
+        btn_layout.addWidget(add_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+        self.load_schedules()
+
+    def load_schedules(self):
+        self.table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT SCHEDULE_ID, RULE_ID, SCHEDULE_TIME, STATUS, RUN_DATA_VALIDATIONS
+                FROM RULE_SCHEDULES
+                ORDER BY SCHEDULE_TIME DESC
+            """)
+            rows = c.fetchall()
+            for row in rows:
+                row_index = self.table.rowCount()
+                self.table.insertRow(row_index)
+                for col_index in range(5):
+                    self.table.setItem(row_index, col_index, QTableWidgetItem(str(row[col_index])))
+                # Action cell: update/delete
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(0,0,0,0)
+                update_btn = QPushButton("Update")
+                update_btn.clicked.connect(lambda _, idx=row_index: self.update_schedule(idx))
+                delete_btn = QPushButton("Delete")
+                delete_btn.clicked.connect(lambda _, idx=row_index: self.delete_schedule(idx))
+                action_layout.addWidget(update_btn)
+                action_layout.addWidget(delete_btn)
+                action_layout.addStretch()
+                self.table.setCellWidget(row_index, 5, action_widget)
+            self.table.resizeColumnsToContents()
+        except Exception as ex:
+            QMessageBox.critical(self, "Load Error", str(ex))
+
+    def add_schedule(self):
+        dlg = EnhancedScheduleDialog(self.connection, self)
+        dlg.exec_()
+        self.load_schedules()
+
+    def update_schedule(self, row_index):
+        item = self.table.item(row_index, 0)
+        if not item:
+            return
+        sched_id = int(item.text())
+        new_dt, ok = QInputDialog.getText(self, "Update Schedule", "New datetime (YYYY-MM-DD HH:mm:ss):")
+        if not ok or not new_dt.strip():
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("UPDATE RULE_SCHEDULES SET SCHEDULE_TIME=? WHERE SCHEDULE_ID=?", (new_dt.strip(), sched_id))
+            self.connection.commit()
+            QMessageBox.information(self, "Updated", f"Schedule {sched_id} updated.")
+        except Exception as ex:
+            QMessageBox.critical(self, "Update Error", str(ex))
+        self.load_schedules()
+
+    def delete_schedule(self, row_index):
+        item = self.table.item(row_index, 0)
+        if not item:
+            return
+        sched_id = int(item.text())
+        confirm = QMessageBox.question(self, "Confirm", f"Delete schedule {sched_id}?")
+        if confirm != QMessageBox.Yes:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("DELETE FROM RULE_SCHEDULES WHERE SCHEDULE_ID=?", (sched_id,))
+            self.connection.commit()
+            QMessageBox.information(self, "Deleted", f"Schedule {sched_id} removed.")
+        except Exception as ex:
+            QMessageBox.critical(self, "Delete Error", str(ex))
+        self.load_schedules()
+  
+
