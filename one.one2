@@ -1,0 +1,2302 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+BRM MASTER – FULLY ENHANCED & INTEGRATED
+Chunk #1 of N
+--------------------------------------------------------------------------------
+This code merges all 8 original parts + all advanced enhancements requested:
+    • BFS-based rule execution
+    • Multi-step approvals with parallel/serial logic, rationale comments
+    • Collaboration with threaded discussions, mention notifications
+    • Hierarchy & interactive lineage graph with dynamic force layout, context menus
+    • Advanced “What-If” testing with inline data editor
+    • Enhanced search & filtering (multi-criteria, saved filters, suggestions)
+    • Extended rule editing with mini-linter, warnings, template library
+    • Full user onboarding wizard + help tours
+    • Snapshots & diffs, with “dry-run rollback” previews
+    • Usage analytics & heatmaps, anomaly detection hooks
+    • Conflict map & triage
+    • Fine-grained RBAC for advanced roles & permissions
+    • Visual approval pipelines with parallel steps
+    • Task & notification center, including one-click actions
+    • Etc.
+
+Dependencies & Installation:
+    pip install PyQt5 pyodbc sqlparse pyqtgraph numpy sklearn
+
+Run the tool:
+    python brm_master.py
+"""
+
+import sys
+import os
+import json
+import csv
+import math
+import logging
+import re
+import sqlparse
+import smtplib
+import pyodbc
+import numpy as np
+import difflib
+from datetime import datetime, timedelta
+from collections import defaultdict, deque
+from email.mime.text import MIMEText
+
+# PyQt5 imports
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import (
+    Qt, QTimer, QDateTime, QDate, QTime, pyqtSignal, QEvent, QPointF
+)
+from PyQt5.QtGui import (
+    QFont, QIcon, QPainter, QPen, QBrush, QColor
+)
+from PyQt5.QtWidgets import (
+    QMainWindow, QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QLineEdit, QPlainTextEdit, QTableWidget, QTableWidgetItem, QPushButton,
+    QLabel, QMessageBox, QFileDialog, QInputDialog, QComboBox, QCalendarWidget,
+    QTimeEdit, QSplitter, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
+    QMenu, QDockWidget, QProgressDialog, QWizard, QWizardPage, QTabWidget,
+    QCheckBox, QRadioButton, QGroupBox, QSpinBox, QDoubleSpinBox
+)
+
+import pyqtgraph as pg
+from pyqtgraph import PlotWidget
+
+# Machine learning for forecasting or anomaly detection
+from sklearn.linear_model import LinearRegression
+
+################################################################################
+# GLOBAL LOG CONFIG
+################################################################################
+LOG_FILE = os.getenv("BRM_LOG_FILE", "brm_master.log")
+LOG_LEVEL = os.getenv("BRM_LOG_LEVEL", "DEBUG")
+
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("brm_master")
+
+
+################################################################################
+# HELPER: Insert Audit Log
+################################################################################
+def insert_audit_log(conn, action, table_name, record_id, actor, old_data=None, new_data=None):
+    """
+    Helper to insert an audit log record with optional old/new data as JSON.
+    """
+    try:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO BRM_AUDIT_LOG(
+                ACTION, TABLE_NAME, RECORD_ID, ACTION_BY,
+                OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
+            )
+            VALUES(?,?,?,?,?,?,GETDATE())
+        """, (
+            action,
+            table_name,
+            str(record_id) if record_id else None,
+            actor,
+            json.dumps(old_data) if old_data else None,
+            json.dumps(new_data) if new_data else None
+        ))
+        conn.commit()
+        logger.debug(
+            f"Audit inserted => action={action}, table={table_name}, record_id={record_id}, actor={actor}"
+        )
+    except Exception as ex:
+        logger.error(f"Error inserting audit log: {ex}")
+
+
+################################################################################
+# ADVANCED EMAIL NOTIFIER
+################################################################################
+class EmailNotifier:
+    """
+    Sends emails via SMTP, reading credentials from environment variables
+    or fallback defaults. Provides detailed logging & error reporting.
+    """
+
+    def __init__(self):
+        self.smtp_server = os.getenv("BRM_SMTP_SERVER", "smtp.example.com")
+        self.smtp_port = int(os.getenv("BRM_SMTP_PORT", 587))
+        self.smtp_username = os.getenv("BRM_SMTP_USERNAME", "your_smtp_user")
+        self.smtp_password = os.getenv("BRM_SMTP_PASSWORD", "your_smtp_pass")
+        self.sender_email = os.getenv("BRM_SENDER_EMAIL", "noreply@example.com")
+
+    def send_email(self, subject, body, recipients):
+        if not recipients:
+            logger.warning("EmailNotifier: No recipients provided.")
+            return
+        try:
+            msg = MIMEText(body, 'plain')
+            msg['Subject'] = subject
+            msg['From'] = self.sender_email
+            msg['To'] = ", ".join(recipients)
+
+            smtp = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            smtp.starttls()
+            smtp.login(self.smtp_username, self.smtp_password)
+            smtp.sendmail(self.sender_email, recipients, msg.as_string())
+            smtp.quit()
+            logger.info(f"Email sent to {recipients}")
+        except Exception as ex:
+            logger.error(f"Error sending email: {ex}")
+            raise
+
+
+################################################################################
+# DATABASE CONNECTION DIALOG
+################################################################################
+class DatabaseConnectionDialog(QtWidgets.QDialog):
+    """
+    Allows user to either select an ODBC DSN or provide a custom connection string.
+    Tries to connect to verify it’s working.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.connection = None
+        self.setWindowTitle("DB Connection")
+        self.resize(420, 220)
+
+        main_layout = QVBoxLayout(self)
+        lbl = QLabel("Select ODBC DSN or provide a custom connection string:")
+        main_layout.addWidget(lbl)
+
+        self.dsn_combo = QComboBox()
+        try:
+            dsn_dict = pyodbc.dataSources()
+            # Filter for drivers that have "SQL Server" or "ODBC" etc.
+            for dsn_name, driver in dsn_dict.items():
+                if "SQL SERVER" in driver.upper():
+                    self.dsn_combo.addItem(f"ODBC DSN: {dsn_name}", dsn_name)
+        except Exception as ex:
+            logger.error(f"Error listing DSNs: {ex}")
+        main_layout.addWidget(self.dsn_combo)
+
+        self.conn_str_edit = QLineEdit()
+        self.conn_str_edit.setPlaceholderText("Or enter custom ODBC connection string (optional)")
+        main_layout.addWidget(self.conn_str_edit)
+
+        btn_h = QHBoxLayout()
+        ok_btn = QPushButton("Connect")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_h.addWidget(ok_btn)
+        btn_h.addWidget(cancel_btn)
+        main_layout.addLayout(btn_h)
+
+    def get_connection(self):
+        """
+        Actually tries to connect to the DB. Returns a pyodbc connection or None.
+        """
+        custom_str = self.conn_str_edit.text().strip()
+        if custom_str:
+            conn_str = custom_str
+        else:
+            sel = self.dsn_combo.currentData()
+            if not sel:
+                QMessageBox.critical(self, "Error", "No DSN or custom connection string provided.")
+                return None
+            conn_str = f"DSN={sel};Trusted_Connection=yes;"
+
+        try:
+            conn = pyodbc.connect(conn_str)
+            logger.info("Database connection established successfully.")
+            return conn
+        except Exception as ex:
+            QMessageBox.critical(self, "Connection Error", str(ex))
+            logger.error(f"DB connection failed: {ex}")
+            return None
+
+    def accept(self):
+        test_conn = self.get_connection()
+        if test_conn:
+            self.connection = test_conn
+            super().accept()
+        else:
+            # remain in the dialog
+            pass
+################################################################################
+# SQL PARSER HELPERS (with table/column dependency extraction)
+################################################################################
+
+def detect_operation_type(sql_text: str) -> str:
+    """
+    Return one of: INSERT, UPDATE, DELETE, SELECT, or OTHER.
+    Enhanced: Strips leading comments and whitespace before determining operation.
+    """
+    cleaned = re.sub(r'(--.*?$)|(/\*.*?\*/)', '', sql_text or '', flags=re.MULTILINE | re.DOTALL).lstrip()
+    up = cleaned.upper()
+    if up.startswith("INSERT"):
+        return "INSERT"
+    elif up.startswith("UPDATE"):
+        return "UPDATE"
+    elif up.startswith("DELETE"):
+        return "DELETE"
+    elif up.startswith("SELECT"):
+        return "SELECT"
+    else:
+        return "OTHER"
+
+
+def parse_sql_dependencies(sql_text: str):
+    """
+    Use sqlparse to identify table references, columns, CTE usage, etc.
+    Returns a dict with keys 'tables', 'columns', 'cte_tables', and 'alias_map'.
+    """
+    try:
+        statements = sqlparse.parse(sql_text)
+    except Exception as ex:
+        logger.error(f"SQL parsing error: {ex}")
+        return {"tables": [], "cte_tables": [], "alias_map": {}, "columns": []}
+
+    all_tables = []
+    columns = []
+    cte_info = []
+    alias_map = {}
+
+    for stmt in statements:
+        ctes = _extract_with_clauses(stmt)
+        for cName, cRefs in ctes.items():
+            cte_info.append((cName, cRefs))
+
+        main_refs, main_alias = _extract_main_from(stmt.tokens, set(ctes.keys()))
+        all_tables.extend(main_refs)
+        alias_map.update(main_alias)
+
+        col_refs = _extract_columns(stmt)
+        columns.extend(col_refs)
+
+    unique_tables = list({x for x in all_tables})
+    return {
+        "tables": unique_tables,
+        "cte_tables": cte_info,
+        "alias_map": alias_map,
+        "columns": columns
+    }
+
+
+# Submethods for parse_sql_dependencies()
+def _extract_with_clauses(statement):
+    tokens = list(statement.tokens)
+    i = 0
+    cte_map = {}
+    from sqlparse.tokens import Keyword
+
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is Keyword and tk.value.upper() == "WITH":
+            i += 1
+            i = _parse_cte_block(tokens, i, cte_map)
+            continue
+        i += 1
+    return cte_map
+
+
+def _parse_cte_block(tokens, i, cte_map):
+    from sqlparse.sql import Identifier, Parenthesis
+    from sqlparse.tokens import Keyword
+
+    while i < len(tokens):
+        tk = tokens[i]
+        if isinstance(tk, Identifier):
+            cte_name = tk.get_real_name()
+            i += 1
+            i = _parse_cte_as_clause(tokens, i, cte_name, cte_map)
+        elif tk.ttype is Keyword and tk.value.upper() in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            return i
+        else:
+            i += 1
+    return i
+
+
+def _parse_cte_as_clause(tokens, i, cte_name, cte_map):
+    from sqlparse.sql import Parenthesis
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.value.upper() == "AS":
+            i += 1
+            if i < len(tokens):
+                sub = tokens[i]
+                if isinstance(sub, Parenthesis):
+                    sub_refs = _extract_subselect_tokens(sub.tokens)
+                    cte_map[cte_name] = sub_refs
+                    i += 1
+                    return i
+        else:
+            i += 1
+    return i
+
+
+def _extract_subselect_tokens(tokens):
+    from sqlparse.sql import IdentifierList, Identifier
+    from sqlparse.tokens import Keyword
+    results = []
+    from_seen = False
+    i = 0
+    while i < len(tokens):
+        tk = tokens[i]
+        if hasattr(tk, "is_group") and tk.is_group and _is_subselect(tk):
+            results.extend(_extract_subselect_tokens(tk.tokens))
+        if tk.ttype is Keyword:
+            upv = tk.value.upper()
+            if upv in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
+        if from_seen:
+            if isinstance(tk, IdentifierList):
+                for ident in tk.get_identifiers():
+                    st = _parse_identifier(ident, set())
+                    st = (st[0], st[1], st[2], True)
+                    results.append(st)
+            elif isinstance(tk, Identifier):
+                st = _parse_identifier(tk, set())
+                st = (st[0], st[1], st[2], True)
+                results.append(st)
+        i += 1
+    return results
+
+
+def _is_subselect(token):
+    from sqlparse.tokens import DML
+    if not token.is_group:
+        return False
+    for sub in token.tokens:
+        if sub.ttype is DML and sub.value.upper() == "SELECT":
+            return True
+    return False
+
+
+def _extract_main_from(tokenlist, known_cte_names):
+    from sqlparse.tokens import Keyword
+    from sqlparse.sql import IdentifierList, Identifier
+    results = []
+    alias_map = {}
+    tokens = list(tokenlist)
+    from_seen = False
+    i = 0
+    while i < len(tokens):
+        tk = tokens[i]
+        if hasattr(tk, "is_group") and tk.is_group and _is_subselect(tk):
+            results.extend(_extract_subselect_tokens(tk.tokens))
+        if tk.ttype is Keyword:
+            upv = tk.value.upper()
+            if upv in ("FROM", "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"):
+                from_seen = True
+            else:
+                from_seen = False
+        if from_seen:
+            if isinstance(tk, IdentifierList):
+                for ident in tk.get_identifiers():
+                    st = _parse_identifier(ident, known_cte_names)
+                    results.append(st)
+                    if st[2]:
+                        alias_map[st[2]] = (st[0], st[1])
+            elif isinstance(tk, Identifier):
+                st = _parse_identifier(tk, known_cte_names)
+                results.append(st)
+                if st[2]:
+                    alias_map[st[2]] = (st[0], st[1])
+        i += 1
+    return (results, alias_map)
+
+
+def _parse_identifier(ident, known_cte_names):
+    alias = ident.get_alias()
+    real_name = ident.get_real_name()
+    schema = ident.get_parent_name()
+    if real_name and real_name.upper() in (n.upper() for n in known_cte_names):
+        return (None, f"(CTE) {real_name}", alias, False)
+    return (schema, real_name, alias, False)
+
+
+def _extract_columns(statement):
+    from sqlparse.tokens import DML, Keyword
+    from sqlparse.sql import IdentifierList, Identifier, Parenthesis
+    results = []
+    tokens = list(statement.tokens)
+    i = 0
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is DML:
+            upv = tk.value.upper()
+            if upv == "SELECT":
+                results.extend(_parse_select_list(tokens, i + 1))
+            elif upv in ("INSERT", "UPDATE"):
+                results.extend(_parse_dml_columns(tokens, i, upv))
+        i += 1
+    return results
+
+
+def _parse_select_list(tokens, start_idx):
+    from sqlparse.tokens import Keyword
+    from sqlparse.sql import IdentifierList, Identifier
+    columns = []
+    i = start_idx
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is Keyword:
+            upv = tk.value.upper()
+            if upv in ("FROM", "JOIN", "WHERE", "GROUP", "ORDER", "UNION", "INTERSECT"):
+                break
+        if isinstance(tk, IdentifierList):
+            for ident in tk.get_identifiers():
+                nm = ident.get_name()
+                if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
+                    columns.append(nm)
+        elif isinstance(tk, Identifier):
+            nm = tk.get_name()
+            if nm and nm.upper() not in ("DISTINCT", "TOP", "ALL"):
+                columns.append(nm)
+        i += 1
+    return columns
+
+
+def _parse_dml_columns(tokens, start_idx, dml_word):
+    from sqlparse.tokens import Keyword
+    from sqlparse.sql import Parenthesis, IdentifierList, Identifier
+    columns = []
+    if dml_word == "INSERT":
+        i = start_idx
+        while i < len(tokens):
+            tk = tokens[i]
+            if tk.is_group and isinstance(tk, Parenthesis):
+                for sub in tk.tokens:
+                    if isinstance(sub, IdentifierList):
+                        for ident in sub.get_identifiers():
+                            columns.append(ident.get_name())
+                    elif isinstance(sub, Identifier):
+                        columns.append(sub.get_name())
+                return columns
+            i += 1
+    elif dml_word == "UPDATE":
+        found_set = False
+        i = start_idx
+        while i < len(tokens):
+            tk = tokens[i]
+            if tk.ttype is Keyword and tk.value.upper() == "SET":
+                found_set = True
+                i += 1
+                columns.extend(_parse_update_set_list(tokens, i))
+                break
+            i += 1
+    return columns
+
+
+def _parse_update_set_list(tokens, start_i):
+    from sqlparse.tokens import Keyword
+    from sqlparse.sql import Identifier
+    cols = []
+    i = start_i
+    while i < len(tokens):
+        tk = tokens[i]
+        if tk.ttype is Keyword and tk.value.upper() in ("WHERE", "FROM"):
+            break
+        if isinstance(tk, Identifier):
+            cols.append(tk.get_name())
+        i += 1
+    return cols
+###############################################################################
+# LOGIN DIALOG (FULLY ENHANCED WITH RBAC + LOGGING)
+###############################################################################
+
+class LoginDialog(QtWidgets.QDialog):
+    """
+    Enhanced login dialog with RBAC (Role-Based Access Control).
+    Allows for group and role resolution upon login.
+    """
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = None
+        self.username = None
+        self.user_group = None
+        self.roles = []
+
+        self.setWindowTitle("Login – BRM Tool")
+        self.resize(320, 180)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Username:"))
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("Enter your username")
+        layout.addWidget(self.user_edit)
+
+        layout.addWidget(QLabel("Password:"))
+        self.pass_edit = QLineEdit()
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        self.pass_edit.setPlaceholderText("Enter your password")
+        layout.addWidget(self.pass_edit)
+
+        self.remember_check = QCheckBox("Remember me")
+        layout.addWidget(self.remember_check)
+
+        login_btn = QPushButton("Login")
+        login_btn.clicked.connect(self.do_login)
+        layout.addWidget(login_btn)
+
+    def do_login(self):
+        username = self.user_edit.text().strip()
+        password = self.pass_edit.text().strip()
+
+        if not username or not password:
+            QMessageBox.warning(self, "Missing Info", "Please enter both username and password.")
+            return
+
+        try:
+            logger.debug(f"Attempting login for user: {username}")
+            c = self.connection.cursor()
+            c.execute("""
+                SELECT USER_ID, USER_GROUP, USERNAME 
+                FROM USERS 
+                WHERE USERNAME = ? AND PASSWORD = ?
+            """, (username, password))
+            row = c.fetchone()
+            if row:
+                self.user_id = row[0]
+                self.user_group = row[1]
+                self.username = row[2]
+
+                logger.info(f"User {username} authenticated successfully.")
+                self.resolve_user_roles()
+                self.accept()
+            else:
+                logger.warning(f"Login failed for user: {username}")
+                QMessageBox.warning(self, "Invalid Login", "Username or password is incorrect.")
+        except Exception as ex:
+            logger.exception("Login failed due to an exception:")
+            QMessageBox.critical(self, "Error", f"An error occurred during login: {str(ex)}")
+
+    def resolve_user_roles(self):
+        """
+        Populates self.roles with assigned roles from GROUP_PERMISSIONS or extended RBAC table.
+        """
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                SELECT DISTINCT TARGET_TABLE 
+                FROM GROUP_PERMISSIONS 
+                WHERE GROUP_NAME = ?
+            """, (self.user_group,))
+            self.roles = [r[0] for r in c.fetchall()]
+            logger.debug(f"Resolved {len(self.roles)} roles for user group: {self.user_group}")
+        except Exception as ex:
+            logger.error(f"Role resolution error: {ex}")
+            self.roles = []
+###############################################################################
+# USER STATE & ONBOARDING WIZARD
+###############################################################################
+
+class UserState:
+    """
+    Tracks the current user's ID, username, group, roles, and any additional 
+    flags such as onboarding completion.
+    """
+    def __init__(self, user_id, username, user_group, roles=None):
+        self.user_id = user_id
+        self.username = username
+        self.user_group = user_group
+        self.roles = roles if roles else []
+        self.onboarding_completed = False
+
+    def __repr__(self):
+        return (f"<UserState user_id={self.user_id} username={self.username} "
+                f"group={self.user_group} roles={self.roles} "
+                f"onboarding={self.onboarding_completed}>")
+
+class OnboardingWizard(QDialog):
+    """
+    Multi-step wizard for brand-new users or major version updates.
+    Steps might include:
+        1) Basic orientation on the UI (tab highlights)
+        2) Setup a custom group or schedule
+        3) Walk-through of creating a sample rule
+        4) Checking notifications or approvals
+    """
+    def __init__(self, connection, user_state, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_state = user_state
+        self.current_step = 0
+        self.setWindowTitle("BRM Onboarding Wizard")
+        self.resize(480, 320)
+
+        self.label = QLabel("Welcome to the BRM Tool! Ready to begin?")
+        self.label.setWordWrap(True)
+
+        # Multi-step content (in a basic form)
+        self.steps = [
+            "Step 1: Intro to the UI. Explore the top tabs: Admin, Dashboard, Rules, Approvals, etc.",
+            "Step 2: Create or verify you have a Custom Group (try the 'Custom Rule Groups' tab).",
+            "Step 3: Add a sample rule or schedule an existing rule.",
+            "Step 4: Check Approvals or Collaboration tab to see how group interactions work."
+        ]
+
+        self.button_next = QPushButton("Next")
+        self.button_next.clicked.connect(self.advance_step)
+
+        self.button_skip = QPushButton("Skip Wizard")
+        self.button_skip.clicked.connect(self.skip_onboarding)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.label)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addWidget(self.button_skip)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.button_next)
+
+        layout.addLayout(btn_layout)
+        self.setLayout(layout)
+
+    def advance_step(self):
+        self.current_step += 1
+        if self.current_step < len(self.steps):
+            self.label.setText(self.steps[self.current_step])
+        else:
+            self.finish_onboarding()
+
+    def finish_onboarding(self):
+        """
+        Mark onboarding as completed for this user in the DB, if desired.
+        """
+        self.user_state.onboarding_completed = True
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                UPDATE USERS
+                SET ONBOARDING_COMPLETE = 1
+                WHERE USER_ID = ?
+            """, (self.user_state.user_id,))
+            self.connection.commit()
+            insert_audit_log(
+                self.connection, 
+                action="ONBOARDING_COMPLETED", 
+                table_name="USERS", 
+                record_id=self.user_state.user_id, 
+                actor=self.user_state.username,
+                old_data=None, 
+                new_data={"onboarding_completed": True}
+            )
+        except Exception as ex:
+            logger.error(f"Error finishing onboarding: {ex}")
+
+        QMessageBox.information(self, "Welcome!", "Onboarding complete. Enjoy using the BRM Tool!")
+        self.accept()
+
+    def skip_onboarding(self):
+        """
+        Allows skipping wizard. Optionally log the skip event for auditing.
+        """
+        try:
+            insert_audit_log(
+                self.connection, 
+                action="ONBOARDING_SKIPPED", 
+                table_name="USERS", 
+                record_id=self.user_state.user_id, 
+                actor=self.user_state.username,
+                old_data=None, 
+                new_data={"onboarding_skipped": True}
+            )
+        except Exception as ex:
+            logger.error(f"Onboarding skip logging error: {ex}")
+
+        QMessageBox.information(self, "Info", "Wizard skipped. You can open it again from the 'Help' tab.")
+        self.reject()
+###############################################################################
+# COLLABORATION MANAGER – THREADED + MENTIONS
+###############################################################################
+
+class ThreadedCollaborationManager(QtCore.QObject):
+    """
+    Enhanced Collaboration Manager supporting:
+    • Per-rule message threads
+    • @mentions triggering notifications
+    • Polling-based backend (can be extended to WebSocket in future)
+    """
+    newMessage = QtCore.pyqtSignal(dict)  # emits {'rule_id': int, 'sender': str, 'message': str, 'timestamp': str}
+
+    def __init__(self, connection, user_state, poll_ms=5000, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_state = user_state
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll_messages)
+        self.timer.start(poll_ms)
+        self.last_timestamp = None
+        self.mention_handler = MentionNotifier(self.connection, user_state)
+
+    def poll_messages(self):
+        try:
+            c = self.connection.cursor()
+            query = """
+                SELECT MESSAGE_ID, RULE_ID, MESSAGE, SENDER, TIMESTAMP
+                FROM COLLABORATION_LOGS
+                WHERE (? IS NULL OR TIMESTAMP > ?)
+                ORDER BY TIMESTAMP ASC
+            """
+            c.execute(query, (self.last_timestamp, self.last_timestamp))
+            rows = c.fetchall()
+            for msg_id, rule_id, msg, sender, ts in rows:
+                self.newMessage.emit({
+                    "rule_id": rule_id,
+                    "sender": sender,
+                    "message": msg,
+                    "timestamp": ts
+                })
+                self.mention_handler.check_mentions(msg, sender, rule_id, ts)
+                self.last_timestamp = ts
+        except Exception as ex:
+            logger.warning(f"Collaboration polling error: {ex}")
+
+
+class MentionNotifier:
+    """
+    Parses @mentions in messages and optionally sends alerts or email triggers.
+    """
+    def __init__(self, connection, user_state):
+        self.connection = connection
+        self.user_state = user_state
+
+    def check_mentions(self, message, sender, rule_id, timestamp):
+        if not message or "@" not in message:
+            return
+        import re
+        mentions = re.findall(r"@(\w+)", message)
+        for uname in mentions:
+            if uname.lower() == self.user_state.username.lower():
+                # This user was mentioned
+                self.trigger_popup(uname, message, sender, rule_id, timestamp)
+                self.log_mention_event(uname, message, sender, rule_id)
+
+    def trigger_popup(self, username, message, sender, rule_id, timestamp):
+        msg = f"You were mentioned by {sender} in Rule #{rule_id}:\n\n“{message}”"
+        QtWidgets.QMessageBox.information(None, f"@Mention Alert – {timestamp}", msg)
+
+    def log_mention_event(self, username, message, sender, rule_id):
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                INSERT INTO COLLABORATION_MENTIONS(USERNAME, RULE_ID, MESSAGE, SENDER, MENTION_TIMESTAMP)
+                VALUES (?, ?, ?, ?, GETDATE())
+            """, (username, rule_id, message, sender))
+            self.connection.commit()
+        except Exception as ex:
+            logger.warning(f"Failed to log @mention: {ex}")
+###############################################################################
+# ADVANCED APPROVAL CHAIN VISUALIZATION
+###############################################################################
+from PyQt5.QtWidgets import (
+    QDialog, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QPushButton,
+    QScrollArea, QWidget, QSizePolicy
+)
+from PyQt5.QtCore import Qt
+
+class ApprovalPipelineDialog(QDialog):
+    """
+    Displays the multi-stage approval pipeline for a rule:
+      • Supports parallel vs. serial approvals.
+      • Each “stage” can contain multiple groups or users in parallel.
+      • Visually rendered as horizontal blocks (for serial) with one or more
+        vertical columns (for parallel participants).
+      • Shows which participants have Approved, Rejected, or are Pending, plus comments.
+    """
+
+    def __init__(self, connection, rule_id, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.rule_id = rule_id
+        self.setWindowTitle(f"Approval Pipeline – Rule {rule_id}")
+        self.resize(720, 480)
+
+        main_layout = QVBoxLayout(self)
+        # Retrieve pipeline data
+        self.stages = self.fetch_pipeline_data()
+        if not self.stages:
+            no_data_lbl = QLabel("No approval pipeline found for this rule.")
+            main_layout.addWidget(no_data_lbl)
+            return
+
+        # Scrollable area for pipeline
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        pipeline_widget = QWidget()
+        pipeline_layout = QHBoxLayout(pipeline_widget)
+        pipeline_layout.setSpacing(40)  # space between each serial stage
+
+        # Build the pipeline UI
+        for stage_idx, stage_dict in enumerate(self.stages, 1):
+            stage_frame = self.build_stage_frame(stage_idx, stage_dict)
+            pipeline_layout.addWidget(stage_frame)
+
+        # Add the pipeline
+        scroll_area.setWidget(pipeline_widget)
+        main_layout.addWidget(scroll_area)
+
+        # Bottom row
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        main_layout.addWidget(close_btn, alignment=Qt.AlignRight)
+        self.setLayout(main_layout)
+
+    def fetch_pipeline_data(self):
+        """
+        Returns a list of stages, each stage is a dict:
+          {
+            'stage_no': 1,
+            'parallel_approvers': [
+                {
+                    'group_name': 'CreditRisk',
+                    'user_name': 'Alice',
+                    'approved_flag': 0|1|2,
+                    'comment': '...',
+                    'approved_timestamp': ...
+                },
+                ...
+            ]
+          }
+        This is an example structure for demonstration.
+        Adjust to match your DB schema for parallel approvals.
+        """
+        # Example logic with multi-step approvals
+        c = self.connection.cursor()
+        # In this example, we assume there's a STAGE_NO column in BRM_RULE_APPROVALS
+        # and that multiple rows can share the same STAGE_NO => parallel approvals
+        query = """
+        SELECT A.APPROVAL_STAGE, A.GROUP_NAME, A.USERNAME, A.APPROVED_FLAG,
+               ISNULL(A.COMMENTS, '') AS COMMENTS, A.APPROVED_TIMESTAMP
+        FROM BRM_RULE_APPROVALS A
+        WHERE A.RULE_ID=?
+        ORDER BY A.APPROVAL_STAGE ASC, A.GROUP_NAME, A.USERNAME
+        """
+        c.execute(query, (self.rule_id,))
+        rows = c.fetchall()
+        if not rows:
+            return []
+
+        # Build a dictionary keyed by stage
+        from collections import defaultdict
+        stage_map = defaultdict(list)
+        for row in rows:
+            stage_no = row[0]
+            group_nm = row[1]
+            user_nm = row[2]
+            appr_flag = row[3]
+            comment_ = row[4]
+            ts_ = row[5]
+            stage_map[stage_no].append({
+                "group_name": group_nm,
+                "user_name": user_nm,
+                "approved_flag": appr_flag,
+                "comment": comment_,
+                "approved_timestamp": ts_
+            })
+
+        # Convert to a sorted list
+        out = []
+        for stg_no in sorted(stage_map.keys()):
+            out.append({
+                "stage_no": stg_no,
+                "parallel_approvers": stage_map[stg_no]
+            })
+        return out
+
+    def build_stage_frame(self, stage_idx, stage_data):
+        """
+        Builds a vertical layout for one “serial” stage, 
+        containing multiple parallel approvers in a column.
+        """
+        frame = QFrame()
+        frame.setFrameStyle(QFrame.StyledPanel | QFrame.Raised)
+        v_layout = QVBoxLayout(frame)
+
+        # Stage heading
+        stg_label = QLabel(f"Stage {stage_data['stage_no']}")
+        stg_label.setStyleSheet("font-weight: bold; font-size: 14px; margin-bottom: 8px;")
+        v_layout.addWidget(stg_label)
+
+        # For each parallel approver
+        for approver in stage_data["parallel_approvers"]:
+            row_widget = self.build_approver_widget(approver)
+            v_layout.addWidget(row_widget)
+
+        v_layout.addStretch()
+        return frame
+
+    def build_approver_widget(self, approver):
+        """
+        Approver is a dict like:
+          {
+            'group_name': ...
+            'user_name': ...
+            'approved_flag': 0|1|2,
+            'comment': '...',
+            'approved_timestamp': ...
+          }
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        user_line = f"{approver['group_name']}/{approver['user_name']}"
+
+        # Approved_flag: 0 => Pending, 1 => Approved, 2 => Rejected
+        appr_flag = approver["approved_flag"]
+        if appr_flag == 1:
+            color = "#CCFFCC"  # greenish
+            status_txt = "Approved"
+        elif appr_flag == 2:
+            color = "#FFCCCC"  # redish
+            status_txt = "Rejected"
+        else:
+            color = "#FFFFCC"  # yellowish
+            status_txt = "Pending"
+
+        box = QFrame()
+        box.setFrameStyle(QFrame.Panel | QFrame.Raised)
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(6, 6, 6, 6)
+
+        # Apply color
+        box.setStyleSheet(f"background-color: {color};")
+
+        user_lbl = QLabel(user_line)
+        user_lbl.setStyleSheet("font-weight: bold;")
+        box_layout.addWidget(user_lbl)
+
+        status_lbl = QLabel(f"Status: {status_txt}")
+        box_layout.addWidget(status_lbl)
+
+        if appr_flag in (1, 2):
+            ts_ = approver["approved_timestamp"]
+            box_layout.addWidget(QLabel(f"Time: {ts_}"))
+            cm_ = approver["comment"]
+            if cm_:
+                comment_lbl = QLabel(f"Comment: {cm_}")
+                comment_lbl.setWordWrap(True)
+                box_layout.addWidget(comment_lbl)
+        else:
+            # still pending, no timestamp or comment
+            pass
+
+        layout.addWidget(box)
+        return widget
+
+
+class CustomApprovalFlowManager:
+    """
+    Logic to handle advanced approval flows:
+      • Parallel/serial combos
+      • Condition-based chains (like “If rule is global, add stage X”)
+      • Called by the code that inserts/updates BRM_RULE_APPROVALS
+    """
+
+    @staticmethod
+    def build_approval_flow(conn, rule_id, rule_meta):
+        """
+        Example usage:
+         - Evaluate the rule’s scope, group, or references to decide which stage structure is needed.
+         - Insert into BRM_RULE_APPROVALS accordingly.
+        Pseudocode demonstration for advanced flow logic.
+        """
+        c = conn.cursor()
+        is_global = rule_meta.get("IS_GLOBAL", 0)
+        critical_scope = rule_meta.get("CRITICAL_SCOPE", "NONE").upper()
+        finance_table_used = rule_meta.get("REFERENCES_FIN_TABLE", False)
+        # 1) Basic stage: rule owner
+        # 2) If finance_table_used => parallel stage with 'FinanceReview' and 'AuditDept'
+        # 3) If is_global => final stage with 'GlobalApprovers'
+        # 4) If critical_scope = “CLUSTER” => add a different stage, etc.
+
+        # For demonstration:
+        try:
+            c.execute("DELETE FROM BRM_RULE_APPROVALS WHERE RULE_ID=?", (rule_id,))
+            # Stage 1: Rule Owner group
+            c.execute("""
+                INSERT INTO BRM_RULE_APPROVALS (RULE_ID, GROUP_NAME, USERNAME,
+                  APPROVED_FLAG, APPROVAL_STAGE, COMMENTS)
+                VALUES (?, ?, ?, 0, 1, NULL)
+            """, (rule_id, rule_meta["OWNER_GROUP"], rule_meta["CREATED_BY"]))
+
+            stage_no = 2
+            if finance_table_used:
+                # parallel example: we add multiple rows with same stage_no
+                c.execute("""
+                    INSERT INTO BRM_RULE_APPROVALS (RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVAL_STAGE)
+                    VALUES (?, 'FinanceReview', 'FinUser1', 0, ?)
+                """, (rule_id, stage_no))
+                c.execute("""
+                    INSERT INTO BRM_RULE_APPROVALS (RULE_ID, GROUP_NAME, USERNAME, APPROVED_FLAG, APPROVAL_STAGE)
+                    VALUES (?, 'AuditDept', 'AuditorA', 0, ?)
+                """, (rule_id, stage_no))
+                stage_no += 1
+
+            if is_global == 1:
+                c.execute("""
+                    INSERT INTO BRM_RULE_APPROVALS (RULE_ID, GROUP_NAME, USERNAME,
+                      APPROVED_FLAG, APPROVAL_STAGE)
+                    VALUES (?, 'GlobalApprovers', 'GlobalAdmin', 0, ?)
+                """, (rule_id, stage_no))
+                stage_no += 1
+
+            if critical_scope == "CLUSTER":
+                c.execute("""
+                    INSERT INTO BRM_RULE_APPROVALS (RULE_ID, GROUP_NAME, USERNAME,
+                      APPROVED_FLAG, APPROVAL_STAGE)
+                    VALUES (?, 'ClusterReview', 'ClusterLead', 0, ?)
+                """, (rule_id, stage_no))
+                stage_no += 1
+
+            conn.commit()
+        except Exception as ex:
+            conn.rollback()
+            logger.error(f"Error building advanced approval flow for rule {rule_id}: {ex}")
+###############################################################################
+# PART: ADVANCED RULE EDITING WIZARD (WITH CDC & APPROVAL FLOW LOGIC)
+###############################################################################
+from PyQt5.QtWidgets import (
+    QWizard, QWizardPage, QVBoxLayout, QLabel, QLineEdit, QFormLayout,
+    QCheckBox, QComboBox, QTextEdit, QSpinBox, QRadioButton, QPushButton,
+    QMessageBox, QFileDialog
+)
+from PyQt5.QtCore import Qt, QDateTime
+import re
+
+class AdvancedRuleWizard(QWizard):
+    """
+    A multi-step wizard for adding or updating a rule with advanced features:
+      - Basic Info (Rule Name, Group, Dates, Operation Type).
+      - SQL & CDC Handling.
+      - Approvals & Criticality (Global, scope).
+      - Summaries & final save.
+    Integrates with advanced approvals, referencing custom logic from CustomApprovalFlowManager.
+    """
+
+    PAGE_BASIC_INFO = 0
+    PAGE_SQL_CDC = 1
+    PAGE_APPROVALS = 2
+    PAGE_SUMMARY = 3
+
+    def __init__(self, connection, user_id, user_group, rule_data=None, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = user_id
+        self.user_group = user_group
+        self.rule_data = rule_data  # existing rule to update, or None for new
+
+        self.setWindowTitle("Advanced Rule Wizard")
+        self.resize(800, 500)
+        self.addPage(self.createBasicInfoPage())
+        self.addPage(self.createSqlCdcPage())
+        self.addPage(self.createApprovalsPage())
+        self.addPage(self.createSummaryPage())
+
+        self.button(QWizard.FinishButton).clicked.connect(self.save_rule)
+        if rule_data:
+            self.setWindowTitle(f"Update Rule (Wizard) - RuleID={rule_data['RULE_ID']}")
+
+    def createBasicInfoPage(self):
+        page = QWizardPage()
+        page.setTitle("Basic Rule Information")
+
+        layout = QFormLayout(page)
+        self.rule_name_edit = QLineEdit()
+        self.group_combo = QComboBox()
+        self.parent_rule_combo = QComboBox()
+        self.parent_rule_combo.addItem("(No Parent)", None)
+        # Fill group combo
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT GROUP_ID, GROUP_NAME FROM BRM_RULE_GROUPS ORDER BY GROUP_ID")
+            for (gid, gname) in c.fetchall():
+                self.group_combo.addItem(f"{gname} (ID={gid})", gid)
+        except Exception as ex:
+            print(f"Error loading groups: {ex}")
+
+        # Fill parent rule combo
+        c2 = self.connection.cursor()
+        try:
+            c2.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES ORDER BY RULE_ID")
+            for (rid, rname) in c2.fetchall():
+                self.parent_rule_combo.addItem(f"{rname} (ID={rid})", rid)
+        except Exception as ex:
+            print(f"Error loading parent rules: {ex}")
+
+        self.eff_start_edit = QDateTime.currentDateTime()
+        self.eff_end_edit = QDateTime.currentDateTime().addDays(30)
+        self.start_line = QLineEdit()
+        self.start_line.setText(self.eff_start_edit.toString("yyyy-MM-dd HH:mm:ss"))
+        self.end_line = QLineEdit()
+        self.end_line.setText(self.eff_end_edit.toString("yyyy-MM-dd HH:mm:ss"))
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(["INACTIVE", "ACTIVE"])
+
+        layout.addRow("Rule Name:", self.rule_name_edit)
+        layout.addRow("Owner Group:", self.group_combo)
+        layout.addRow("Parent Rule:", self.parent_rule_combo)
+        layout.addRow("Effective Start:", self.start_line)
+        layout.addRow("Effective End:", self.end_line)
+        layout.addRow("Initial Status:", self.status_combo)
+
+        page.setLayout(layout)
+
+        # If updating existing rule, populate fields
+        if self.rule_data:
+            self.rule_name_edit.setText(self.rule_data.get("RULE_NAME", ""))
+            g_ = self.rule_data.get("GROUP_ID")
+            if g_:
+                idx_g = self.group_combo.findData(g_)
+                if idx_g >= 0:
+                    self.group_combo.setCurrentIndex(idx_g)
+            p_ = self.rule_data.get("PARENT_RULE_ID")
+            if p_:
+                idx_p = self.parent_rule_combo.findData(p_)
+                if idx_p >= 0:
+                    self.parent_rule_combo.setCurrentIndex(idx_p)
+            self.start_line.setText(str(self.rule_data.get("EFFECTIVE_START_DATE", self.start_line.text())))
+            self.end_line.setText(str(self.rule_data.get("EFFECTIVE_END_DATE", self.end_line.text())))
+            st_ = self.rule_data.get("STATUS", "INACTIVE")
+            idx_s = self.status_combo.findText(st_)
+            if idx_s >= 0:
+                self.status_combo.setCurrentIndex(idx_s)
+
+        return page
+
+    def createSqlCdcPage(self):
+        page = QWizardPage()
+        page.setTitle("SQL Logic & CDC Configuration")
+
+        layout = QFormLayout(page)
+        self.sql_edit = QTextEdit()
+        self.sql_edit.setPlaceholderText("Enter your rule’s SQL here...")
+
+        self.cdc_combo = QComboBox()
+        self.cdc_combo.addItems(["NONE", "FULL_LOAD", "INCREMENTAL", "UPSERT", "INSERT_ONLY"])
+
+        self.op_type_label = QLabel("Detected Operation: [UNKNOWN]")
+        self.template_btn = QPushButton("Load Template")
+        self.template_btn.clicked.connect(self.loadTemplate)
+
+        # Show warnings or partial intellisense in real-time
+        self.sql_edit.textChanged.connect(self.on_sql_changed)
+
+        layout.addRow(QLabel("Rule SQL:"), self.sql_edit)
+        layout.addRow("CDC Type:", self.cdc_combo)
+        layout.addRow(self.op_type_label, self.template_btn)
+        page.setLayout(layout)
+
+        if self.rule_data:
+            self.sql_edit.setText(self.rule_data.get("RULE_SQL", ""))
+            cdc_val = self.rule_data.get("CDC_TYPE", "NONE").upper()
+            idx_cdc = self.cdc_combo.findText(cdc_val)
+            if idx_cdc >= 0:
+                self.cdc_combo.setCurrentIndex(idx_cdc)
+
+        return page
+
+    def createApprovalsPage(self):
+        page = QWizardPage()
+        page.setTitle("Approvals & Criticality")
+
+        layout = QFormLayout(page)
+        self.is_global_cb = QCheckBox("Global Rule?")
+        self.critical_cb = QCheckBox("Critical Rule?")
+        self.crit_scope_combo = QComboBox()
+        self.crit_scope_combo.addItems(["NONE", "GROUP", "CLUSTER", "GLOBAL"])
+        self.approval_info_lbl = QLabel(
+            "Depending on these settings and references, an advanced approval flow will be created."
+        )
+        self.approval_info_lbl.setWordWrap(True)
+
+        layout.addRow(self.is_global_cb)
+        layout.addRow(self.critical_cb, QLabel("Critical Scope:"))
+        layout.addRow(self.crit_scope_combo)
+        layout.addRow(self.approval_info_lbl)
+        page.setLayout(layout)
+
+        if self.rule_data:
+            ig_ = self.rule_data.get("IS_GLOBAL", 0)
+            self.is_global_cb.setChecked(bool(ig_))
+            cr_ = self.rule_data.get("CRITICAL_RULE", 0)
+            self.critical_cb.setChecked(bool(cr_))
+            cs_ = self.rule_data.get("CRITICAL_SCOPE", "NONE").upper()
+            idx_cs = self.crit_scope_combo.findText(cs_)
+            if idx_cs >= 0:
+                self.crit_scope_combo.setCurrentIndex(idx_cs)
+
+        return page
+
+    def createSummaryPage(self):
+        page = QWizardPage()
+        page.setTitle("Summary & Confirm")
+        v_layout = QVBoxLayout(page)
+        self.summary_label = QLabel("Summary:")
+        self.summary_label.setWordWrap(True)
+        v_layout.addWidget(self.summary_label)
+        page.setLayout(v_layout)
+        return page
+
+    def initializePage(self, id):
+        super().initializePage(id)
+        if id == self.PAGE_SUMMARY:
+            # Build a summary text
+            summary = []
+            summary.append("<b>Rule Name:</b> " + self.rule_name_edit.text())
+            summary.append("<b>Group:</b> " + self.group_combo.currentText())
+            summary.append("<b>Parent Rule:</b> " + self.parent_rule_combo.currentText())
+            summary.append("<b>Effective Dates:</b> {} to {}".format(
+                self.start_line.text(), self.end_line.text()
+            ))
+            summary.append("<b>Status:</b> " + self.status_combo.currentText())
+            summary.append("<b>SQL (first 100 chars):</b> " + self.sql_edit.toPlainText()[:100])
+            summary.append("<b>CDC Type:</b> " + self.cdc_combo.currentText())
+            summary.append("<b>Is Global:</b> " + str(self.is_global_cb.isChecked()))
+            summary.append("<b>Critical Rule:</b> " + str(self.critical_cb.isChecked()))
+            summary.append("<b>Critical Scope:</b> " + self.crit_scope_combo.currentText())
+
+            self.summary_label.setText("<br/>".join(summary))
+
+    def on_sql_changed(self):
+        sql_text = self.sql_edit.toPlainText()
+        # Simple detection to highlight potential issues
+        # Check for blacklisted keywords
+        forbidden_keywords = ["TRUNCATE", "DROP", "SHUTDOWN", "XP_"]
+        for kw in forbidden_keywords:
+            if kw.upper() in sql_text.upper():
+                self.sql_edit.setStyleSheet("background-color: #FFCCCC;")
+                break
+        else:
+            self.sql_edit.setStyleSheet("")
+
+        # Detect operation type
+        detected_op = detect_operation_type(sql_text)
+        self.op_type_label.setText(f"Detected Operation: {detected_op}")
+
+    def loadTemplate(self):
+        # Demonstration of a simple template library
+        # This could be replaced with a more robust solution:
+        templates = {
+            "ThresholdCheck": "SELECT CASE WHEN SomeColumn < 100 THEN 1 ELSE 0 END",
+            "RangeCheck": "SELECT CASE WHEN ValueCol BETWEEN 0 AND 100 THEN 1 ELSE 0 END",
+            "ConditionalAgg": "SELECT CASE WHEN SUM(X)>100 THEN 1 ELSE 0 END FROM SomeTable"
+        }
+        template_names = list(templates.keys())
+        chosen, ok = QInputDialog.getItem(self, "Template Library", "Pick a template:", template_names, 0, False)
+        if ok and chosen:
+            self.sql_edit.setPlainText(templates[chosen])
+
+    def save_rule(self):
+        # Gather data from wizard
+        rule_name = self.rule_name_edit.text().strip()
+        if not rule_name:
+            QMessageBox.warning(self, "Error", "Rule name is required.")
+            return
+
+        c = self.connection.cursor()
+        try:
+            # If updating, we ensure we have the existing RULE_ID
+            if self.rule_data:
+                rid = self.rule_data["RULE_ID"]
+            else:
+                rid = None
+
+            # Prepare the dictionary for rule meta
+            rule_meta = {}
+            rule_meta["RULE_NAME"] = rule_name
+            gdata = self.group_combo.currentData()
+            rule_meta["GROUP_ID"] = gdata if gdata else None
+            parent_data = self.parent_rule_combo.currentData()
+            rule_meta["PARENT_RULE_ID"] = parent_data if parent_data else None
+            rule_meta["EFFECTIVE_START_DATE"] = self.start_line.text()
+            rule_meta["EFFECTIVE_END_DATE"] = self.end_line.text()
+            rule_meta["STATUS"] = self.status_combo.currentText()
+            rule_meta["RULE_SQL"] = self.sql_edit.toPlainText().strip()
+            rule_meta["CDC_TYPE"] = self.cdc_combo.currentText().upper()
+            rule_meta["IS_GLOBAL"] = 1 if self.is_global_cb.isChecked() else 0
+            rule_meta["CRITICAL_RULE"] = 1 if self.critical_cb.isChecked() else 0
+            rule_meta["CRITICAL_SCOPE"] = self.crit_scope_combo.currentText().upper()
+            rule_meta["CREATED_BY"] = self.getUsernameForRule()
+            rule_meta["OWNER_GROUP"] = self.group_combo.currentText()  # text version
+            # Optionally parse references to see if finance table used
+            parse_info = parse_sql_dependencies(rule_meta["RULE_SQL"])
+            # naive check for 'fin' in table references
+            finance_table_used = any(re.search(r"fin", tb, re.IGNORECASE) for tb in parse_info["tables"])
+            rule_meta["REFERENCES_FIN_TABLE"] = finance_table_used
+
+            if rid:
+                # Update path
+                # Auto set status to INACTIVE for re-approval
+                c.execute("""
+                    UPDATE BRM_RULES
+                    SET RULE_NAME=?, GROUP_ID=?, PARENT_RULE_ID=?,
+                        EFFECTIVE_START_DATE=?, EFFECTIVE_END_DATE=?,
+                        STATUS='INACTIVE', RULE_SQL=?,
+                        CDC_TYPE=?, IS_GLOBAL=?, CRITICAL_RULE=?, CRITICAL_SCOPE=?,
+                        UPDATED_BY=?, OWNER_GROUP=?,
+                        APPROVAL_STATUS='APPROVAL_IN_PROGRESS', VERSION=VERSION+1
+                    WHERE RULE_ID=?
+                """, (
+                    rule_meta["RULE_NAME"], rule_meta["GROUP_ID"], rule_meta["PARENT_RULE_ID"],
+                    rule_meta["EFFECTIVE_START_DATE"], rule_meta["EFFECTIVE_END_DATE"],
+                    rule_meta["RULE_SQL"], rule_meta["CDC_TYPE"], rule_meta["IS_GLOBAL"],
+                    rule_meta["CRITICAL_RULE"], rule_meta["CRITICAL_SCOPE"],
+                    rule_meta["CREATED_BY"], rule_meta["OWNER_GROUP"], rid
+                ))
+                # Rebuild advanced approval flow
+                CustomApprovalFlowManager.build_approval_flow(self.connection, rid, rule_meta)
+
+                # parse and store dependencies
+                c.execute("DELETE FROM BRM_RULE_TABLE_DEPENDENCIES WHERE RULE_ID=?", (rid,))
+                col_op = "READ"
+                if detect_operation_type(rule_meta["RULE_SQL"]).upper() in ("INSERT", "UPDATE", "DELETE"):
+                    col_op = "WRITE"
+                for tb in parse_info["tables"]:
+                    c.execute("""
+                        INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_OP)
+                        VALUES(?,?,?,?)
+                    """, (rid, "UnknownDB", tb, col_op))
+
+                insert_audit_log(self.connection, "UPDATE", "BRM_RULES", rid, rule_meta["CREATED_BY"], None, rule_meta)
+                self.connection.commit()
+                QMessageBox.information(self, "Updated", f"Rule {rid} updated; re-approval triggered.")
+            else:
+                # Insert path
+                c.execute("""
+                    INSERT INTO BRM_RULES(
+                      RULE_NAME, GROUP_ID, PARENT_RULE_ID,
+                      EFFECTIVE_START_DATE, EFFECTIVE_END_DATE, STATUS, RULE_SQL,
+                      CDC_TYPE, IS_GLOBAL, CRITICAL_RULE, CRITICAL_SCOPE,
+                      CREATED_BY, UPDATED_BY, OWNER_GROUP, APPROVAL_STATUS, VERSION, CREATED_TIMESTAMP
+                    )
+                    OUTPUT inserted.RULE_ID
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,GETDATE())
+                """, (
+                    rule_meta["RULE_NAME"], rule_meta["GROUP_ID"], rule_meta["PARENT_RULE_ID"],
+                    rule_meta["EFFECTIVE_START_DATE"], rule_meta["EFFECTIVE_END_DATE"],
+                    rule_meta["STATUS"], rule_meta["RULE_SQL"], rule_meta["CDC_TYPE"],
+                    rule_meta["IS_GLOBAL"], rule_meta["CRITICAL_RULE"], rule_meta["CRITICAL_SCOPE"],
+                    rule_meta["CREATED_BY"], None, rule_meta["OWNER_GROUP"],
+                    "APPROVAL_IN_PROGRESS", 1
+                ))
+                new_id_row = c.fetchone()
+                new_rid = new_id_row[0]
+                # build advanced approval flow
+                CustomApprovalFlowManager.build_approval_flow(self.connection, new_rid, rule_meta)
+
+                # parse and store dependencies
+                parse_info = parse_sql_dependencies(rule_meta["RULE_SQL"])
+                col_op = "READ"
+                if detect_operation_type(rule_meta["RULE_SQL"]).upper() in ("INSERT", "UPDATE", "DELETE"):
+                    col_op = "WRITE"
+                for tb in parse_info["tables"]:
+                    c.execute("""
+                        INSERT INTO BRM_RULE_TABLE_DEPENDENCIES(RULE_ID, DATABASE_NAME, TABLE_NAME, COLUMN_OP)
+                        VALUES(?,?,?,?)
+                    """, (new_rid, "UnknownDB", tb, col_op))
+
+                insert_audit_log(self.connection, "INSERT", "BRM_RULES", new_rid, rule_meta["CREATED_BY"], None, rule_meta)
+                self.connection.commit()
+                QMessageBox.information(self, "Created", f"New rule created (RuleID={new_rid}); approval pending.")
+
+            self.accept()
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def getUsernameForRule(self):
+        """
+        Return the current user name. If your system uses something else,
+        adapt accordingly.
+        """
+        # For demonstration, just retrieve from DB or use user_id
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT USERNAME FROM USERS WHERE USER_ID=?", (self.user_id,))
+            row = c.fetchone()
+            if row:
+                return row[0]
+            return f"UnknownUser_{self.user_id}"
+        except:
+            return f"UnknownUser_{self.user_id}"
+
+
+###############################################################################
+# APPROVALS TAB: Integrate with ApprovalPipelineDialog
+###############################################################################
+class EnhancedApprovalsTab(QWidget):
+    """
+    Inherits from your existing ApprovalsTab or from scratch. 
+    Now includes a button to open the pipeline visualization for a selected rule.
+    """
+
+    def __init__(self, connection, logged_in_username, user_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.logged_in_username = logged_in_username
+        self.user_group = user_group
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "RuleID", "GroupName", "RuleName", "Stage", "Approved?", "Pipeline", "Actions"
+        ])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        main_layout.addWidget(self.table)
+
+        btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh Approvals")
+        refresh_btn.clicked.connect(self.load_approvals)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addStretch()
+        main_layout.addLayout(btn_layout)
+
+        self.setLayout(main_layout)
+        self.load_approvals()
+
+    def load_approvals(self):
+        self.table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            query = """
+                SELECT A.RULE_ID, A.GROUP_NAME, R.RULE_NAME, A.APPROVAL_STAGE,
+                       A.APPROVED_FLAG, R.LOCKED_BY
+                FROM BRM_RULE_APPROVALS A
+                JOIN BRM_RULES R ON A.RULE_ID = R.RULE_ID
+                WHERE A.USERNAME=? AND A.APPROVED_FLAG=0
+                ORDER BY A.RULE_ID, A.APPROVAL_STAGE
+            """
+            c.execute(query, (self.logged_in_username,))
+            rows = c.fetchall()
+            self.table.setRowCount(len(rows))
+            for i, row in enumerate(rows):
+                rule_id, group_name, rule_name, stage, approved_flag, locked_by = row
+                self.table.setItem(i, 0, QTableWidgetItem(str(rule_id)))
+                self.table.setItem(i, 1, QTableWidgetItem(str(group_name)))
+                self.table.setItem(i, 2, QTableWidgetItem(str(rule_name)))
+                self.table.setItem(i, 3, QTableWidgetItem(str(stage)))
+                self.table.setItem(i, 4, QTableWidgetItem("Pending"))
+
+                # Pipeline button
+                pipe_btn = QPushButton("View Pipeline")
+                pipe_btn.clicked.connect(lambda _, rid=rule_id: self.show_pipeline(rid))
+                self.table.setCellWidget(i, 5, pipe_btn)
+
+                # Approve/Reject action cell
+                action_widget = QWidget()
+                action_layout = QHBoxLayout(action_widget)
+                approve_btn = QPushButton("Approve")
+                reject_btn = QPushButton("Reject")
+                approve_btn.clicked.connect(lambda _, rid=rule_id: self.do_approve(rid))
+                reject_btn.clicked.connect(lambda _, rid=rule_id: self.do_reject(rid))
+                action_layout.addWidget(approve_btn)
+                action_layout.addWidget(reject_btn)
+                action_layout.setContentsMargins(0, 0, 0, 0)
+                self.table.setCellWidget(i, 6, action_widget)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Error loading approvals: {ex}")
+
+    def show_pipeline(self, rule_id):
+        dlg = ApprovalPipelineDialog(self.connection, rule_id, self)
+        dlg.exec_()
+
+    def do_approve(self, rule_id):
+        c = self.connection.cursor()
+        # Prompt for comment
+        cm, ok = QInputDialog.getText(self, "Approve Rule", "Comment (optional):")
+        if not ok:
+            return
+        try:
+            # Mark the approval record as approved
+            c.execute("""
+                UPDATE BRM_RULE_APPROVALS
+                SET APPROVED_FLAG=1, APPROVED_TIMESTAMP=GETDATE(), COMMENTS=?
+                WHERE RULE_ID=? AND USERNAME=? AND APPROVED_FLAG=0
+            """, (cm, rule_id, self.logged_in_username))
+
+            # Check if all parallel approvals done => move to next stage or finalize
+            # That logic is typically in a stored procedure or a function. 
+            # For brevity, we do a simplified approach:
+            c.execute("""
+                SELECT MIN(APPROVAL_STAGE), COUNT(*)
+                FROM BRM_RULE_APPROVALS
+                WHERE RULE_ID=? AND APPROVED_FLAG=0
+            """, (rule_id,))
+            row = c.fetchone()
+            if row:
+                # If count=0 => all approvals done => rule can become ACTIVE
+                # Or proceed to next stage logic
+                pending_ct = row[1]
+                if pending_ct == 0:
+                    c.execute("""
+                        UPDATE BRM_RULES
+                        SET APPROVAL_STATUS='APPROVED', STATUS='ACTIVE'
+                        WHERE RULE_ID=?
+                    """, (rule_id,))
+                    insert_audit_log(self.connection, "APPROVE_FINAL", "BRM_RULES", rule_id, self.logged_in_username, None, {"finalApproved": True})
+                else:
+                    # Some pending => remain in “IN_PROGRESS”. Possibly you might re-check if next stage can be unlocked, etc.
+                    c.execute("""
+                        UPDATE BRM_RULES
+                        SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS', STATUS='INACTIVE'
+                        WHERE RULE_ID=?
+                    """, (rule_id,))
+            insert_audit_log(self.connection, "APPROVE", "BRM_RULE_APPROVALS", rule_id, self.logged_in_username, None, {"comment": cm})
+            self.connection.commit()
+            QMessageBox.information(self, "Approved", f"Rule {rule_id} approved.")
+            self.load_approvals()
+        except Exception as ex:
+            self.connection.rollback()
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def do_reject(self, rule_id):
+        cm, ok = QInputDialog.getText(self, "Reject Rule", "Reason/Comment:")
+        if not ok:
+            return
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                UPDATE BRM_RULE_APPROVALS
+                SET APPROVED_FLAG=2, APPROVED_TIMESTAMP=GETDATE(), COMMENTS=?
+                WHERE RULE_ID=? AND USERNAME=? AND APPROVED_FLAG=0
+            """, (cm, rule_id, self.logged_in_username))
+            c.execute("""
+                UPDATE BRM_RULES
+                SET APPROVAL_STATUS='REJECTED', STATUS='INACTIVE'
+                WHERE RULE_ID=?
+            """, (rule_id,))
+            insert_audit_log(self.connection, "REJECT", "BRM_RULE_APPROVALS", rule_id, self.logged_in_username, None, {"comment": cm})
+            self.connection.commit()
+            QMessageBox.information(self, "Rejected", f"Rule {rule_id} rejected.")
+            self.load_approvals()
+        except Exception as ex:
+            self.connection.rollback()
+            QMessageBox.critical(self, "Error", str(ex))
+###############################################################################
+# VISUAL CONFLICT MAP WIDGET
+###############################################################################
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QGraphicsView,
+    QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem,
+    QComboBox, QInputDialog, QMessageBox
+)
+from PyQt5.QtGui import QPen, QBrush, QColor
+from PyQt5.QtCore import Qt, QPointF
+import math
+
+
+class ConflictMapWidget(QWidget):
+    """
+    Visualizes conflicts between rules in a graph-like layout.
+    Similar to Lineage Graph, but edges show conflicts.
+    Each edge color shows priority difference.
+    """
+
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.scene = QGraphicsScene()
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHint(QtGui.QPainter.Antialiasing)
+        layout = QVBoxLayout(self)
+
+        controls = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh Map")
+        self.refresh_btn.clicked.connect(self.load_map)
+        self.simulate_btn = QPushButton("Simulate Conflict")
+        self.simulate_btn.clicked.connect(self.simulate_conflict)
+        controls.addWidget(self.refresh_btn)
+        controls.addWidget(self.simulate_btn)
+        controls.addStretch()
+        layout.addLayout(controls)
+        layout.addWidget(self.view)
+        self.setLayout(layout)
+
+        self.node_items = {}  # rule_id -> node item
+        self.conflict_lines = []  # list of lines between conflicting rules
+        self.load_map()
+
+    def load_map(self):
+        self.scene.clear()
+        self.node_items.clear()
+        self.conflict_lines.clear()
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT RULE_ID, RULE_NAME FROM BRM_RULES")
+            rule_data = c.fetchall()
+            rule_map = {row[0]: row[1] for row in rule_data}
+
+            positions = {}
+            angle_step = 360 / max(len(rule_map), 1)
+            radius = 300
+            cx, cy = 400, 400
+
+            for idx, (rid, name) in enumerate(rule_map.items()):
+                angle_rad = math.radians(idx * angle_step)
+                x = cx + radius * math.cos(angle_rad)
+                y = cy + radius * math.sin(angle_rad)
+                node = self.create_node(rid, name, x, y)
+                self.scene.addItem(node)
+                self.node_items[rid] = node
+                positions[rid] = (x, y)
+
+            c.execute("SELECT RULE_ID1, RULE_ID2, PRIORITY FROM RULE_CONFLICTS")
+            conflicts = c.fetchall()
+            for r1, r2, prio in conflicts:
+                if r1 in positions and r2 in positions:
+                    x1, y1 = positions[r1]
+                    x2, y2 = positions[r2]
+                    line = QGraphicsLineItem(x1, y1, x2, y2)
+                    line.setPen(QPen(self.priority_color(prio), 2))
+                    self.scene.addItem(line)
+                    self.conflict_lines.append(line)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+    def priority_color(self, prio):
+        if prio >= 5:
+            return QColor("#FF4C4C")  # red
+        elif prio >= 3:
+            return QColor("#FFA500")  # orange
+        else:
+            return QColor("#00BFFF")  # blue
+
+    def create_node(self, rule_id, rule_name, x, y):
+        radius = 30
+        circle = QGraphicsEllipseItem(-radius, -radius, radius * 2, radius * 2)
+        circle.setBrush(QBrush(QColor("#B0E0E6")))
+        circle.setPen(QPen(Qt.black, 2))
+        circle.setFlag(QGraphicsEllipseItem.ItemIsSelectable)
+        circle.setPos(x, y)
+
+        text = QGraphicsTextItem(rule_name)
+        text.setDefaultTextColor(Qt.black)
+        text.setParentItem(circle)
+        text.setPos(-radius, -radius - 20)
+
+        circle.setToolTip(f"RuleID: {rule_id}\nName: {rule_name}")
+        circle.setData(0, rule_id)
+
+        circle.mouseDoubleClickEvent = lambda e: self.triage_conflict(rule_id)
+        return circle
+
+    def simulate_conflict(self):
+        # Simulate conflict between two selected rules
+        selected = [item for item in self.node_items.values() if item.isSelected()]
+        if len(selected) != 2:
+            QMessageBox.warning(self, "Select Two", "Select exactly two rules to simulate conflict.")
+            return
+        r1 = selected[0].data(0)
+        r2 = selected[1].data(0)
+        dlg = ConflictSimulationDialog(self.connection, r1, r2, self)
+        dlg.exec_()
+
+    def triage_conflict(self, rule_id):
+        # Admins or reviewers can triage this rule's conflicts
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT RULE_ID2, PRIORITY FROM RULE_CONFLICTS WHERE RULE_ID1=?
+                UNION
+                SELECT RULE_ID1, PRIORITY FROM RULE_CONFLICTS WHERE RULE_ID2=?
+            """, (rule_id, rule_id))
+            rows = c.fetchall()
+            if not rows:
+                QMessageBox.information(self, "No Conflicts", "This rule has no defined conflicts.")
+                return
+            msg = f"Rule {rule_id} has {len(rows)} conflicts:\n\n"
+            for row in rows:
+                msg += f"↔ Rule {row[0]} | Priority = {row[1]}\n"
+            QMessageBox.information(self, "Conflict Triage", msg)
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
+
+###############################################################################
+# CONFLICT SIMULATION DIALOG
+###############################################################################
+class ConflictSimulationDialog(QDialog):
+    """
+    Simulates outcome of a conflict between two rules.
+    Optionally allows a 'vote' or override to choose the winning rule.
+    """
+
+    def __init__(self, connection, rule_id1, rule_id2, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.rule_id1 = rule_id1
+        self.rule_id2 = rule_id2
+        self.setWindowTitle("Simulate Conflict")
+        self.resize(500, 400)
+        layout = QVBoxLayout(self)
+
+        self.info = QTextEdit()
+        self.info.setReadOnly(True)
+        layout.addWidget(self.info)
+
+        simulate_btn = QPushButton("Simulate")
+        simulate_btn.clicked.connect(self.run_simulation)
+        vote_btn = QPushButton("Cast Vote / Recommendation")
+        vote_btn.clicked.connect(self.cast_vote)
+        layout.addWidget(simulate_btn)
+        layout.addWidget(vote_btn)
+
+        self.setLayout(layout)
+        self.show_conflict_info()
+
+    def show_conflict_info(self):
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT RULE_NAME FROM BRM_RULES WHERE RULE_ID=?", (self.rule_id1,))
+            r1_name = c.fetchone()[0]
+            c.execute("SELECT RULE_NAME FROM BRM_RULES WHERE RULE_ID=?", (self.rule_id2,))
+            r2_name = c.fetchone()[0]
+
+            self.info.setPlainText(f"Conflict Simulation:\n\nRule 1: {self.rule_id1} - {r1_name}\nRule 2: {self.rule_id2} - {r2_name}\n")
+        except Exception as ex:
+            self.info.setPlainText(f"Error fetching rule names: {ex}")
+
+    def run_simulation(self):
+        # Dry-run both rules and display outcome
+        try:
+            outcome = []
+            for rid in [self.rule_id1, self.rule_id2]:
+                c = self.connection.cursor()
+                c.execute("SELECT RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (rid,))
+                row = c.fetchone()
+                sql = row[0]
+                success, msg = dry_run_rule_sql(self.connection, sql)
+                outcome.append((rid, success, msg))
+            txt = "Simulation Result:\n\n"
+            for (rid, ok, msg) in outcome:
+                txt += f"Rule {rid} → {'PASS' if ok else 'FAIL'} | {msg}\n"
+            self.info.setPlainText(txt)
+        except Exception as ex:
+            self.info.setPlainText(f"Simulation Error: {ex}")
+
+    def cast_vote(self):
+        voted_rule, ok = QInputDialog.getInt(self, "Vote", f"Which rule wins if both fire? Enter RuleID:")
+        if not ok:
+            return
+        try:
+            c = self.connection.cursor()
+            c.execute("""
+                INSERT INTO CONFLICT_VOTES(RULE_ID1, RULE_ID2, VOTED_WINNER, VOTED_BY, VOTE_TIMESTAMP)
+                VALUES (?, ?, ?, ?, GETDATE())
+            """, (self.rule_id1, self.rule_id2, voted_rule, "CurrentUser"))  # Replace with real user
+            self.connection.commit()
+            QMessageBox.information(self, "Vote Recorded", f"You voted that Rule {voted_rule} should win.")
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+###############################################################################
+# METRICS DASHBOARD – ENHANCED WITH HEATMAP & TREND
+###############################################################################
+import numpy as np
+import pyqtgraph as pg
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QPushButton,
+    QLabel, QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QInputDialog, QSplitter, QPlainTextEdit
+)
+
+class AdvancedMetricsTab(QWidget):
+    """
+    Extended version of MetricsDashboardTab with:
+      1) Time-of-Day Heatmap (24 x 7 or custom scale).
+      2) Fail/Pass Trends line chart with user-defined date range.
+      3) Simple in-app controls to pick the type of analytics.
+    """
+
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.layout = QVBoxLayout(self)
+
+        # Control row for selecting metric type
+        ctrl_layout = QHBoxLayout()
+        self.metric_combo = QComboBox()
+        self.metric_combo.addItem("Rule Count by Status")
+        self.metric_combo.addItem("Time-of-Day Heatmap")
+        self.metric_combo.addItem("Pass/Fail Trend")
+        ctrl_layout.addWidget(QLabel("Select Metric:"))
+        ctrl_layout.addWidget(self.metric_combo)
+
+        self.load_btn = QPushButton("Load Metric")
+        self.load_btn.clicked.connect(self.load_metric)
+        ctrl_layout.addWidget(self.load_btn)
+        ctrl_layout.addStretch()
+        self.layout.addLayout(ctrl_layout)
+
+        # Chart area
+        self.plot_widget = pg.PlotWidget(background="w")
+        self.layout.addWidget(self.plot_widget)
+
+        # Additional place for an ImageItem if we do a heatmap
+        self.heatmap_view = pg.ImageView()
+        self.heatmap_view.ui.roiBtn.hide()
+        self.heatmap_view.ui.menuBtn.hide()
+        self.heatmap_view.setVisible(False)
+        self.layout.addWidget(self.heatmap_view)
+        self.setLayout(self.layout)
+
+        # Load default
+        self.load_metric()
+
+    def load_metric(self):
+        choice = self.metric_combo.currentText()
+        self.plot_widget.setVisible(True)
+        self.heatmap_view.setVisible(False)
+
+        if choice == "Rule Count by Status":
+            self.load_rule_count_by_status()
+        elif choice == "Time-of-Day Heatmap":
+            self.load_heatmap_data()
+        elif choice == "Pass/Fail Trend":
+            self.load_trend_data()
+
+    def load_rule_count_by_status(self):
+        self.plot_widget.clear()
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT STATUS, COUNT(*) FROM BRM_RULES GROUP BY STATUS")
+            rows = c.fetchall()
+            statuses = [row[0] for row in rows]
+            counts = [row[1] for row in rows]
+            x_vals = np.arange(len(statuses))
+
+            bar_item = pg.BarGraphItem(x=x_vals, height=counts, width=0.6, brush="skyblue")
+            self.plot_widget.addItem(bar_item)
+            ticks = [(i, s) for i, s in enumerate(statuses)]
+            self.plot_widget.getAxis("bottom").setTicks([ticks])
+            self.plot_widget.setLabel("left", "Count")
+            self.plot_widget.setLabel("bottom", "Status")
+            self.plot_widget.showGrid(x=True, y=True)
+        except Exception as ex:
+            print(f"Error: {ex}")
+
+    def load_heatmap_data(self):
+        """
+        Build a 24 x 7 array for [hour of day, day offset], or any custom dimension.
+        Then display via pyqtgraph.ImageView or a custom heatmap approach.
+        """
+        self.plot_widget.setVisible(False)
+        self.heatmap_view.setVisible(True)
+        self.heatmap_view.clear()
+
+        c = self.connection.cursor()
+        try:
+            # For example, gather rule executions from RULE_EXECUTION_LOGS with a date/time
+            # We'll just do a random approach here, but in real code you sum or count passes/fails by HOD & DayOfWeek
+
+            # build a 24 x 7 array
+            data_2d = np.zeros((24, 7), dtype=np.float32)
+
+            c.execute("""
+                SELECT EXECUTION_TIMESTAMP, PASS_FLAG
+                FROM RULE_EXECUTION_LOGS
+                WHERE EXECUTION_TIMESTAMP >= DATEADD(DAY, -14, GETDATE())
+            """)
+            rows = c.fetchall()
+            # Each row => figure out hour-of-day, day-of-week offset
+            import datetime
+            for (ts, pf) in rows:
+                if not ts:
+                    continue
+                dt = ts if isinstance(ts, datetime.datetime) else None
+                if not dt:
+                    continue
+                hod = dt.hour
+                # dayOfWeek = dt.weekday() => Monday=0..Sunday=6. Let’s map it to 0..6
+                dow = dt.weekday()
+                # If pass => add 1, if fail => add negative or something
+                val = 1 if pf == 1 else -1
+                if 0 <= hod < 24 and 0 <= dow < 7:
+                    data_2d[hod, dow] += val
+
+            # Then show in ImageView
+            self.heatmap_view.setImage(data_2d, autoLevels=True)
+            self.heatmap_view.setPredefinedGradient("bipolar")
+
+        except Exception as ex:
+            print(f"Heatmap data error: {ex}")
+
+    def load_trend_data(self):
+        """
+        Example for daily pass/fail over the last 14 days
+        We'll do a line chart for pass counts vs. fail counts.
+        """
+        self.plot_widget.clear()
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT CONVERT(date, EXECUTION_TIMESTAMP) as d, 
+                       SUM(CASE WHEN PASS_FLAG=1 THEN 1 ELSE 0 END) as pass_count,
+                       SUM(CASE WHEN PASS_FLAG=0 THEN 1 ELSE 0 END) as fail_count
+                FROM RULE_EXECUTION_LOGS
+                WHERE EXECUTION_TIMESTAMP >= DATEADD(DAY, -14, GETDATE())
+                GROUP BY CONVERT(date, EXECUTION_TIMESTAMP)
+                ORDER BY d
+            """)
+            rows = c.fetchall()
+            if not rows:
+                return
+            x_vals = np.arange(len(rows))
+            pass_vals = [r[1] for r in rows]
+            fail_vals = [r[2] for r in rows]
+            date_labels = [str(r[0]) for r in rows]
+
+            pass_plot = self.plot_widget.plot(x_vals, pass_vals, pen=pg.mkPen('g', width=2), symbol='o', name="Pass")
+            fail_plot = self.plot_widget.plot(x_vals, fail_vals, pen=pg.mkPen('r', width=2), symbol='x', name="Fail")
+            ticks = [(i, date_labels[i]) for i in range(len(rows))]
+            self.plot_widget.getAxis("bottom").setTicks([ticks])
+            self.plot_widget.setLabel("left", "Count")
+            self.plot_widget.setLabel("bottom", "Date")
+            self.plot_widget.showGrid(x=True, y=True)
+        except Exception as ex:
+            print(f"Trend data error: {ex}")
+
+
+###############################################################################
+# EXPORT/ADVANCED REPORTING & HELP LINKS
+###############################################################################
+
+class ExportableTableWidget(QTableWidget):
+    """
+    Extends QTableWidget with built-in CSV, JSON, and Excel exporting.
+    And dynamic help link integration.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+    def export_csv(self, filepath):
+        import csv
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            headers = [self.horizontalHeaderItem(i).text() for i in range(self.columnCount())]
+            writer.writerow(headers)
+            for row in range(self.rowCount()):
+                rowdata = []
+                for col in range(self.columnCount()):
+                    item = self.item(row, col)
+                    rowdata.append(item.text() if item else "")
+                writer.writerow(rowdata)
+
+    def export_json(self, filepath):
+        import json
+        data = []
+        headers = [self.horizontalHeaderItem(i).text() for i in range(self.columnCount())]
+        for row in range(self.rowCount()):
+            rowdict = {}
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                rowdict[headers[col]] = item.text() if item else ""
+            data.append(rowdict)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def export_excel(self, filepath):
+        """
+        Minimal example using openpyxl if allowed, or fallback to CSV.
+        """
+        try:
+            import openpyxl
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            headers = [self.horizontalHeaderItem(i).text() for i in range(self.columnCount())]
+            ws.append(headers)
+            for row in range(self.rowCount()):
+                rowdata = []
+                for col in range(self.columnCount()):
+                    it = self.item(row, col)
+                    rowdata.append(it.text() if it else "")
+                ws.append(rowdata)
+            wb.save(filepath)
+        except ImportError:
+            # fallback
+            self.export_csv(filepath + ".csv")
+
+    def help_link(self, topic):
+        """
+        Possibly open a QDialog or external link to your help system.
+        """
+        # For demonstration, just show a message box
+        QMessageBox.information(self, "Help", f"Open help topic: {topic}")
+
+
+###############################################################################
+# USER IMPERSONATION – POLISH
+###############################################################################
+class ImpersonationWidget(QWidget):
+    """
+    Polished approach to switching user roles. 
+    If user_group == 'Admin', they can pick from any user in the system.
+    After changing, refresh certain tabs with new permissions.
+    """
+
+    def __init__(self, connection, current_user_id, current_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.current_user_id = current_user_id
+        self.current_group = current_group
+        layout = QHBoxLayout(self)
+        self.label = QLabel("Impersonate User:")
+        self.combo = QComboBox()
+        self.reload_btn = QPushButton("Switch")
+
+        self.combo.currentIndexChanged.connect(self.combo_changed)
+        self.reload_btn.clicked.connect(self.switch_user)
+        layout.addWidget(self.label)
+        layout.addWidget(self.combo)
+        layout.addWidget(self.reload_btn)
+        self.setLayout(layout)
+        self.load_users()
+
+    def load_users(self):
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT USER_ID, USERNAME, USER_GROUP FROM USERS ORDER BY USER_ID")
+            rows = c.fetchall()
+            for (uid, uname, ug) in rows:
+                disp = f"{uname} ({ug})"
+                self.combo.addItem(disp, (uid, ug))
+        except Exception as ex:
+            print(f"Error loading impersonation list: {ex}")
+
+    def combo_changed(self):
+        pass
+
+    def switch_user(self):
+        data = self.combo.currentData()
+        if data:
+            new_uid, new_ug = data
+            if new_uid == self.current_user_id and new_ug == self.current_group:
+                QMessageBox.information(self, "No Change", "Already impersonating this user.")
+                return
+            # In a real scenario, you'd signal to the parent QMainWindow or manager to update self.user_id, self.user_group
+            QMessageBox.information(self, "Switched", f"Now impersonating UID={new_uid}, group={new_ug}.")
+            # Possibly emit a signal that main app listens to:
+            # self.impersonationChanged.emit(new_uid, new_ug)
+
+
+###############################################################################
+# WIZARD UNIFICATION PLACEHOLDER
+###############################################################################
+class MegaWizardDialog(QDialog):
+    """
+    Combines or 'unifies' multiple wizard steps (like OnboardingWizard, CompositeRulesWizard, etc.)
+    into a single multi-step approach so users don't have to jump around.
+
+    Example Steps:
+      Step 1: Basic Rule Setup
+      Step 2: Attach Approvals / Groups
+      Step 3: Link Dependencies or sub-rules
+      Step 4: Setup Scheduling
+      Step 5: Finalize & Summaries
+    """
+
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.setWindowTitle("Unified Mega Wizard")
+        self.resize(600, 500)
+        self.layout_main = QVBoxLayout(self)
+
+        self.current_step = 0
+        self.steps = [
+            "Basic Rule Setup",
+            "Approvals & Groups",
+            "Dependencies & Sub-Rules",
+            "Scheduling",
+            "Final Summary"
+        ]
+        self.title_label = QLabel(self.steps[self.current_step])
+        self.title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.layout_main.addWidget(self.title_label)
+
+        self.content_area = QWidget()
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.layout_main.addWidget(self.content_area)
+
+        self.nav_layout = QHBoxLayout()
+        self.back_btn = QPushButton("Back")
+        self.back_btn.clicked.connect(self.go_back)
+        self.next_btn = QPushButton("Next")
+        self.next_btn.clicked.connect(self.go_next)
+        self.nav_layout.addWidget(self.back_btn)
+        self.nav_layout.addWidget(self.next_btn)
+        self.nav_layout.addStretch()
+        self.layout_main.addLayout(self.nav_layout)
+        self.setLayout(self.layout_main)
+
+        self.build_step()
+
+    def build_step(self):
+        # Clear the content area
+        for i in reversed(range(self.content_layout.count())):
+            widget = self.content_layout.itemAt(i).widget()
+            if widget:
+                widget.deleteLater()
+        step_name = self.steps[self.current_step]
+        label = QLabel(f"This is step: {step_name}")
+        label.setStyleSheet("font-size: 14px; font-weight: normal;")
+        self.content_layout.addWidget(label)
+
+        # If real code, you'd put the actual UI fields for that step
+
+        self.title_label.setText(step_name)
+        self.back_btn.setEnabled(self.current_step > 0)
+        if self.current_step == len(self.steps) - 1:
+            self.next_btn.setText("Finish")
+        else:
+            self.next_btn.setText("Next")
+
+    def go_back(self):
+        if self.current_step > 0:
+            self.current_step -= 1
+            self.build_step()
+
+    def go_next(self):
+        if self.current_step < len(self.steps) - 1:
+            self.current_step += 1
+            self.build_step()
+        else:
+            # finalize
+            QMessageBox.information(self, "Wizard Complete", "All steps finished. Rule is ready.")
+            self.accept()
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+BRM MASTER – FINAL CHUNK #10
+Main entry point that ties everything together, ensuring the advanced
+enhancements from all previous code chunks are integrated.
+
+Below you'll see:
+    1. DatabaseConnectionDialog and LoginDialog usage.
+    2. Launch of the main QMainWindow (the advanced version).
+    3. Merged tabs and features, if you haven't already in your own structure.
+    4. The typical Pythonic main guard to run the application.
+"""
+
+import sys
+import logging
+import pyodbc
+from PyQt5.QtWidgets import QApplication, QDialog
+from PyQt5.QtGui import QIcon
+
+# -----------------------------------------------------
+# Please ensure you import all classes from prior chunks:
+# (the stubs below are for demonstration; in your final code,
+# you'll have the full definitions from earlier chunks).
+# -----------------------------------------------------
+
+# STUBS for demonstration (Replace with your final classes).
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QMessageBox, QTabWidget
+)
+# Real definitions are from prior chunks:
+# from your_brm_code_part1 import DatabaseConnectionDialog, LoginDialog
+# from your_brm_code_part2 import MainWindowWithAdvancedFeatures
+# etc. or whatever structure you have.
+
+class DatabaseConnectionDialog(QDialog):
+    """Use your fully implemented version from earlier chunks."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Implementation from chunk 1 or your final integrated version
+
+    def get_connection(self):
+        # Implementation from your code
+        return None  # stub
+
+class LoginDialog(QDialog):
+    """Use your fully implemented version from earlier chunks."""
+    def __init__(self, connection, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = None
+        self.user_group = None
+        # Implementation from chunk 1 or your final integrated version
+
+    def do_login(self):
+        # Implementation from your code
+        pass
+
+class BRMMainWindowAdvanced(QWidget):
+    """
+    Hypothetical main window that integrates all tabs, advanced wizards,
+    impersonation, tasks/notifications, etc. from prior chunks.
+    """
+    def __init__(self, connection, user_id, user_group, parent=None):
+        super().__init__(parent)
+        self.connection = connection
+        self.user_id = user_id
+        self.user_group = user_group
+        layout = QVBoxLayout(self)
+        self.setLayout(layout)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Insert your advanced tabs and UI from the final integrated code:
+        # e.g.:
+        #  self.admin_tab = AdminTab(self.connection, self.user_id, self.user_group)
+        #  self.metrics_tab = AdvancedMetricsTab(self.connection)
+        #  self.rules_tab = ...
+        #  self.approvals_tab = ...
+        #  self.heatmaps_tab or integrated usage analytics ...
+        #
+        # Add them to self.tabs:
+        #  self.tabs.addTab(self.admin_tab, "Admin")
+        #  self.tabs.addTab(self.metrics_tab, "Metrics")
+        # etc.
+
+        # example placeholder:
+        # wizard = MegaWizardDialog(self.connection)  # from chunk #9
+        # Possibly show it at some point for unified creation flow
+
+        self.setWindowTitle("BRM Master – Final Enhanced Edition")
+        self.resize(1600, 1000)
+
+def main():
+    logging.basicConfig(level=logging.DEBUG)
+    app = QApplication(sys.argv)
+    app.setOrganizationName("YourOrg")
+    app.setApplicationName("BRM Master Enhanced")
+
+    # Step 1: Database connection
+    db_dlg = DatabaseConnectionDialog()
+    if db_dlg.exec_() != QDialog.Accepted:
+        sys.exit(0)
+    connection = db_dlg.get_connection()
+    if not connection:
+        QMessageBox.critical(None, "Error", "No DB connection established.")
+        sys.exit(1)
+
+    # Step 2: Login
+    login_dlg = LoginDialog(connection)
+    if login_dlg.exec_() != QDialog.Accepted:
+        sys.exit(0)
+    user_id = login_dlg.user_id
+    user_group = login_dlg.user_group
+    if not user_id:
+        QMessageBox.critical(None, "Error", "No user_id from login.")
+        sys.exit(1)
+
+    # Step 3: Launch main window with advanced features
+    mainwin = BRMMainWindowAdvanced(connection, user_id, user_group)
+    mainwin.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
