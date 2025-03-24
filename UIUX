@@ -1,1542 +1,362 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""
-Single-file example: A comprehensive PyQt5-based BRM Tool.
-
-IMPORTANT NOTES:
- 1) You must have all the database tables defined as per your DDLs
-    (including RULE_CONFLICTS, DECISION_TABLES, COMPOSITE_RULES, RULE_SCHEDULES,
-     RULE_SNAPSHOTS, RULE_TAGS, DATA_VALIDATIONS, etc.).
- 2) Many functions are placeholders or simplified (like BFS or advanced parsing).
- 3) This file merges "everything" into one place. 
-    Typically, you'd separate each tab/class into separate files.
-"""
-
-import sys
-import os
-import json
-import math
-import logging
-import logging.config
-import re
-import csv
-import random
-import statistics
-import difflib
-import smtplib
-import pyodbc
-import sqlparse
-from datetime import datetime, timedelta
-from collections import defaultdict, deque
-from email.mime.text import MIMEText
-
-# For basic AI/ML placeholders:
-import numpy as np
-# e.g. import sklearn, etc., if needed
-#import sklearn
-
-# PyQt5
-from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QTimer, QDate, QDateTime
-from PyQt5.QtGui import QFont, QColor, QPen, QBrush
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QDialog, QTabWidget, QDockWidget,
-    QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QPushButton, QMessageBox, QComboBox, QCheckBox, QFileDialog, QTableWidget,
-    QTableWidgetItem, QCalendarWidget, QTimeEdit, QInputDialog, QListWidget,
-    QListWidgetItem, QTreeWidget, QTreeWidgetItem, QAbstractItemView, QSplitter,
-    QGroupBox, QProgressDialog, QStatusBar, QToolBar
+    QMainWindow, QTabWidget, QStatusBar, QToolBar, QAction, 
+    QVBoxLayout, QWidget, QPushButton, QMessageBox
 )
+from PyQt5.QtCore import Qt, QTimer
+import logging
 
-# PyQtGraph for metrics
-import pyqtgraph as pg
-
-###############################################################################
-# LOGGING CONFIG
-###############################################################################
-LOG_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "standard": {"format": "%(asctime)s [%(levelname)s] %(name)s: %(message)s"}
-    },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "formatter": "standard",
-            "level": "DEBUG"
-        },
-        "file": {
-            "class": "logging.FileHandler",
-            "filename": "brm_master.log",
-            "formatter": "standard",
-            "level": "INFO"
-        }
-    },
-    "root": {
-        "handlers": ["console","file"],
-        "level": "DEBUG"
-    }
-}
-logging.config.dictConfig(LOG_CONFIG)
 logger = logging.getLogger("brm_master")
 
-###############################################################################
-# BRM CONFIG (Global)
-###############################################################################
-BRM_CONFIG = {
-    "REQUIRED_APPROVAL_STAGES": 2,
-    "PARALLEL_APPROVAL_GROUPS": False,
-    "RBAC_ENABLED": True,
-    "AUTO_HEALING_THRESHOLD": 5,
-}
-
-###############################################################################
-# Database Connection Dialog
-###############################################################################
-class DatabaseConnectionDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.connection = None
-        self.setWindowTitle("Database Connection – BRM Master")
-        self.resize(440, 200)
-
-        main_layout = QVBoxLayout(self)
-        lbl = QLabel("Select ODBC DSN or custom connection string:")
-        main_layout.addWidget(lbl)
-
-        self.dsn_combo = QComboBox()
-        try:
-            dsn_dict = pyodbc.dataSources()
-            for dsn_name, driver in dsn_dict.items():
-                if "SQL SERVER" in driver.upper():
-                    self.dsn_combo.addItem(f"ODBC DSN: {dsn_name}", dsn_name)
-        except Exception as ex:
-            logger.error(f"Error listing DSNs: {ex}")
-        main_layout.addWidget(self.dsn_combo)
-
-        self.conn_str_edit = QLineEdit()
-        self.conn_str_edit.setPlaceholderText("Or enter custom ODBC connection string (optional)")
-        main_layout.addWidget(self.conn_str_edit)
-
-        btn_h = QHBoxLayout()
-        ok_btn = QPushButton("Connect")
-        ok_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_h.addWidget(ok_btn)
-        btn_h.addWidget(cancel_btn)
-        main_layout.addLayout(btn_h)
-
-    def get_connection(self):
-        custom_str = self.conn_str_edit.text().strip()
-        if custom_str:
-            conn_str = custom_str
-        else:
-            sel = self.dsn_combo.currentData()
-            if not sel:
-                QMessageBox.critical(self,"Error","No DSN or custom connection string provided.")
-                return None
-            conn_str = f"DSN={sel};Trusted_Connection=yes;"
-        try:
-            test_conn = pyodbc.connect(conn_str)
-            logger.info("Database connection established successfully.")
-            return test_conn
-        except Exception as ex:
-            logger.error(f"DB connection failed: {ex}")
-            QMessageBox.critical(self,"Connection Error",str(ex))
-            return None
-
-    def accept(self):
-        c = self.get_connection()
-        if c:
-            self.connection = c
-            super().accept()
-
-###############################################################################
-# Login Dialog
-###############################################################################
-class LoginDialog(QtWidgets.QDialog):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.user_id = None
-        self.user_group = None
-        self.setWindowTitle("Login")
-        self.resize(300, 160)
-
-        main_layout = QVBoxLayout(self)
-        self.user_edit = QLineEdit()
-        self.user_edit.setPlaceholderText("Username")
-        main_layout.addWidget(QLabel("Username:"))
-        main_layout.addWidget(self.user_edit)
-
-        self.pass_edit = QLineEdit()
-        self.pass_edit.setPlaceholderText("Password")
-        self.pass_edit.setEchoMode(QLineEdit.Password)
-        main_layout.addWidget(QLabel("Password:"))
-        main_layout.addWidget(self.pass_edit)
-
-        login_btn = QPushButton("Login")
-        login_btn.clicked.connect(self.do_login)
-        main_layout.addWidget(login_btn)
-
-        self.setLayout(main_layout)
-
-    def do_login(self):
-        un = self.user_edit.text().strip()
-        pw = self.pass_edit.text().strip()
-        if not un or not pw:
-            QMessageBox.warning(self,"Error","Both username and password are required.")
-            return
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT USER_ID, USER_GROUP FROM USERS WHERE USERNAME=? AND PASSWORD=?",(un,pw))
-            row = c.fetchone()
-            if row:
-                self.user_id=row[0]
-                self.user_group=row[1]
-                logger.info(f"User {un} logged in successfully. user_id={self.user_id}, group={self.user_group}")
-                self.accept()
-            else:
-                QMessageBox.warning(self,"Login Failed","Invalid credentials.")
-        except Exception as ex:
-            logger.exception("Error during login:")
-            QMessageBox.critical(self,"Database Error",f"Error in login:\n{ex}")
-
-###############################################################################
-# LockManager
-###############################################################################
-class LockManager:
-    @staticmethod
-    def auto_unlock_expired_locks(conn):
-        now = datetime.now()
-        c = conn.cursor()
-        try:
-            c.execute("""
-                UPDATE BRM_RULE_LOCKS
-                SET ACTIVE_LOCK=0
-                WHERE ACTIVE_LOCK=1
-                  AND EXPIRY_TIMESTAMP < ?
-            """,(now,))
-            rc = c.rowcount
-            conn.commit()
-            if rc>0:
-                logger.info(f"Auto-unlocked {rc} expired rule locks.")
-        except Exception as ex:
-            logger.error(f"Error auto-unlocking: {ex}")
-
-    @staticmethod
-    def rule_current_lock_owner(conn, rule_id):
-        c = conn.cursor()
-        c.execute("""
-            SELECT LOCKED_BY, LOCK_TIMESTAMP, EXPIRY_TIMESTAMP, FORCE_LOCK
-            FROM BRM_RULE_LOCKS
-            WHERE RULE_ID=? AND ACTIVE_LOCK=1
-        """,(rule_id,))
-        row = c.fetchone()
-        if not row:
-            return None
-        locked_by, lts, et, fflag = row
-        now = datetime.now()
-        if et and now>et:
-            # expired
-            try:
-                c2 = conn.cursor()
-                c2.execute("""
-                    UPDATE BRM_RULE_LOCKS
-                    SET ACTIVE_LOCK=0
-                    WHERE RULE_ID=? AND ACTIVE_LOCK=1
-                """,(rule_id,))
-                conn.commit()
-            except Exception as ex:
-                logger.error(f"Error expiring lock for rule {rule_id}: {ex}")
-            return None
-        return (locked_by, lts, et, fflag)
-
-    @staticmethod
-    def lock_rule_for_edit(conn, rule_id, user_id, force=False, lock_minutes=30):
-        LockManager.auto_unlock_expired_locks(conn)
-        info = LockManager.rule_current_lock_owner(conn, rule_id)
-        now = datetime.now()
-        expiry = now + timedelta(minutes=lock_minutes)
-        c = conn.cursor()
-        if info is not None:
-            locked_by, old_ts, old_exp, fflag = info
-            if locked_by==user_id:
-                # refresh
-                c.execute("""
-                    UPDATE BRM_RULE_LOCKS
-                    SET LOCK_TIMESTAMP=?, EXPIRY_TIMESTAMP=?, FORCE_LOCK=?
-                    WHERE RULE_ID=? AND ACTIVE_LOCK=1
-                """,(now, expiry, 1 if force else 0, rule_id))
-                conn.commit()
-                return
-            else:
-                if not force:
-                    raise ValueError(f"Rule {rule_id} is locked by {locked_by}.")
-                else:
-                    c.execute("""
-                        UPDATE BRM_RULE_LOCKS
-                        SET ACTIVE_LOCK=0
-                        WHERE RULE_ID=? AND ACTIVE_LOCK=1
-                    """,(rule_id,))
-                    c.execute("""
-                        INSERT INTO BRM_RULE_LOCKS(
-                          RULE_ID, LOCKED_BY, LOCK_TIMESTAMP, EXPIRY_TIMESTAMP,
-                          FORCE_LOCK, ACTIVE_LOCK
-                        )
-                        VALUES(?,?,?,?,?,1)
-                    """,(rule_id,user_id,now,expiry,1))
-                    conn.commit()
-        else:
-            c.execute("""
-                INSERT INTO BRM_RULE_LOCKS(
-                  RULE_ID, LOCKED_BY, LOCK_TIMESTAMP, EXPIRY_TIMESTAMP,
-                  FORCE_LOCK, ACTIVE_LOCK
-                )
-                VALUES(?,?,?,?,?,1)
-            """,(rule_id,user_id,now,expiry,1 if force else 0))
-            conn.commit()
-
-    @staticmethod
-    def unlock_rule_for_edit(conn, rule_id, user_id, force=False):
-        LockManager.auto_unlock_expired_locks(conn)
-        info=LockManager.rule_current_lock_owner(conn, rule_id)
-        if not info:
-            return
-        locked_by, lts, et, fflag = info
-        if locked_by!=user_id and not force:
-            raise ValueError(f"Rule {rule_id} is locked by {locked_by}.")
-        c=conn.cursor()
-        c.execute("""
-            UPDATE BRM_RULE_LOCKS
-            SET ACTIVE_LOCK=0
-            WHERE RULE_ID=? AND ACTIVE_LOCK=1
-        """,(rule_id,))
-        conn.commit()
-
-###############################################################################
-# BFS & Advanced Execution
-###############################################################################
-def run_data_validations(conn):
-    """
-    Basic example: loop over DATA_VALIDATIONS table, 
-    do checks, and write to DATA_VALIDATION_LOGS.
-    """
-    c = conn.cursor()
-    try:
-        c.execute("SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS FROM DATA_VALIDATIONS")
-        validations = c.fetchall()
-    except Exception as e:
-        logger.error(f"Error fetching validations: {e}")
-        return
-
-    for val in validations:
-        vid, table_name, col_name, vtype, params = val
-        result_flag="PASS"
-        details=""
-        try:
-            if vtype.upper()=="NOT NULL":
-                c.execute(f"SELECT COUNT(*) FROM {table_name} WHERE {col_name} IS NULL")
-                count = c.fetchone()[0]
-                if count>0:
-                    result_flag="FAIL"
-                    details=f"{count} rows have NULL in {col_name}"
-            elif vtype.upper()=="RANGE":
-                # parse "min=..., max=..."
-                min_val, max_val=None,None
-                if params:
-                    for p in params.split(";"):
-                        p2 = p.strip().lower()
-                        if p2.startswith("min="):
-                            min_val=float(p2.split("=")[1])
-                        elif p2.startswith("max="):
-                            max_val=float(p2.split("=")[1])
-                if min_val is None or max_val is None:
-                    result_flag="FAIL"
-                    details="Range params invalid"
-                else:
-                    q = f"""SELECT COUNT(*) 
-                            FROM {table_name}
-                            WHERE TRY_CAST({col_name} AS FLOAT) < {min_val}
-                               OR TRY_CAST({col_name} AS FLOAT) > {max_val}"""
-                    c.execute(q)
-                    ccount = c.fetchone()[0]
-                    if ccount>0:
-                        result_flag="FAIL"
-                        details=f"{ccount} rows out of range [{min_val}, {max_val}]"
-            elif vtype.upper()=="UNIQUE":
-                q=f"""
-                SELECT COUNT(*) FROM (
-                  SELECT {col_name}, COUNT(*) as c
-                  FROM {table_name}
-                  GROUP BY {col_name}
-                  HAVING COUNT(*)>1
-                ) T
-                """
-                c.execute(q)
-                ccount = c.fetchone()[0]
-                if ccount>0:
-                    result_flag="FAIL"
-                    details=f"{ccount} duplicates in {col_name}"
-            else:
-                result_flag="FAIL"
-                details=f"Validation type '{vtype}' not recognized."
-        except Exception as ex:
-            result_flag="FAIL"
-            details=f"Error => {ex}"
-        try:
-            c.execute("""
-                INSERT INTO DATA_VALIDATION_LOGS(
-                  VALIDATION_ID, RESULT_FLAG, DETAILS, VALIDATION_TIMESTAMP
-                ) VALUES(?,?,?,GETDATE())
-            """,(vid,result_flag,details))
-            conn.commit()
-        except Exception as e2:
-            logger.error(f"Error logging validation {vid}: {e2}")
-
-def detect_operation_type(sql_text: str):
-    """
-    Return one of INSERT/UPDATE/DELETE/SELECT/OTHER 
-    after removing comments.
-    """
-    cleaned = re.sub(r'(--.*?$)|(/\*.*?\*/)', '', sql_text or '', flags=re.MULTILINE|re.DOTALL).strip()
-    up = cleaned.upper()
-    if up.startswith("INSERT"):
-        return "INSERT"
-    elif up.startswith("UPDATE"):
-        return "UPDATE"
-    elif up.startswith("DELETE"):
-        return "DELETE"
-    elif up.startswith("SELECT"):
-        return "SELECT"
-    return "OTHER"
-
-def dry_run_rule_sql(conn, sql_text:str, input_csv=None):
-    """
-    Execute the SQL in a transaction and rollback. 
-    If the first row/col = 1 => success, else fail.
-    """
-    c = conn.cursor()
-    try:
-        c.execute("BEGIN TRANSACTION")
-    except Exception as ex:
-        return (False,f"Error start txn => {ex}",0)
-    success=True
-    msg=""
-    rec_count=0
-    try:
-        # input_csv if needed for advanced scenario
-        c.execute(sql_text)
-        rows=[]
-        try:
-            rows=c.fetchall()
-        except:
-            pass
-        rec_count=len(rows)
-        if rows:
-            val=rows[0][0]
-            success=(val==1)
-            msg=f"Returned => {val}"
-        else:
-            msg="No rows => PASS"
-        c.execute("ROLLBACK")
-    except Exception as ex:
-        try:
-            c.execute("ROLLBACK")
-        except:
-            pass
-        success=False
-        msg=str(ex)
-    return (success,msg,rec_count)
-
-def execute_decision_table(conn, dt_id, dry_run=True):
-    c = conn.cursor()
-    c.execute("SELECT DECISION_QUERY FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dt_id,))
-    row = c.fetchone()
-    if not row:
-        return (False, f"DecisionTable {dt_id} not found.", 0)
-    dq = row[0]
-    try:
-        c.execute("BEGIN TRANSACTION")
-    except Exception as ex:
-        return (False, f"Error begin txn => {ex}",0)
-    success=False
-    msg=""
-    rec_count=0
-    try:
-        c.execute(dq)
-        rows=[]
-        try:
-            rows=c.fetchall()
-        except:
-            pass
-        rec_count=len(rows)
-        if rows:
-            val=rows[0][0]
-            success=(val==1)
-            msg=f"Decision returned {val}"
-        else:
-            success=True
-            msg="No rows => PASS"
-        c.execute("ROLLBACK")  # always if dry_run
-    except Exception as ex:
-        try:
-            c.execute("ROLLBACK")
-        except:
-            pass
-        success=False
-        msg=str(ex)
-    return (success,msg,rec_count)
-
-# BFS stubs
-def load_rule_relationships(conn):
-    c = conn.cursor()
-    c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
-    rows = c.fetchall()
-    adjacency = {}
-    parent_map = {}
-    all_ids = set()
-    for (rid, pid) in rows:
-        all_ids.add(rid)
-        if pid:
-            adjacency.setdefault(pid,set()).add(rid)
-            parent_map[rid]=pid
-    # Conflicts
-    c.execute("SELECT RULE_ID1, RULE_ID2 FROM RULE_CONFLICTS")
-    conf_rows = c.fetchall()
-    for (r1,r2) in conf_rows:
-        adjacency.setdefault(r1,set()).add(r2)
-        adjacency.setdefault(r2,set()).add(r1)
-
-    child_ids = set(parent_map.keys())
-    roots = [rid for rid in all_ids if rid not in child_ids]
-    return (adjacency, roots, parent_map)
-
-def get_all_rules_map(conn):
-    c = conn.cursor()
-    c.execute("SELECT * FROM BRM_RULES")
-    rows = c.fetchall()
-    colnames = [desc[0] for desc in c.description]
-    rule_map={}
-    for row in rows:
-        d = dict(zip(colnames,row))
-        rule_map[d["RULE_ID"]]=d
-    return rule_map
-
-def run_single_rule_in_transaction(conn, rule_info, is_dry_run=False):
-    op_type = rule_info.get("OPERATION_TYPE","OTHER")
-    if op_type.upper()=="DECISION_TABLE":
-        dt_id=rule_info.get("DECISION_TABLE_ID")
-        if not dt_id:
-            return (False,"No DECISION_TABLE_ID",0)
-        ok,msg,rc=execute_decision_table(conn, dt_id, dry_run=True)
-        return (ok,msg,rc)
-    sql_ = rule_info.get("RULE_SQL","")
-    c = conn.cursor()
-    try:
-        c.execute("BEGIN TRANSACTION")
-    except Exception as ex:
-        logger.error(f"Begin txn error => {ex}")
-        return (False,str(ex),0)
-    success=False
-    msg=""
-    rec_count=0
-    try:
-        c.execute(sql_)
-        rows=[]
-        try:
-            rows=c.fetchall()
-        except:
-            pass
-        rec_count=len(rows)
-        if rows:
-            val=rows[0][0]
-            success=(val==1)
-            msg=f"Returned => {val}"
-        else:
-            success=True
-            msg="No rows => PASS"
-        if is_dry_run or not success:
-            c.execute("ROLLBACK")
-        else:
-            c.execute("COMMIT")
-    except Exception as ex:
-        try:
-            c.execute("ROLLBACK")
-        except:
-            pass
-        success=False
-        msg=str(ex)
-    return (success,msg,rec_count)
-
-def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count):
-    c = conn.cursor()
-    try:
-        c.execute("""
-            INSERT INTO RULE_EXECUTION_LOGS(
-              RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG,
-              MESSAGE, RECORD_COUNT, EXECUTION_TIME_MS,
-              CPU_USAGE, MEM_USAGE
-            )
-            VALUES(?, GETDATE(), ?, ?, ?, 0, 0, 0)
-        """,(rule_id, 1 if pass_flag else 0, message, record_count))
-        conn.commit()
-    except Exception as ex:
-        logger.error(f"Error inserting rule exec log => {ex}")
-
-def skip_all_descendants(start_id, adjacency, skipped):
-    stack=[start_id]
-    while stack:
-        cur=stack.pop()
-        if cur in skipped:
-            continue
-        skipped.add(cur)
-        if cur in adjacency:
-            for ch in adjacency[cur]:
-                if ch not in skipped:
-                    stack.append(ch)
-
-def execute_rules_unified_bfs(conn, dry_run=False, user_id=None):
-    """
-    BFS across all root rules. If a rule is critical or global & fails => skip its children.
-    """
-    run_data_validations(conn)  # example
-    adjacency, roots, parent_map = load_rule_relationships(conn)
-    rule_map = get_all_rules_map(conn)
-    executed=[]
-    skipped=set()
-    queue = list(roots)
-    while queue:
-        rid = queue.pop(0)
-        if rid in skipped:
-            continue
-        if rid not in rule_map:
-            skipped.add(rid)
-            continue
-        # if user_id => permission checks
-        rinfo = rule_map[rid]
-        ok,msg,rc = run_single_rule_in_transaction(conn, rinfo, is_dry_run=dry_run)
-        insert_rule_execution_log(conn, rid, ok, msg, rc)
-        if ok:
-            executed.append(rid)
-            if rid in adjacency:
-                for ch in adjacency[rid]:
-                    if ch not in skipped:
-                        queue.append(ch)
-        else:
-            is_crit = (rinfo.get("CRITICAL_RULE",0)==1 or rinfo.get("IS_GLOBAL",0)==1)
-            if is_crit and rid in adjacency:
-                for child in adjacency[rid]:
-                    skip_all_descendants(child, adjacency, skipped)
-            if rid in adjacency:
-                for child in adjacency[rid]:
-                    skip_all_descendants(child, adjacency, skipped)
-            skipped.add(rid)
-    return (executed,list(skipped))
-
-###############################################################################
-# Collaboration / Chat Manager
-###############################################################################
-class CollaborationManager(QtCore.QObject):
-    newMessage = QtCore.pyqtSignal(dict)
-
-    def __init__(self, connection, poll_ms=5000, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.poll_ms = poll_ms
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.poll_messages)
-        self.last_timestamp = None
-        self.timer.start(self.poll_ms)
-
-    def poll_messages(self):
-        c = self.connection.cursor()
-        try:
-            if self.last_timestamp:
-                c.execute("""
-                    SELECT MESSAGE_ID, MESSAGE, SENDER, TIMESTAMP 
-                    FROM COLLABORATION_LOGS
-                    WHERE TIMESTAMP > ?
-                    ORDER BY TIMESTAMP ASC
-                """,(self.last_timestamp,))
-            else:
-                c.execute("""
-                    SELECT MESSAGE_ID, MESSAGE, SENDER, TIMESTAMP
-                    FROM COLLABORATION_LOGS
-                    ORDER BY TIMESTAMP ASC
-                """)
-            rows = c.fetchall()
-            if rows:
-                for row in rows:
-                    mid, msg, sender, ts = row
-                    payload={"message_id":mid,"message":msg,"sender":sender,"timestamp":ts}
-                    self.newMessage.emit(payload)
-                    self.last_timestamp=ts
-        except Exception as ex:
-            logger.error(f"Collab poll error: {ex}")
-
-###############################################################################
-# AIOps Placeholder
-###############################################################################
-def detect_rule_execution_anomalies_advanced(conn, days=7):
-    anomalies=[]
-    c=conn.cursor()
-    try:
-        c.execute("""
-            SELECT RULE_ID, EXECUTION_TIME_MS, 
-                   CASE WHEN PASS_FLAG=0 THEN 1 ELSE 0 END AS fail
-            FROM RULE_EXECUTION_LOGS
-            WHERE EXECUTION_TIMESTAMP >= DATEADD(DAY, -?, GETDATE())
-        """,(days,))
-        rows = c.fetchall()
-        data={}
-        for r in rows:
-            rid, et, f = r
-            data.setdefault(rid,{"times":[],"fails":[]})
-            data[rid]["times"].append(et)
-            data[rid]["fails"].append(f)
-        for rule_id, vals in data.items():
-            times=vals["times"]
-            fails=vals["fails"]
-            if not times:
-                continue
-            avg_t = sum(times)/len(times)
-            if len(times)>1:
-                stdev_t = statistics.stdev(times)
-            else:
-                stdev_t=0
-            fail_rate = sum(fails)/len(fails)
-            # naive
-            if fail_rate>0.2:
-                anomalies.append((rule_id, f"High fail rate {fail_rate*100:.1f}%"))
-            threshold = avg_t+(2*stdev_t if stdev_t>0 else 50)
-            if avg_t>threshold:
-                anomalies.append((rule_id,f"Avg time {avg_t} > threshold {threshold}"))
-    except Exception as ex:
-        logger.error(f"AIOps detection error: {ex}")
-    return anomalies
-
-def auto_heal_or_escalate_advanced(conn, anomalies):
-    c=conn.cursor()
-    for rule_id, reason in anomalies:
-        if "stale" in reason.lower():
-            # forcibly unlock
-            try:
-                c.execute("DELETE FROM BRM_RULE_LOCKS WHERE RULE_ID=? AND ACTIVE_LOCK=1",(rule_id,))
-                c.connection.commit()
-                logger.info(f"Auto-healed stale lock for rule {rule_id}")
-            except Exception as e2:
-                logger.error(f"Failed auto-heal {rule_id}: {e2}")
-        else:
-            logger.warning(f"Escalate anomaly for rule {rule_id}: {reason}")
-
-###############################################################################
-# TABS for advanced features: DecisionTablesTab, ConflictPriorityManagerTab, etc.
-###############################################################################
-# (Due to file size, we'll show a couple examples. You can add the rest similarly.)
-
-class DecisionTablesTab(QtWidgets.QWidget):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        layout = QVBoxLayout(self)
-
-        self.dt_table = QTableWidget(0,3)
-        self.dt_table.setHorizontalHeaderLabels(["DT_ID","Table Name","Description"])
-        self.dt_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.dt_table)
-
-        btn_row = QHBoxLayout()
-        add_btn = QPushButton("Add DT")
-        add_btn.clicked.connect(self.add_dt)
-        del_btn = QPushButton("Delete DT")
-        del_btn.clicked.connect(self.del_dt)
-        run_btn = QPushButton("Execute DT")
-        run_btn.clicked.connect(self.run_dt)
-        ref_btn = QPushButton("Refresh")
-        ref_btn.clicked.connect(self.load_dt)
-        btn_row.addWidget(add_btn)
-        btn_row.addWidget(del_btn)
-        btn_row.addWidget(run_btn)
-        btn_row.addWidget(ref_btn)
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
-
-        self.setLayout(layout)
-        self.load_dt()
-
-    def load_dt(self):
-        self.dt_table.setRowCount(0)
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                SELECT DECISION_TABLE_ID, TABLE_NAME, DESCRIPTION
-                FROM DECISION_TABLES
-                ORDER BY DECISION_TABLE_ID
-            """)
-            rows = c.fetchall()
-            for row in rows:
-                i = self.dt_table.rowCount()
-                self.dt_table.insertRow(i)
-                for col,v in enumerate(row):
-                    self.dt_table.setItem(i,col,QTableWidgetItem(str(v) if v else ""))
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def get_selected_dt_id(self):
-        row = self.dt_table.currentRow()
-        if row<0:
-            return None
-        it = self.dt_table.item(row,0)
-        if not it:
-            return None
-        return int(it.text())
-
-    def add_dt(self):
-        name, ok = QInputDialog.getText(self,"Add Decision Table","Table name:")
-        if not ok or not name.strip():
-            return
-        desc, ok2 = QInputDialog.getText(self,"Description","Optional:")
-        if not ok2:
-            desc=""
-        dq, ok3 = QInputDialog.getMultiLineText(self,"Decision Query","Enter SQL (returns 1 or 0):")
-        if not ok3 or not dq.strip():
-            return
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                INSERT INTO DECISION_TABLES(TABLE_NAME,DESCRIPTION,DECISION_QUERY,CREATED_TIMESTAMP)
-                VALUES(?,?,?,GETDATE())
-            """,(name.strip(),desc.strip(),dq.strip()))
-            c.connection.commit()
-            QMessageBox.information(self,"Added","Decision table created.")
-            self.load_dt()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def del_dt(self):
-        dtid = self.get_selected_dt_id()
-        if not dtid:
-            return
-        confirm=QMessageBox.question(self,"Confirm",f"Delete DT {dtid}?")
-        if confirm!=QMessageBox.Yes:
-            return
-        c = self.connection.cursor()
-        try:
-            c.execute("DELETE FROM DECISION_TABLES WHERE DECISION_TABLE_ID=?",(dtid,))
-            c.connection.commit()
-            QMessageBox.information(self,"Deleted",f"DT {dtid} removed.")
-            self.load_dt()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def run_dt(self):
-        dtid = self.get_selected_dt_id()
-        if not dtid:
-            return
-        ok,msg,rc = execute_decision_table(self.connection, dtid, dry_run=True)
-        txt=f"DT {dtid} => PASS={ok}, msg='{msg}', recs={rc}"
-        QMessageBox.information(self,"DT Execution",txt)
-
-###############################################################################
-# Example: Conflict Priority Manager
-###############################################################################
-class ConflictPriorityManagerTab(QtWidgets.QWidget):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        layout = QVBoxLayout(self)
-        self.cf_table = QTableWidget(0,4)
-        self.cf_table.setHorizontalHeaderLabels(["ConflictID","Rule1","Rule2","Priority"])
-        self.cf_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.cf_table)
-
-        btn_h=QHBoxLayout()
-        add_btn = QPushButton("Add Conflict")
-        add_btn.clicked.connect(self.add_conflict)
-        set_btn = QPushButton("Set Priority")
-        set_btn.clicked.connect(self.set_priority)
-        del_btn = QPushButton("Delete Conflict")
-        del_btn.clicked.connect(self.del_conflict)
-        ref_btn = QPushButton("Refresh")
-        ref_btn.clicked.connect(self.load_conflicts)
-        btn_h.addWidget(add_btn)
-        btn_h.addWidget(set_btn)
-        btn_h.addWidget(del_btn)
-        btn_h.addWidget(ref_btn)
-        btn_h.addStretch()
-        layout.addLayout(btn_h)
-
-        self.setLayout(layout)
-        self.load_conflicts()
-
-    def load_conflicts(self):
-        self.cf_table.setRowCount(0)
-        c = self.connection.cursor()
-        try:
-            c.execute("SELECT CONFLICT_ID,RULE_ID1,RULE_ID2,PRIORITY FROM RULE_CONFLICTS ORDER BY CONFLICT_ID")
-            rows=c.fetchall()
-            for row in rows:
-                i=self.cf_table.rowCount()
-                self.cf_table.insertRow(i)
-                for col,val in enumerate(row):
-                    self.cf_table.setItem(i,col,QTableWidgetItem(str(val)))
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def get_selected_conflict_id(self):
-        row = self.cf_table.currentRow()
-        if row<0:
-            return None
-        it = self.cf_table.item(row,0)
-        if not it:
-            return None
-        return int(it.text())
-
-    def add_conflict(self):
-        r1,ok1 = QInputDialog.getInt(self,"Add Conflict","RuleID1:")
-        if not ok1:
-            return
-        r2,ok2 = QInputDialog.getInt(self,"Add Conflict","RuleID2:")
-        if not ok2:
-            return
-        priority,ok3 = QInputDialog.getInt(self,"Priority","1..9:",value=1)
-        if not ok3:
-            return
-        c = self.connection.cursor()
-        try:
-            c.execute("INSERT INTO RULE_CONFLICTS(RULE_ID1,RULE_ID2,PRIORITY) VALUES(?,?,?)",(r1,r2,priority))
-            c.connection.commit()
-            QMessageBox.information(self,"Added","Conflict added.")
-            self.load_conflicts()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def set_priority(self):
-        cfid = self.get_selected_conflict_id()
-        if not cfid:
-            return
-        new_p, ok = QInputDialog.getInt(self,"Set Priority",f"Priority for conflict {cfid}:",value=1)
-        if not ok:
-            return
-        c=self.connection.cursor()
-        try:
-            c.execute("UPDATE RULE_CONFLICTS SET PRIORITY=? WHERE CONFLICT_ID=?",(new_p,cfid))
-            c.connection.commit()
-            QMessageBox.information(self,"Updated","Priority updated.")
-            self.load_conflicts()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def del_conflict(self):
-        cfid = self.get_selected_conflict_id()
-        if not cfid:
-            return
-        confirm=QMessageBox.question(self,"Confirm",f"Delete conflict {cfid}?")
-        if confirm!=QMessageBox.Yes:
-            return
-        c=self.connection.cursor()
-        try:
-            c.execute("DELETE FROM RULE_CONFLICTS WHERE CONFLICT_ID=?",(cfid,))
-            c.connection.commit()
-            QMessageBox.information(self,"Deleted","Conflict removed.")
-            self.load_conflicts()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-###############################################################################
-# Example: OnboardingWizard
-###############################################################################
-class OnboardingWizard(QDialog):
-    def __init__(self, connection, user_id=None, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.user_id = user_id
-        self.step=0
-        self.setWindowTitle("Onboarding Wizard")
-        self.resize(400,200)
-        ml = QVBoxLayout(self)
-        self.label=QLabel("Welcome to the BRM Onboarding.")
-        ml.addWidget(self.label)
-        self.next_btn = QPushButton("Next")
-        self.next_btn.clicked.connect(self.advance)
-        ml.addWidget(self.next_btn)
-        self.setLayout(ml)
-
-    def advance(self):
-        self.step+=1
-        if self.step==1:
-            self.label.setText("1) Create or confirm your group in Admin->Group Management.")
-        elif self.step==2:
-            self.label.setText("2) Go to Business Rules tab, create a rule. Then route for approval.")
-        elif self.step==3:
-            self.label.setText("3) Check Approvals tab & Collaboration chat. Done!")
-        else:
-            self.label.setText("Onboarding done. Enjoy!")
-            self.accept()
-
-###############################################################################
-# Notification / Task Panel
-###############################################################################
-class TaskNotificationCenterTab(QWidget):
-    """
-    A more advanced task center listing stale locks, pending approvals, etc.
-    """
-    def __init__(self, connection, user_id, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.user_id=user_id
-        layout=QVBoxLayout(self)
-        # e.g. let user search or save filter
-        self.search_edit=QLineEdit()
-        self.search_edit.setPlaceholderText("Filter tasks ...")
-        self.search_edit.textChanged.connect(self.load_tasks)
-        layout.addWidget(self.search_edit)
-
-        self.task_table=QTableWidget(0,4)
-        self.task_table.setHorizontalHeaderLabels(["TaskID","Type","Description","Actions"])
-        self.task_table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.task_table)
-
-        ref_btn=QPushButton("Refresh Tasks")
-        ref_btn.clicked.connect(self.load_tasks)
-        layout.addWidget(ref_btn)
-        self.setLayout(layout)
-        self.load_tasks()
-
-    def load_tasks(self):
-        txt=self.search_edit.text().lower()
-        self.task_table.setRowCount(0)
-        tasks=[]
-        c=self.connection.cursor()
-        # pending approvals
-        try:
-            c.execute("""
-                SELECT RULE_ID, APPROVAL_STAGE
-                FROM BRM_RULE_APPROVALS
-                WHERE USERNAME=? AND APPROVED_FLAG=0
-            """,(self.user_id,))
-            for row in c.fetchall():
-                rid, stg = row
-                tasks.append(("Approval",f"Rule {rid} awaiting stage {stg}",rid))
-        except Exception as ex:
-            logger.error(f"Error loading approvals: {ex}")
-
-        # stale locks
-        try:
-            now=datetime.now()
-            c.execute("""
-                SELECT RULE_ID, LOCKED_BY, EXPIRY_TIMESTAMP
-                FROM BRM_RULE_LOCKS
-                WHERE ACTIVE_LOCK=1 AND EXPIRY_TIMESTAMP < ?
-            """,(now,))
-            for row in c.fetchall():
-                rid, lby, exp = row
-                tasks.append(("StaleLock",f"Rule {rid}, locked by {lby}, expired at {exp}",rid))
-        except Exception as ex:
-            logger.error(f"Error loading stale locks: {ex}")
-
-        # filter
-        if txt:
-            tasks=[t for t in tasks if txt in t[0].lower() or txt in t[1].lower()]
-
-        self.task_table.setRowCount(len(tasks))
-        for i, t in enumerate(tasks):
-            ttype,desc,rid = t
-            self.task_table.setItem(i,0,QTableWidgetItem(str(i+1)))
-            self.task_table.setItem(i,1,QTableWidgetItem(ttype))
-            self.task_table.setItem(i,2,QTableWidgetItem(desc))
-
-            cell=QWidget()
-            hl=QHBoxLayout(cell)
-            hl.setContentsMargins(0,0,0,0)
-            if ttype=="Approval":
-                ab=QPushButton("Approve")
-                ab.clicked.connect(lambda _,rr=rid:self.approve_rule(rr))
-                rb=QPushButton("Reject")
-                rb.clicked.connect(lambda _,rr=rid:self.reject_rule(rr))
-                hl.addWidget(ab)
-                hl.addWidget(rb)
-            elif ttype=="StaleLock":
-                fb=QPushButton("Force Unlock")
-                fb.clicked.connect(lambda _,rr=rid:self.force_unlock(rr))
-                hl.addWidget(fb)
-            hl.addStretch()
-            self.task_table.setCellWidget(i,3,cell)
-
-    def approve_rule(self, rule_id):
-        # simplified
-        c=self.connection.cursor()
-        try:
-            c.execute("""
-                UPDATE BRM_RULE_APPROVALS
-                SET APPROVED_FLAG=1, APPROVED_TIMESTAMP=GETDATE()
-                WHERE RULE_ID=? AND USERNAME=? AND APPROVED_FLAG=0
-            """,(rule_id,self.user_id))
-            c.execute("SELECT COUNT(*) FROM BRM_RULE_APPROVALS WHERE RULE_ID=? AND APPROVED_FLAG=0",(rule_id,))
-            rem = c.fetchone()[0]
-            if rem==0:
-                c.execute("""
-                    UPDATE BRM_RULES
-                    SET APPROVAL_STATUS='APPROVED', STATUS='ACTIVE'
-                    WHERE RULE_ID=?
-                """,(rule_id,))
-            c.connection.commit()
-            QMessageBox.information(self,"Approved",f"Rule {rule_id} approved.")
-            self.load_tasks()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def reject_rule(self, rule_id):
-        c=self.connection.cursor()
-        try:
-            c.execute("""
-                UPDATE BRM_RULE_APPROVALS
-                SET APPROVED_FLAG=2, APPROVED_TIMESTAMP=GETDATE()
-                WHERE RULE_ID=? AND USERNAME=? AND APPROVED_FLAG=0
-            """,(rule_id,self.user_id))
-            c.execute("""
-                UPDATE BRM_RULES
-                SET APPROVAL_STATUS='REJECTED', STATUS='INACTIVE'
-                WHERE RULE_ID=?
-            """,(rule_id,))
-            c.connection.commit()
-            QMessageBox.information(self,"Rejected",f"Rule {rule_id} rejected.")
-            self.load_tasks()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def force_unlock(self, rule_id):
-        c=self.connection.cursor()
-        try:
-            LockManager.unlock_rule_for_edit(self.connection, rule_id, self.user_id, force=True)
-            QMessageBox.information(self,"Unlocked",f"Rule {rule_id} forcibly unlocked.")
-            self.load_tasks()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-###############################################################################
-# MainWindow
-###############################################################################
 class MainWindow(QMainWindow):
+    """
+    A single MainWindow that gathers all the advanced features in one place:
+      - Dashboard (Metrics + Task Center)
+      - Rules & BFS
+      - Scheduling
+      - Decision Tables
+      - Advanced Features (Conflicts, Composite, Hierarchy, Data Validation)
+      - Snapshots & Tags
+      - Collaboration
+      - What-If Testing
+      - Advanced Search
+      - Multi-Step Approvals
+      - Administration (User Mgmt, Group Mgmt, etc.)
+      - And more...
+
+    Assumes you already have the relevant Tabs/Dialogs defined:
+      • TaskNotificationCenterTab
+      • MetricsDashboardTab
+      • BusinessRulesTab (or extended BFS version)
+      • ScheduleManagementTab
+      • DecisionTablesTab
+      • ConflictPriorityManagerTab
+      • CompositeRulesTab
+      • DataValidationTab
+      • HierarchyViewTab
+      • SnapshotManagerTab
+      • TagsManagerTab
+      • CollaborationTab (or EnhancedCollaborationTab)
+      • WhatIfTestTab
+      • AdvancedSearchWidget or RuleSearchDialog
+      • MultiStepApprovalTab
+      • AdminTab (User Mgmt, Group Mgmt, etc.)
+      • Additional classes: ChainSimulationDialog, GroupSimulationDialog, etc.
+
+    Integrates them into one QTabWidget with optional menubar, toolbar, status bar.
+    Also demonstrates how to handle refresh actions and BFS simulations.
+    """
     def __init__(self, connection, user_id, user_group, parent=None):
         super().__init__(parent)
         self.connection = connection
         self.user_id = user_id
         self.user_group = user_group
-        self.setWindowTitle("BRM – Full UI Example")
-        self.resize(1400,900)
 
-        # Menubar
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
-        logout_act = file_menu.addAction("Logout")
-        logout_act.triggered.connect(self.logout)
-        exit_act = file_menu.addAction("Exit")
-        exit_act.triggered.connect(self.close)
+        self.setWindowTitle("BRM Master – Full MainWindow")
+        self.resize(1400, 900)
 
-        # Help
-        help_menu = menubar.addMenu("Help")
-        about_act = help_menu.addAction("About")
-        about_act.triggered.connect(self.show_about)
-
-        # Central widget with QTabWidget
-        central_widget = QWidget(self)
-        main_layout = QVBoxLayout(central_widget)
-
+        # Create the main QTabWidget
         self.main_tabs = QTabWidget()
-        main_layout.addWidget(self.main_tabs)
+        self.setCentralWidget(self.main_tabs)
 
-        # 1) Admin Tab
-        self.admin_tab = AdminAggregateTab(self.connection, self.user_id, self.user_group)
-        self.main_tabs.addTab(self.admin_tab,"Administration")
+        # Optionally add a toolbar
+        self.setup_toolbar()
 
-        # 2) Business Rules Tab (with BFS, etc.)
-        self.rules_tab = BusinessRulesTabExtended(self.connection, self.user_id, self.user_group)
-        self.main_tabs.addTab(self.rules_tab,"Business Rules")
-
-        # 3) Decision Tables
-        self.decision_tab = DecisionTablesTab(self.connection)
-        self.main_tabs.addTab(self.decision_tab,"Decision Tables")
-
-        # 4) Conflict Priority
-        self.conflict_tab = ConflictPriorityManagerTab(self.connection)
-        self.main_tabs.addTab(self.conflict_tab,"Conflicts")
-
-        # 5) Snapshots
-        self.snap_tab = SnapshotManagerTab(self.connection)
-        self.main_tabs.addTab(self.snap_tab,"Snapshots")
-
-        # 6) Data Validation
-        self.dv_tab = DataValidationTab(self.connection)
-        self.main_tabs.addTab(self.dv_tab,"Data Validation")
-
-        # 7) Multi-Step Approvals
-        self.approval_tab = MultiStepApprovalTab(self.connection, self.current_user_id(), self.user_group)
-        self.main_tabs.addTab(self.approval_tab,"Approvals")
-
-        # 8) Collaboration
-        self.collab_mgr = CollaborationManager(self.connection)
-        self.collab_tab = EnhancedCollaborationTab(self.connection, self.collab_mgr)
-        self.main_tabs.addTab(self.collab_tab,"Collaboration")
-
-        # 9) Scheduling
-        self.sch_tab = ScheduleManagementTab(self.connection)
-        self.main_tabs.addTab(self.sch_tab,"Scheduling")
-
-        # 10) Custom Groups
-        self.cust_grp_tab = CustomRuleGroupsTab(self.connection)
-        self.main_tabs.addTab(self.cust_grp_tab,"Custom Groups")
-
-        # 11) Composite
-        self.composite_tab = CompositeRulesTab(self.connection)
-        self.main_tabs.addTab(self.composite_tab,"Composite Rules")
-
-        # 12) BFS Simulation (Chain & Group)
-        chain_grp_container = QWidget()
-        cglayout = QVBoxLayout(chain_grp_container)
-        chain_btn = QPushButton("Open Chain Simulation Dialog")
-        chain_btn.clicked.connect(self.open_chain_dialog)
-        cglayout.addWidget(chain_btn)
-        group_btn = QPushButton("Open Group Simulation Dialog")
-        group_btn.clicked.connect(self.open_group_dialog)
-        cglayout.addWidget(group_btn)
-        cglayout.addStretch()
-        self.main_tabs.addTab(chain_grp_container,"BFS Simulation")
-
-        # 13) What-if Testing
-        self.whatif_tab = WhatIfTestTab(self.connection)
-        self.main_tabs.addTab(self.whatif_tab,"What-If")
-
-        # 14) Metrics
-        self.metrics_tab = MetricsDashboardTab(self.connection)
-        self.main_tabs.addTab(self.metrics_tab,"Metrics")
-
-        # 15) Audit Log
-        self.audit_tab = EnhancedAuditLogAnalysisTab(self.connection)
-        self.main_tabs.addTab(self.audit_tab,"Audit Log")
-
-        # 16) Hierarchy View
-        self.hierarchy_tab = HierarchyViewTab(self.connection)
-        self.main_tabs.addTab(self.hierarchy_tab,"Hierarchy")
-
-        # 17) Tag Manager
-        self.tag_tab = TagsManagerTab(self.connection)
-        self.main_tabs.addTab(self.tag_tab,"Tags")
-
-        # 18) Global/Critical Admin
-        self.gcr_tab = GlobalCriticalAdminTab(self.connection, self.user_group)
-        self.main_tabs.addTab(self.gcr_tab,"Global/Critical Admin")
-
-        # 19) Task/Notification Center
-        self.task_center_tab = TaskNotificationCenterTab(self.connection, self.user_id)
-        self.main_tabs.addTab(self.task_center_tab,"Task Center")
-
-        # 20) Help/Onboarding
-        self.help_tab = HelpAndOnboardingTab(self.connection, self.user_id)
-        self.main_tabs.addTab(self.help_tab,"Help/Onboarding")
-
-        central_widget.setLayout(main_layout)
-        self.setCentralWidget(central_widget)
+        # Optionally add a menubar
+        self.setup_menubar()
 
         # Status bar
         self.setStatusBar(QStatusBar(self))
+        self.statusBar().showMessage("Ready")
 
-        # Optional toolbar
-        toolbar = QToolBar("Main")
-        self.addToolBar(Qt.TopToolBarArea,toolbar)
-        refresh_act = toolbar.addAction("Refresh")
+        # Build out the individual tabs
+        self.setup_all_feature_tabs()
+
+        # (Optional) Auto-refresh timer
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_all)
+        # If you want auto-refresh every 30s, uncomment:
+        # self.refresh_timer.start(30000)
+
+    def setup_toolbar(self):
+        """
+        Creates a basic top toolbar with Refresh, BFS Execution, etc.
+        """
+        toolbar = QToolBar("Main Toolbar")
+        toolbar.setMovable(False)
+        self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+        # Example: refresh action
+        refresh_act = QAction("Refresh", self)
         refresh_act.triggered.connect(self.refresh_all)
+        toolbar.addAction(refresh_act)
+
+        # BFS execution example
+        bfs_act = QAction("Execute BFS", self)
+        bfs_act.triggered.connect(self.execute_bfs_unified)
+        toolbar.addAction(bfs_act)
+
+        # Add any other actions you need
+        # ...
+        # e.g. new rule wizard
+        # wizard_act = QAction("New Rule Wizard", self)
+        # wizard_act.triggered.connect(self.some_dialog)
+        # toolbar.addAction(wizard_act)
+
+    def setup_menubar(self):
+        """
+        Create a menubar with File/Help (optional).
+        """
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        logout_action = file_menu.addAction("Logout")
+        logout_action.triggered.connect(self.logout)
+
+        exit_action = file_menu.addAction("Exit")
+        exit_action.triggered.connect(self.close)
+
+        help_menu = menubar.addMenu("Help")
+        about_action = help_menu.addAction("About")
+        about_action.triggered.connect(self.show_about_dialog)
+
+    def setup_all_feature_tabs(self):
+        """
+        Instantiates and adds every major tab into the QTabWidget.
+        Replace each reference with your actual class name or logic.
+        """
+
+        # 1) Dashboard: Metrics + Task Center
+        try:
+            dash_widget = QWidget()
+            dash_layout = QVBoxLayout(dash_widget)
+
+            # Example: a metrics dashboard
+            self.metrics_dashboard = MetricsDashboardTab(self.connection)
+            dash_layout.addWidget(self.metrics_dashboard)
+
+            # Example: a task center (pending approvals, stale locks, etc.)
+            self.task_center = TaskNotificationCenterTab(self.connection, self.user_id)
+            dash_layout.addWidget(self.task_center)
+
+            dash_widget.setLayout(dash_layout)
+            self.main_tabs.addTab(dash_widget, "Dashboard")
+        except Exception as ex:
+            logger.error(f"Error building Dashboard tab: {ex}", exc_info=True)
+
+        # 2) Business Rules & BFS
+        try:
+            rules_tab = QWidget()
+            rules_layout = QVBoxLayout(rules_tab)
+
+            # Suppose you have a "BusinessRulesTab" or "BusinessRulesTabExtended" 
+            self.rule_dashboard = BusinessRulesTabExtended(self.connection, self.user_id, self.user_group)
+            rules_layout.addWidget(self.rule_dashboard)
+
+            # BFS Simulation Buttons
+            sim_btn_layout = QHBoxLayout()
+            chain_btn = QPushButton("Chain Simulation")
+            chain_btn.clicked.connect(self.open_chain_sim)
+            sim_btn_layout.addWidget(chain_btn)
+
+            group_btn = QPushButton("Group Simulation")
+            group_btn.clicked.connect(self.open_group_sim)
+            sim_btn_layout.addWidget(group_btn)
+
+            sim_btn_layout.addStretch()
+            rules_layout.addLayout(sim_btn_layout)
+
+            rules_tab.setLayout(rules_layout)
+            self.main_tabs.addTab(rules_tab, "Rules & BFS")
+        except Exception as ex:
+            logger.error(f"Error building Business Rules tab: {ex}", exc_info=True)
+
+        # 3) Scheduling
+        try:
+            self.schedule_tab = ScheduleManagementTab(self.connection)
+            self.main_tabs.addTab(self.schedule_tab, "Scheduling")
+        except Exception as ex:
+            logger.error(f"Error building Scheduling tab: {ex}")
+
+        # 4) Decision Tables
+        try:
+            self.decision_tab = DecisionTablesTab(self.connection)
+            self.main_tabs.addTab(self.decision_tab, "Decision Tables")
+        except Exception as ex:
+            logger.error(f"Error building DecisionTables tab: {ex}")
+
+        # 5) Advanced Features (Conflicts, Composite, DataValidation, Hierarchy)
+        try:
+            adv_tab = QTabWidget()
+
+            # conflict
+            conflict_tab = ConflictPriorityManagerTab(self.connection)
+            adv_tab.addTab(conflict_tab,"Conflicts")
+
+            # composite
+            comp_tab = CompositeRulesTab(self.connection)
+            adv_tab.addTab(comp_tab,"Composite")
+
+            # data validations
+            dv_tab = DataValidationTab(self.connection)
+            adv_tab.addTab(dv_tab,"DataVal")
+
+            # hierarchy
+            hierarchy_tab = HierarchyViewTab(self.connection)
+            adv_tab.addTab(hierarchy_tab,"Hierarchy")
+
+            self.main_tabs.addTab(adv_tab, "Advanced Features")
+        except Exception as ex:
+            logger.error(f"Error building Advanced Features tab: {ex}")
+
+        # 6) Snapshots & Tags
+        try:
+            snap_tag_tab = QTabWidget()
+
+            snap_tab = SnapshotManagerTab(self.connection)
+            snap_tag_tab.addTab(snap_tab, "Snapshots")
+
+            tag_tab = TagsManagerTab(self.connection)
+            snap_tag_tab.addTab(tag_tab, "Tags")
+
+            self.main_tabs.addTab(snap_tag_tab,"Snapshots & Tags")
+        except Exception as ex:
+            logger.error(f"Error building Snap/Tags tab: {ex}")
+
+        # 7) Collaboration 
+        try:
+            # If you have a global CollaborationManager, you might do that outside. 
+            # For now, let's instantiate a local manager or re-use it:
+            self.collab_manager = CollaborationManager(self.connection)
+            # Or EnhancedCollaborationTab / CollaborationTab
+            self.collab_tab = EnhancedCollaborationTab(self.connection, self.collab_manager)
+            self.main_tabs.addTab(self.collab_tab,"Collaboration")
+        except Exception as ex:
+            logger.error(f"Error building Collaboration tab: {ex}")
+
+        # 8) What-If Testing
+        try:
+            self.whatif_tab = WhatIfTestTab(self.connection)
+            self.main_tabs.addTab(self.whatif_tab,"What-If Testing")
+        except Exception as ex:
+            logger.error(f"Error building WhatIf tab: {ex}")
+
+        # 9) Advanced Search
+        try:
+            # If you have e.g. "AdvancedSearchWidget"
+            self.adv_search_tab = AdvancedSearchWidget(self.connection)
+            self.main_tabs.addTab(self.adv_search_tab,"Advanced Search")
+        except Exception as ex:
+            logger.error(f"Error building AdvancedSearch tab: {ex}")
+
+        # 10) Multi-Step Approvals
+        try:
+            # If your login user is e.g. "my_user_name"
+            username = self.fetch_username(self.user_id)
+            self.approval_tab = MultiStepApprovalTab(self.connection, username, self.user_group)
+            self.main_tabs.addTab(self.approval_tab,"Approvals")
+        except Exception as ex:
+            logger.error(f"Error building Approvals tab: {ex}")
+
+        # 11) Administration (if user is Admin)
+        try:
+            if self.user_group.upper()=="ADMIN":
+                from PyQt5.QtWidgets import QTabWidget, QLabel
+                admin_tab_widget = QTabWidget()
+
+                # Example: user mgmt, group mgmt, etc.
+                # or a single AdminAggregateTab you wrote
+                admin_agg = AdminAggregateTab(self.connection, self.user_id, self.user_group)
+                admin_tab_widget.addTab(admin_agg, "Admin Aggregate")
+
+                self.main_tabs.addTab(admin_tab_widget,"Administration")
+        except Exception as ex:
+            logger.error(f"Error building Admin tab: {ex}")
+
+        # 12) Audit Log
+        try:
+            self.audit_tab = EnhancedAuditLogAnalysisTab(self.connection)
+            self.main_tabs.addTab(self.audit_tab,"Audit Log")
+        except Exception as ex:
+            logger.error(f"Error building AuditLog tab: {ex}")
+
+        # 13) (Optional) others ... 
+        # e.g. if you had additional specialized features.
+
+        # 14) Done
 
     def logout(self):
+        """
+        Called if the user chooses 'Logout' from File menu or somewhere else.
+        You can close this window and maybe re-run the login dialog.
+        """
         self.close()
 
-    def show_about(self):
+    def show_about_dialog(self):
         QMessageBox.information(self,"About",
-            "Business Rules Manager – single-file example\n"
-            "Includes BFS, scheduling, conflicts, data validations, collaboration, etc.")
+            "BRM Tool – Single MainWindow with all advanced functionality.\n"
+            "Includes BFS, scheduling, conflicts, data validations, etc."
+        )
 
-    def current_user_id(self):
-        return self.user_id
-
-    def open_chain_dialog(self):
-        d = ChainSimulationDialog(self.connection,self)
-        d.exec_()
-
-    def open_group_dialog(self):
-        d = GroupSimulationDialog(self.connection,self)
-        d.exec_()
+    def fetch_username(self, user_id):
+        """
+        Helper to get the username from the USERS table.
+        """
+        c = self.connection.cursor()
+        try:
+            c.execute("SELECT USERNAME FROM USERS WHERE USER_ID=?",(user_id,))
+            row = c.fetchone()
+            if row:
+                return row[0]
+        except Exception:
+            pass
+        return "UnknownUser"
 
     def refresh_all(self):
-        # Example refresh
+        """
+        Called by the toolbar's Refresh or a QTimer.
+        Tells each tab to reload as needed.
+        """
         logger.info("Global refresh triggered.")
-        # each tab can have a .load_* method if needed
-        pass
-
-###############################################################################
-# Dummy "extended" classes for placeholders
-###############################################################################
-class AdminAggregateTab(QWidget):
-    def __init__(self, connection, user_id, user_group, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.user_id = user_id
-        self.user_group = user_group
-        layout = QVBoxLayout(self)
-        if self.user_group.upper()!="ADMIN":
-            layout.addWidget(QLabel("Access Denied: Admin only."))
-        else:
-            layout.addWidget(QLabel("Aggregate Admin sub‑tabs go here. E.g. User mgmt, group mgmt, etc."))
-        self.setLayout(layout)
-
-class BusinessRulesTabExtended(QWidget):
-    def __init__(self, connection, user_id, user_group, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.user_id = user_id
-        self.user_group = user_group
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Business Rules (extended BFS, advanced searches, etc.)"))
-        # e.g. embed a QTableWidget or sub‑tab
-        self.setLayout(layout)
-
-class MultiStepApprovalTab(QWidget):
-    def __init__(self, connection, logged_in_user, user_group, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.logged_in_user=logged_in_user
-        self.user_group=user_group
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("MultiStep Approvals Tab (parallel/serial) placeholder"))
-        self.setLayout(layout)
-
-class EnhancedCollaborationTab(QWidget):
-    def __init__(self, connection, collab_manager, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.collab_manager=collab_manager
-        layout=QVBoxLayout(self)
-        self.messages_list = QListWidget()
-        layout.addWidget(self.messages_list)
-        input_h=QHBoxLayout()
-        self.msg_edit=QLineEdit()
-        self.msg_edit.setPlaceholderText("Type message ...")
-        input_h.addWidget(self.msg_edit)
-        send_btn=QPushButton("Send")
-        send_btn.clicked.connect(self.send_message)
-        input_h.addWidget(send_btn)
-        layout.addLayout(input_h)
-        ref_btn=QPushButton("Refresh")
-        ref_btn.clicked.connect(self.load_messages)
-        layout.addWidget(ref_btn)
-        self.setLayout(layout)
-        self.load_messages()
-        self.collab_manager.newMessage.connect(self.handle_new_message)
-
-    def load_messages(self):
-        self.messages_list.clear()
-        c=self.connection.cursor()
+        # Example: 
         try:
-            c.execute("""
-                SELECT MESSAGE_ID, MESSAGE, SENDER, TIMESTAMP 
-                FROM COLLABORATION_LOGS
-                ORDER BY TIMESTAMP DESC
-            """)
-            for row in c.fetchall():
-                mid,msg,sender,ts=row
-                self.messages_list.addItem(f"[{ts}] {sender}: {msg}")
+            if hasattr(self, "task_center"):
+                self.task_center.load_tasks()
+            if hasattr(self, "metrics_dashboard"):
+                self.metrics_dashboard.load_metrics()
+            if hasattr(self, "approval_tab"):
+                self.approval_tab.load_approvals()
+            # if you have more .load_* 
         except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
+            logger.error(f"Refresh error: {ex}")
 
-    def send_message(self):
-        msg=self.msg_edit.text().strip()
-        if not msg:
+        self.statusBar().showMessage("Refreshed",3000)
+
+    def open_chain_sim(self):
+        """
+        Show ChainSimulationDialog for BFS from a chosen rule.
+        """
+        d = ChainSimulationDialog(self.connection, self)
+        d.exec_()
+
+    def open_group_sim(self):
+        """
+        Show GroupSimulationDialog for BFS or dry-run on a custom group.
+        """
+        d = GroupSimulationDialog(self.connection, self)
+        d.exec_()
+
+    def execute_bfs_unified(self):
+        """
+        Example: run a BFS-based rule execution across all root rules.
+        """
+        from PyQt5.QtWidgets import QInputDialog
+        dry_run,ok = QInputDialog.getItem(
+            self,"Execute BFS","Dry-run or Real?",
+            ["dry-run","real"],0,False
+        )
+        if not ok:
             return
-        sender="CurrentUser"
-        c=self.connection.cursor()
-        try:
-            c.execute("INSERT INTO COLLABORATION_LOGS(MESSAGE,SENDER,TIMESTAMP) VALUES(?,?,GETDATE())",(msg,sender))
-            c.connection.commit()
-            self.msg_edit.clear()
-            self.load_messages()
-        except Exception as ex:
-            QMessageBox.critical(self,"Error",str(ex))
-
-    def handle_new_message(self,msg_dict):
-        mid=msg_dict.get("message_id","")
-        message=msg_dict.get("message","")
-        sender=msg_dict.get("sender","")
-        ts=msg_dict.get("timestamp","")
-        self.messages_list.insertItem(0,f"[{ts}] {sender}: {message}")
-
-class ScheduleManagementTab(QWidget):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Rule Scheduling Tab (Enhanced) placeholder."))
-        self.setLayout(layout)
-
-class CustomRuleGroupsTab(QWidget):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Manage custom rule groups + members."))
-        self.setLayout(layout)
-
-class CompositeRulesTab(QWidget):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Composite rules tab."))
-        self.setLayout(layout)
-
-class ChainSimulationDialog(QDialog):
-    def __init__(self,connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.setWindowTitle("Chain BFS Simulation")
-        self.resize(400,300)
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Chain BFS simulation would go here."))
-        close_btn=QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
-        self.setLayout(layout)
-
-class GroupSimulationDialog(QDialog):
-    def __init__(self,connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.setWindowTitle("Group BFS Simulation")
-        self.resize(400,300)
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Group BFS simulation or dry-run."))
-        close_btn=QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
-        self.setLayout(layout)
-
-class WhatIfTestTab(QWidget):
-    def __init__(self,connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("What-if Test Tab with inline data editor, CSV upload, etc."))
-        self.setLayout(layout)
-
-class EnhancedAuditLogAnalysisTab(QWidget):
-    def __init__(self,connection,parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Audit Log with advanced filtering, export, diff."))
-        self.setLayout(layout)
-
-class HierarchyViewTab(QTreeWidget):
-    def __init__(self,connection,parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.setHeaderLabels(["Hierarchy (Drag/Drop)"])
-        self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.InternalMove)
-        # load hierarchy
-        item = QTreeWidgetItem(["Placeholder Group"])
-        self.addTopLevelItem(item)
-        # ...
-        self.expandAll()
-
-class TagsManagerTab(QWidget):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Rule Tags Manager."))
-        self.setLayout(layout)
-
-class GlobalCriticalAdminTab(QWidget):
-    def __init__(self, connection, user_group, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.user_group=user_group
-        layout=QVBoxLayout(self)
-        if self.user_group.upper()!="ADMIN":
-            layout.addWidget(QLabel("Access Denied: Admin only."))
-        else:
-            layout.addWidget(QLabel("Global/Critical admin interface. Link child rules, etc."))
-        self.setLayout(layout)
-
-###############################################################################
-# Snapshots Tab
-###############################################################################
-class SnapshotManagerTab(QWidget):
-    def __init__(self,connection,parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Snapshot Manager Tab. You can take or compare snapshots."))
-        self.setLayout(layout)
-
-###############################################################################
-# Data Validation Tab
-###############################################################################
-class DataValidationTab(QWidget):
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        layout=QVBoxLayout(self)
-        layout.addWidget(QLabel("Data Validation Tab (list validations, run them, etc.)"))
-        self.setLayout(layout)
-
-###############################################################################
-# Help / Onboarding
-###############################################################################
-class HelpAndOnboardingTab(QWidget):
-    def __init__(self, connection, user_id, parent=None):
-        super().__init__(parent)
-        self.connection=connection
-        self.user_id=user_id
-        layout=QVBoxLayout(self)
-        wiz_btn=QPushButton("Run Onboarding Wizard")
-        wiz_btn.clicked.connect(self.run_wizard)
-        layout.addWidget(wiz_btn)
-        layout.addWidget(QLabel("Additional help content goes here."))
-        self.setLayout(layout)
-
-    def run_wizard(self):
-        w=OnboardingWizard(self.connection,self.user_id,self)
-        w.exec_()
-
-###############################################################################
-# MAIN LAUNCH
-###############################################################################
-def main():
-    app = QApplication(sys.argv)
-
-    # Step1: DB Connect
-    db_dlg = DatabaseConnectionDialog()
-    if db_dlg.exec_()!=QDialog.Accepted or not db_dlg.connection:
-        sys.exit(0)
-    conn=db_dlg.connection
-
-    # Step2: Login
-    login_dlg = LoginDialog(conn)
-    if login_dlg.exec_()!=QDialog.Accepted:
-        sys.exit(0)
-    user_id = login_dlg.user_id
-    user_group = login_dlg.user_group
-
-    # Step3: Launch main window
-    mw = MainWindow(conn, user_id, user_group)
-    mw.show()
-
-    sys.exit(app.exec_())
-
-if __name__=="__main__":
-    main()
+        do_dry = (dry_run=="dry-run")
+        # call your BFS
+        executed,skipped = execute_rules_unified_bfs(self.connection, dry_run=do_dry, user_id=self.user_id)
+        msg = f"Executed: {executed}\nSkipped: {skipped}"
+        QMessageBox.information(self,"BFS Execution Result", msg)
