@@ -1,0 +1,316 @@
+Below is a step-by-step analysis of the most common pitfalls in your fully integrated code that lead to:
+	1.	Invalid/missing columns in SQL statements.
+	2.	Unresolved references to local variables (e.g., rid, user_id) in certain functions.
+
+After the analysis, you will find concrete fixes and example schema adjustments to ensure your code runs without errors. Where necessary, I also provide an updated snippet that corrects the most pressing bugs (especially the inconsistent INSERT statements into RULE_EXECUTION_LOGS).
+
+⸻
+
+1) Common Invalid Column Issues
+
+(A) Mismatch in RULE_EXECUTION_LOGS Inserts
+
+In the code, you have:
+
+def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count):
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO RULE_EXECUTION_LOGS(
+                RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT, EXECUTION_TIME_MS, CPU_USAGE, MEM_USAGE
+            ) VALUES( GETDATE(), ?, ?, ?, ?, 0, 0, 0 )
+        """)
+    except:
+        # ...
+        pass
+
+    try:
+        c.execute("""
+            INSERT INTO RULE_EXECUTION_LOGS(
+              RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE,
+              RECORD_COUNT, EXECUTION_TIME_MS, CPU_USAGE, MEM_USAGE
+            ) VALUES(?, GETDATE(), ?, ?, ?, 0, 0, 0)
+        """, (rule_id, 1 if pass_flag else 0, message, record_count))
+        conn.commit()
+    except Exception as ex:
+        logger.error(f"Error inserting rule exec log => {ex}")
+
+	•	Problem: The first INSERT statement tries to place GETDATE() into the RULE_ID column, but your columns are in the order (RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, ...). So you are effectively inserting GETDATE() where an integer RULE_ID is expected. Then you pass the other parameters with question marks. This leads to an immediate column-value mismatch.
+	•	Solution: You typically only need one INSERT statement, with the columns in the correct order. For example:
+
+INSERT INTO RULE_EXECUTION_LOGS(
+    RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT,
+    EXECUTION_TIME_MS, CPU_USAGE, MEM_USAGE
+) VALUES(?, GETDATE(), ?, ?, ?, 0, 0, 0)
+
+Then supply the parameter tuple (rule_id, 1 if pass_flag else 0, message, record_count).
+
+Hence, you can delete the first try/except block entirely. One corrected version is:
+
+def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count):
+    c = conn.cursor()
+    try:
+        c.execute(
+            """
+            INSERT INTO RULE_EXECUTION_LOGS(
+                RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT,
+                EXECUTION_TIME_MS, CPU_USAGE, MEM_USAGE
+            )
+            VALUES (?, GETDATE(), ?, ?, ?, 0, 0, 0)
+            """,
+            (rule_id, 1 if pass_flag else 0, message, record_count)
+        )
+        conn.commit()
+    except Exception as ex:
+        logger.error(f"Error inserting rule exec log => {ex}")
+        conn.rollback()
+
+Make sure your table RULE_EXECUTION_LOGS actually has these columns:
+
+CREATE TABLE RULE_EXECUTION_LOGS (
+  EXEC_LOG_ID INT IDENTITY(1,1) PRIMARY KEY,
+  RULE_ID INT NOT NULL,
+  EXECUTION_TIMESTAMP DATETIME NOT NULL,
+  PASS_FLAG BIT NOT NULL,
+  MESSAGE VARCHAR(4000),
+  RECORD_COUNT INT,
+  EXECUTION_TIME_MS INT,
+  CPU_USAGE FLOAT,
+  MEM_USAGE FLOAT
+  -- Add any other columns as needed.
+);
+
+If your real table has fewer columns, remove references to EXECUTION_TIME_MS, CPU_USAGE, or MEM_USAGE.
+
+⸻
+
+(B) Columns in BRM_RULES that might not exist
+
+Throughout the BFS code, you reference:
+
+info.get("OPERATION_TYPE", "OTHER")
+info.get("CRITICAL_RULE", 0)
+info.get("IS_GLOBAL", 0)
+info.get("RULE_SQL", "")
+info.get("RULE_NAME", "")
+...
+
+Make sure your table BRM_RULES has these columns:
+	•	RULE_ID (int PK)
+	•	RULE_NAME (varchar)
+	•	RULE_SQL (varchar)
+	•	OPERATION_TYPE (varchar)
+	•	CRITICAL_RULE (bit or int)
+	•	IS_GLOBAL (bit or int)
+	•	STATUS (varchar)
+	•	OWNER_GROUP (varchar)
+	•	APPROVAL_STATUS (varchar)
+	•	Possibly LIFECYCLE_STATE or VERSION if you use them.
+
+If you omit them from your real database, you must remove references in code. For instance, if you do not store IS_GLOBAL, remove checks like info.get("IS_GLOBAL", 0) == 1.
+
+⸻
+
+(C) Columns in RULE_CONFLICTS
+
+You do:
+
+SELECT RULE_ID1, RULE_ID2 FROM RULE_CONFLICTS
+
+or
+
+SELECT CONFLICT_ID, RULE_ID1, RULE_ID2, PRIORITY FROM RULE_CONFLICTS
+
+Ensure you actually have a table RULE_CONFLICTS that includes columns like:
+	•	CONFLICT_ID (PK)
+	•	RULE_ID1 (FK to BRM_RULES)
+	•	RULE_ID2 (FK to BRM_RULES)
+	•	PRIORITY (int)
+
+If you do not have CONFLICT_ID in your table, remove it or add it.
+
+⸻
+
+(D) Columns in BRM_RULE_APPROVALS
+
+You do:
+
+SELECT RULE_ID, APPROVAL_STAGE, USERNAME, APPROVED_FLAG
+  FROM BRM_RULE_APPROVALS
+
+So your table must have RULE_ID, APPROVAL_STAGE, USERNAME, APPROVED_FLAG, plus maybe REQUEST_TIMESTAMP, etc. If your real table is different, adjust the code or the DB.
+
+⸻
+
+(E) Columns in BRM_RULE_LOCKS
+
+You do:
+
+SELECT RULE_ID, LOCKED_BY, LOCK_TIMESTAMP, EXPIRY_TIMESTAMP, FORCE_LOCK, ACTIVE_LOCK
+  FROM BRM_RULE_LOCKS
+
+Hence that table should have columns:
+	•	RULE_ID (int)
+	•	LOCKED_BY (varchar)
+	•	LOCK_TIMESTAMP (datetime)
+	•	EXPIRY_TIMESTAMP (datetime)
+	•	FORCE_LOCK (bit)
+	•	ACTIVE_LOCK (bit)
+
+⸻
+
+(F) Columns in DATA_VALIDATIONS & DATA_VALIDATION_LOGS
+
+The code does:
+
+SELECT VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS
+  FROM DATA_VALIDATIONS
+
+INSERT INTO DATA_VALIDATION_LOGS(
+    VALIDATION_ID, RESULT_FLAG, DETAILS, VALIDATION_TIMESTAMP
+) VALUES(?,?,?,GETDATE())
+
+Hence, ensure these columns exist:
+	•	DATA_VALIDATIONS( VALIDATION_ID, TABLE_NAME, COLUMN_NAME, VALIDATION_TYPE, PARAMS )
+	•	DATA_VALIDATION_LOGS( LOG_ID PK?, VALIDATION_ID, RESULT_FLAG, DETAILS, VALIDATION_TIMESTAMP )
+
+⸻
+
+(G) Any place you see ... OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY ...
+
+SQL Fetch / Offset syntax is not supported on older SQL Server versions (before 2012) and can cause issues if your database is not correct. If using, ensure your DB or T-SQL version supports it. Otherwise, remove or replace with TOP 1000 logic.
+
+⸻
+
+2) Unresolved Reference for rid or user_id
+
+Generally, your BFS code references:
+
+executed, skipped = simulate_chain_bfs(self.connection, rid)
+
+Here rid is the local variable that’s passed from a lambda, e.g.:
+
+del_btn.clicked.connect(lambda _, rid=rid: self.delete_rule(rid))
+
+So that usage is valid, because rid was captured in a lambda:
+
+for row in rows:
+    rid = row[0]
+    ...
+    del_btn.clicked.connect(lambda _, rid=rid: self.delete_rule(rid))
+
+As long as that code is physically inside the for row in rows: loop, rid is properly defined. If you accidentally moved the lambda calls outside that loop, you would get “unresolved reference rid.” So double-check that each place you do lambda _, rid=rid: is inside the same scope that sets rid.
+
+Similarly, for user_id references, you do have:
+
+self.user_id = user_id
+...
+LockManager.unlock_rule_for_edit(self.connection, rule_id, self.current_user_id, force=True)
+
+That is fine if self.current_user_id is set. If your code accidentally references user_id outside the class or function that knows it, you’ll get an undefined variable error. So confirm your method is referencing self.user_id (or current_user_id) that was indeed set in __init__().
+
+In short:
+	•	If Python complains NameError: name 'rid' is not defined, it usually means the code that sets rid is not in the correct scope or got deleted.
+	•	If Python complains NameError: name 'user_id' is not defined, ensure you are using self.user_id from your class constructor or passing it as a parameter.
+
+⸻
+
+3) A Minimal Corrected Insert Code Snippet
+
+Below is the primary fix for the RULE_EXECUTION_LOGS insertion bug, plus some slight cleanup. You can drop it into your existing code to solve the column mismatch:
+
+def insert_rule_execution_log(conn, rule_id, pass_flag, message, record_count):
+    """
+    Inserts a record into RULE_EXECUTION_LOGS with columns:
+      [RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE, RECORD_COUNT, EXECUTION_TIME_MS, CPU_USAGE, MEM_USAGE]
+    Adjust or remove columns as needed to match your real DB schema.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO RULE_EXECUTION_LOGS(
+                RULE_ID, EXECUTION_TIMESTAMP, PASS_FLAG, MESSAGE,
+                RECORD_COUNT, EXECUTION_TIME_MS, CPU_USAGE, MEM_USAGE
+            )
+            VALUES(?, GETDATE(), ?, ?, ?, 0, 0, 0)
+        """, (rule_id, 1 if pass_flag else 0, message, record_count))
+        conn.commit()
+    except Exception as ex:
+        conn.rollback()
+        logger.error(f"Error inserting rule exec log => {ex}")
+
+Make sure your BFS or chain-execution code calls only this version.
+
+⸻
+
+4) Final Tips and Next Steps
+	1.	Verify DB Schemas: The surest way to avoid missing-column errors is to confirm each table has exactly the columns the code references. If you are missing a column (for example, OPERATION_TYPE in BRM_RULES), either add it to the DB or remove the code that references it.
+	2.	Comment Out Unused Logic: If you do not use CRITICAL_RULE, IS_GLOBAL, or APPROVAL_STATUS, you can comment out references to them until your schema is consistent.
+	3.	Use Try/Except Carefully Around SQL**: If you have big schema mismatches, the code will keep throwing exceptions. Avoid swallowing exceptions with empty except: blocks. You want to see the real error.
+	4.	Scope of rid and user_id: Confirm your lambda capturing or direct references to rid, user_id remain within the same indentation or function scope that sets them.
+
+With those changes, your integrated PyQt application should run with fewer “invalid column” or “unresolved reference” errors.
+
+⸻
+
+Example “Working” Table Definitions (Optional)
+
+For reference, here are minimal definitions you might use so all columns exist:
+
+-- BRM_RULES
+CREATE TABLE BRM_RULES (
+  RULE_ID INT IDENTITY PRIMARY KEY,
+  RULE_NAME VARCHAR(200) NOT NULL,
+  RULE_SQL VARCHAR(MAX),
+  OPERATION_TYPE VARCHAR(50),
+  CRITICAL_RULE BIT DEFAULT 0,
+  IS_GLOBAL BIT DEFAULT 0,
+  STATUS VARCHAR(50) DEFAULT 'INACTIVE',
+  OWNER_GROUP VARCHAR(100),
+  APPROVAL_STATUS VARCHAR(50),
+  LIFECYCLE_STATE VARCHAR(50),
+  CREATED_TIMESTAMP DATETIME DEFAULT GETDATE(),
+  UPDATED_BY VARCHAR(100),
+  VERSION INT DEFAULT 1
+);
+
+-- RULE_EXECUTION_LOGS
+CREATE TABLE RULE_EXECUTION_LOGS (
+  EXEC_LOG_ID INT IDENTITY PRIMARY KEY,
+  RULE_ID INT NOT NULL,
+  EXECUTION_TIMESTAMP DATETIME NOT NULL,
+  PASS_FLAG BIT NOT NULL,
+  MESSAGE VARCHAR(2000),
+  RECORD_COUNT INT,
+  EXECUTION_TIME_MS INT,
+  CPU_USAGE FLOAT,
+  MEM_USAGE FLOAT
+  -- Possibly foreign key to BRM_RULES(RULE_ID) if you want.
+);
+
+-- RULE_CONFLICTS
+CREATE TABLE RULE_CONFLICTS (
+  CONFLICT_ID INT IDENTITY PRIMARY KEY,
+  RULE_ID1 INT NOT NULL,
+  RULE_ID2 INT NOT NULL,
+  PRIORITY INT DEFAULT 1
+);
+
+-- BRM_RULE_APPROVALS
+CREATE TABLE BRM_RULE_APPROVALS (
+  APPROVAL_ID INT IDENTITY PRIMARY KEY,
+  RULE_ID INT NOT NULL,
+  GROUP_NAME VARCHAR(100),
+  APPROVAL_STAGE INT,
+  USERNAME VARCHAR(100),
+  APPROVED_FLAG INT DEFAULT 0,
+  APPROVED_TIMESTAMP DATETIME,
+  REQUEST_TIMESTAMP DATETIME,
+  COMMENT VARCHAR(500)
+);
+
+-- And so forth for other references...
+
+By ensuring these tables exist and columns match, your BFS, scheduling, conflict resolution, and editing features should work without column errors.
+
+Good luck debugging and happy coding!
