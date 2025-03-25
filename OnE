@@ -2904,15 +2904,28 @@ class MultiStepApprovalTab(QWidget):
         self.approvals_table.setRowCount(0)
         c = self.connection.cursor()
         try:
+            # Instead of "R.LOCKED_BY", do a LEFT JOIN with BRM_RULE_LOCKS
             c.execute("""
-                SELECT A.RULE_ID, A.GROUP_NAME, R.RULE_NAME, A.APPROVAL_STAGE, A.APPROVED_FLAG, R.LOCKED_BY
+                SELECT 
+                    A.RULE_ID,
+                    A.GROUP_NAME,
+                    R.RULE_NAME,
+                    A.APPROVAL_STAGE,
+                    A.APPROVED_FLAG,
+                    L.LOCKED_BY
                 FROM BRM_RULE_APPROVALS A
                 JOIN BRM_RULES R ON A.RULE_ID = R.RULE_ID
-                WHERE A.USERNAME=? AND A.APPROVED_FLAG=0
+                LEFT JOIN BRM_RULE_LOCKS L
+                       ON R.RULE_ID = L.RULE_ID
+                      AND L.ACTIVE_LOCK=1           -- only show if there's an active lock
+                WHERE A.USERNAME=? 
+                  AND A.APPROVED_FLAG=0
                 ORDER BY A.RULE_ID
             """, (self.logged_in_username,))
+
             rows = c.fetchall()
 
+            # get_min_stage helper as before
             def get_min_stage(rule_id):
                 cur = self.connection.cursor()
                 cur.execute("""
@@ -2921,29 +2934,41 @@ class MultiStepApprovalTab(QWidget):
                     WHERE RULE_ID=? AND APPROVED_FLAG=0
                 """, (rule_id,))
                 result = cur.fetchone()
-                return result[0] if result and result[0] is not None else None
+                return result[0] if (result and result[0] is not None) else None
 
+            # Filter approvals by the minimal stage
             filtered = [r for r in rows if r[3] == get_min_stage(r[0])]
             self.approvals_table.setRowCount(len(filtered))
+
             for i, row in enumerate(filtered):
                 rule_id, group_name, rule_name, stage, approved_flag, locked_by = row
+
+                # Fill columns
                 self.approvals_table.setItem(i, 0, QTableWidgetItem(str(rule_id)))
                 self.approvals_table.setItem(i, 1, QTableWidgetItem(str(group_name)))
                 self.approvals_table.setItem(i, 2, QTableWidgetItem(str(rule_name)))
                 self.approvals_table.setItem(i, 3, QTableWidgetItem(str(stage)))
                 self.approvals_table.setItem(i, 4, QTableWidgetItem(str(approved_flag)))
+
+                # Approve button
                 approve_btn = QPushButton("Approve")
                 approve_btn.clicked.connect(lambda _, idx=i: self.do_approve(idx))
                 self.approvals_table.setCellWidget(i, 5, approve_btn)
+
+                # Reject button
                 reject_btn = QPushButton("Reject")
                 reject_btn.clicked.connect(lambda _, idx=i: self.do_reject(idx))
                 self.approvals_table.setCellWidget(i, 6, reject_btn)
+
                 lock_status = f"Locked by {locked_by}" if locked_by else "Unlocked"
                 self.approvals_table.setItem(i, 7, QTableWidgetItem(lock_status))
+
+                # Force unlock button (only for Admins)
                 force_btn = QPushButton("ForceUnlock")
                 force_btn.setEnabled(self.user_group == "Admin")
                 force_btn.clicked.connect(lambda _, idx=i: self.do_forceunlock(idx))
                 self.approvals_table.setCellWidget(i, 8, force_btn)
+
         except Exception as ex:
             QMessageBox.critical(self, "Approval Load Error", str(ex))
 
@@ -5997,21 +6022,292 @@ class SchedulingTab(QWidget):
 
 
 # ---------------------- Composite Rules Tab (Wizard-based) ----------------------
+import json
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QInputDialog,
+    QDialog, QPlainTextEdit, QLineEdit, QLabel
+)
+from PyQt5.QtCore import Qt
+
+def insert_audit_log(conn, action, table_name, record_id, actor, old_data=None, new_data=None):
+    """
+    Placeholder stub: Adjust or remove if your environment already has one.
+    Expects a table like BRM_AUDIT_LOG with columns:
+      (AUDIT_ID, ACTION, TABLE_NAME, RECORD_ID, ACTION_BY, OLD_DATA, NEW_DATA, ACTION_TIMESTAMP)
+    """
+    c = conn.cursor()
+    try:
+        c.execute(
+            """
+            INSERT INTO BRM_AUDIT_LOG(
+              ACTION, TABLE_NAME, RECORD_ID, ACTION_BY,
+              OLD_DATA, NEW_DATA, ACTION_TIMESTAMP
+            )
+            VALUES(?,?,?,?,?,?,
+                   GETDATE())
+            """,
+            (
+                action,
+                table_name,
+                str(record_id) if record_id else None,
+                actor,
+                json.dumps(old_data) if old_data else None,
+                json.dumps(new_data) if new_data else None
+            )
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"[WARN] insert_audit_log failed: {e}")
+        # swallow or re-raise as needed
+
 class CompositeRulesTab(QWidget):
+    """
+    CompositeRulesTab:
+      • Shows a table of composite rules (ID, Name, Expression, Action, CreatedTS).
+      • Add, Update, Delete each rule.
+      • Logs all changes into an audit log (INSERT, UPDATE, DELETE).
+      • Minimal interface uses QInputDialog; adapt as needed.
+    """
 
-
-    def __init__(self, connection, parent=None):
+    def __init__(self, connection, current_user="CurrentUser", parent=None):
         super().__init__(parent)
         self.connection = connection
-        layout = QVBoxLayout(self)
-        wizard_btn = QPushButton("Create Composite Rule (Wizard)")
-        wizard_btn.clicked.connect(self.open_wizard)
-        layout.addWidget(wizard_btn)
-        self.setLayout(layout)
+        self.current_user = current_user  # who is making changes (for audit)
+        self.init_ui()
 
-    def open_wizard(self):
-        dlg = CompositeRuleWizard(self.connection)
-        dlg.exec_()
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Top row buttons
+        btn_layout = QHBoxLayout()
+        add_btn = QPushButton("Add Composite Rule")
+        add_btn.clicked.connect(self.add_composite)
+        btn_layout.addWidget(add_btn)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.load_composites)
+        btn_layout.addWidget(refresh_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        # Composite rules table
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "Name", "Expression", "ActionOnPass", "CreatedTime", "Update", "Delete"
+        ])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.table)
+
+        self.setLayout(layout)
+        self.load_composites()
+
+    def load_composites(self):
+        """
+        Loads all composite rules from COMPOSITE_RULES into the table.
+        """
+        self.table.setRowCount(0)
+        c = self.connection.cursor()
+        try:
+            c.execute("""
+                SELECT COMPOSITE_RULE_ID, CRULE_NAME, LOGIC_EXPR,
+                       ACTION_ON_PASS, 
+                       CONVERT(varchar(19), COALESCE(CREATED_TIMESTAMP, GETDATE()), 120)
+                FROM COMPOSITE_RULES
+                ORDER BY COMPOSITE_RULE_ID DESC
+            """)
+            rows = c.fetchall()
+            for row_i, row_data in enumerate(rows):
+                self.table.insertRow(row_i)
+                # Place each column
+                for col_i in range(5):
+                    val = row_data[col_i]
+                    item = QTableWidgetItem(str(val) if val else "")
+                    self.table.setItem(row_i, col_i, item)
+
+                # Update button
+                up_btn = QPushButton("Update")
+                up_btn.clicked.connect(
+                    lambda _, r=row_i: self.update_composite(r)
+                )
+                self.table.setCellWidget(row_i, 5, up_btn)
+
+                # Delete button
+                del_btn = QPushButton("Delete")
+                del_btn.clicked.connect(
+                    lambda _, r=row_i: self.delete_composite(r)
+                )
+                self.table.setCellWidget(row_i, 6, del_btn)
+
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Could not load composite rules:\n{ex}")
+
+    def get_rule_id_at_row(self, row_idx):
+        item = self.table.item(row_idx, 0)
+        if not item:
+            return None
+        try:
+            return int(item.text())
+        except:
+            return None
+
+    def add_composite(self):
+        """
+        Prompt user for CRULE_NAME, LOGIC_EXPR, ACTION_ON_PASS, insert row
+        into DB, and audit log the insertion.
+        """
+        name, ok1 = QInputDialog.getText(self, "Add Composite", "Name:")
+        if not ok1 or not name.strip():
+            return
+        expr, ok2 = QInputDialog.getMultiLineText(
+            self, "Expression", "Logic expression (e.g. 'Rule10==PASS AND Rule20==PASS'):"
+        )
+        if not ok2:
+            return
+        action, ok3 = QInputDialog.getText(self, "Action on Pass", "Action (optional):")
+        if not ok3:
+            action = ""
+
+        c = self.connection.cursor()
+        old_data = None
+        new_data = {
+            "CRULE_NAME": name.strip(),
+            "LOGIC_EXPR": expr.strip(),
+            "ACTION_ON_PASS": action.strip()
+        }
+        try:
+            c.execute("""
+                INSERT INTO COMPOSITE_RULES (CRULE_NAME, LOGIC_EXPR, ACTION_ON_PASS, CREATED_TIMESTAMP)
+                OUTPUT inserted.COMPOSITE_RULE_ID
+                VALUES (?, ?, ?, GETDATE())
+            """, (name.strip(), expr.strip(), action.strip()))
+            inserted_id = c.fetchone()[0]
+            self.connection.commit()
+
+            # Insert audit
+            insert_audit_log(
+                self.connection,
+                "INSERT",
+                "COMPOSITE_RULES",
+                inserted_id,
+                self.current_user,
+                old_data=old_data,
+                new_data=new_data
+            )
+            QMessageBox.information(self, "Added", f"Composite rule '{name}' created (ID={inserted_id}).")
+            self.load_composites()
+
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Add Composite failed:\n{ex}")
+
+    def update_composite(self, row_idx):
+        """
+        Let user update the composite rule at the given table row.
+        """
+        rule_id = self.get_rule_id_at_row(row_idx)
+        if not rule_id:
+            return
+        # Fetch old data
+        c = self.connection.cursor()
+        c.execute("""
+            SELECT CRULE_NAME, LOGIC_EXPR, ACTION_ON_PASS
+            FROM COMPOSITE_RULES
+            WHERE COMPOSITE_RULE_ID=?
+        """, (rule_id,))
+        row = c.fetchone()
+        if not row:
+            QMessageBox.warning(self, "Not Found", f"Composite rule {rule_id} not found.")
+            return
+
+        old_data = {
+            "CRULE_NAME": row[0],
+            "LOGIC_EXPR": row[1],
+            "ACTION_ON_PASS": row[2]
+        }
+        # Prompt
+        name, ok1 = QInputDialog.getText(self, "Update Composite", "Name:", text=row[0] or "")
+        if not ok1:
+            return
+        expr, ok2 = QInputDialog.getMultiLineText(self, "Update Expr", "Expression:", text=row[1] or "")
+        if not ok2:
+            return
+        action, ok3 = QInputDialog.getText(self, "Update Action", "Action on Pass:", text=row[2] or "")
+        if not ok3:
+            return
+
+        new_data = {
+            "CRULE_NAME": name.strip(),
+            "LOGIC_EXPR": expr.strip(),
+            "ACTION_ON_PASS": action.strip()
+        }
+
+        # Update
+        try:
+            c.execute("""
+                UPDATE COMPOSITE_RULES
+                SET CRULE_NAME=?, LOGIC_EXPR=?, ACTION_ON_PASS=?
+                WHERE COMPOSITE_RULE_ID=?
+            """, (new_data["CRULE_NAME"], new_data["LOGIC_EXPR"], new_data["ACTION_ON_PASS"], rule_id))
+            self.connection.commit()
+
+            insert_audit_log(
+                self.connection,
+                "UPDATE",
+                "COMPOSITE_RULES",
+                rule_id,
+                self.current_user,
+                old_data=old_data,
+                new_data=new_data
+            )
+            QMessageBox.information(self, "Updated", f"Composite rule {rule_id} updated.")
+            self.load_composites()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Update failed:\n{ex}")
+
+    def delete_composite(self, row_idx):
+        """
+        Delete the composite rule at the given table row, with audit log.
+        """
+        rule_id = self.get_rule_id_at_row(row_idx)
+        if not rule_id:
+            return
+        confirm = QMessageBox.question(self, "Confirm", f"Delete composite rule {rule_id}?")
+        if confirm != QMessageBox.Yes:
+            return
+
+        # Grab old data for logging
+        c = self.connection.cursor()
+        c.execute("""
+            SELECT CRULE_NAME, LOGIC_EXPR, ACTION_ON_PASS
+            FROM COMPOSITE_RULES
+            WHERE COMPOSITE_RULE_ID=?
+        """, (rule_id,))
+        row = c.fetchone()
+        old_data = {
+            "CRULE_NAME": row[0] if row else None,
+            "LOGIC_EXPR": row[1] if row else None,
+            "ACTION_ON_PASS": row[2] if row else None
+        }
+
+        try:
+            c.execute("DELETE FROM COMPOSITE_RULES WHERE COMPOSITE_RULE_ID=?", (rule_id,))
+            self.connection.commit()
+
+            insert_audit_log(
+                self.connection,
+                "DELETE",
+                "COMPOSITE_RULES",
+                rule_id,
+                self.current_user,
+                old_data=old_data,
+                new_data=None
+            )
+            QMessageBox.information(self, "Deleted", f"Composite rule {rule_id} deleted.")
+            self.load_composites()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", f"Delete failed:\n{ex}")
 
 
 class CompositeRuleWizard(QDialog):
