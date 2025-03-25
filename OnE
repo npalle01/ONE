@@ -1013,58 +1013,6 @@ def execute_rules_unified_bfs(conn, dry_run=False):
 ###############################################################################
 # 2) LOAD RULE RELATIONSHIPS & SUPPORT FUNCTIONS
 ###############################################################################
-def load_rule_relationships(conn):
-    """
-    Constructs an adjacency list for:
-      - Child rules (via PARENT_RULE_ID)
-      - Conflict links (from RULE_CONFLICTS, two-way)
-      - Global-critical links (from BRM_GLOBAL_CRITICAL_LINKS, one-way)
-      - Composite references (from COMPOSITE_RULES, sub-rule -> composite rule)
-    Returns a tuple: (adjacency_dict, list_of_root_rule_ids, parent_map).
-    """
-    c = conn.cursor()
-    c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
-    rows = c.fetchall()
-    adjacency = {}
-    parent_map = {}
-    all_ids = set()
-    for (rid, pid) in rows:
-        all_ids.add(rid)
-        if pid:
-            adjacency.setdefault(pid, set()).add(rid)
-            parent_map[rid] = pid
-
-    # Add conflict links (bidirectional)
-    c.execute("SELECT RULE_ID1, RULE_ID2 FROM RULE_CONFLICTS")
-    conflicts = c.fetchall()
-    for (r1, r2) in conflicts:
-        adjacency.setdefault(r1, set()).add(r2)
-        adjacency.setdefault(r2, set()).add(r1)
-
-    # Add global-critical links (one directional: parent->child)
-    c.execute("SELECT GCR_RULE_ID, TARGET_RULE_ID FROM BRM_GLOBAL_CRITICAL_LINKS")
-    gcrs = c.fetchall()
-    for (gcr, tgt) in gcrs:
-        adjacency.setdefault(gcr, set()).add(tgt)
-
-    # Add composite links (sub-rule -> composite rule)
-    c.execute("SELECT COMPOSITE_RULE_ID, LOGIC_EXPR FROM COMPOSITE_RULES")
-    comp_rows = c.fetchall()
-    pat = re.compile(r"Rule(\d+)")
-    for (comp_id, expr) in comp_rows:
-        if expr:
-            matches = pat.findall(expr)
-            for m in matches:
-                try:
-                    sub_id = int(m)
-                    adjacency.setdefault(sub_id, set()).add(comp_id)
-                except Exception as ex:
-                    logger.error(f"Error parsing composite rule expression: {ex}")
-                    continue
-
-    child_ids = set(parent_map.keys())
-    roots = [rid for rid in all_ids if rid not in child_ids]
-    return (adjacency, roots, parent_map)
 
 
 def skip_all_descendants(start_id, adjacency, skipped):
@@ -5356,72 +5304,78 @@ def load_rule_relationships(conn):
     roots = [r for r in all_ids if r not in child_ids]
     return adjacency, roots, parent_map
 
-
-def run_single_rule_in_transaction(conn, rule_id):
+def run_single_rule_in_transaction(conn, rule_id, is_dry_run=False):
     """
-    Simplified single-rule runner. In practice, you might have more logic:
-       - parse the rule
-       - run the rule's SQL or call a function
-       - commit or rollback
-    Returns (ok_flag, message) where ok_flag=True if rule is considered PASS.
+    Example of running one rule in a transaction. If is_dry_run=True, always rollback.
+    Otherwise, you might commit if needed.
+
+    Returns (ok_flag, message, rowcount, sample_rows).
     """
-    try:
-        c = conn.cursor()
-        c.execute("SELECT RULE_SQL, OPERATION_TYPE FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
-        row = c.fetchone()
-        if not row:
-            return (False, f"Rule {rule_id} not found.")
-        sql_text, op_type = row
+    c = conn.cursor()
+    # Lookup the rule's SQL
+    c.execute("SELECT RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+    row = c.fetchone()
+    if not row:
+        return (False, f"Rule {rule_id} not found", 0, [])
 
-        if not sql_text:
-            # Possibly a "decision table" or no-op rule
-            return (True, "No SQL => pass by default")
+    sql_text = row[0] or ""
+    if not sql_text.strip():
+        # No SQL => trivially pass
+        return (True, "No SQL => pass", 0, [])
 
-        # Example: run in a transaction, check if first cell is 1 => PASS
-        c.execute("BEGIN TRANSACTION")
-        c.execute(sql_text)
+    if is_dry_run:
+        # Use the dry-run function
+        return dry_run_rule_sql_enhanced(conn, sql_text)
+    else:
+        # Example real-run: you might do a full transaction commit
         try:
-            rows = c.fetchall()
-        except:
-            rows = []
-        c.execute("ROLLBACK")  # always rollback for "test" or "BFS"? Up to you
-        if rows:
-            val = rows[0][0]
-            return (val == 1, f"Returned => {val}")
-        return (True, "No rows => PASS by default")
-    except Exception as ex:
-        return (False, str(ex))
+            c.execute("BEGIN TRANSACTION")
+            c.execute(sql_text)
+            # See if there's a result set
+            try:
+                all_data = c.fetchall()
+                rowcount = len(all_data)
+                sample_rows = all_data[:10]
+            except pyodbc.ProgrammingError:
+                rowcount = c.rowcount
+                sample_rows = []
+            # In a real environment, you might COMMIT now
+            c.execute("COMMIT")
+            return (True, "Executed OK", rowcount, sample_rows)
+        except Exception as ex:
+            c.execute("ROLLBACK")
+            return (False, str(ex), 0, [])
 
-
-def run_chain_bfs_from_rule(conn, parent_rule_id):
+def run_chain_bfs_from_rule(conn, start_rule_id):
     """
-    Minimal BFS approach that attempts to run each rule in a chain from parent_rule_id.
-    If a rule fails, we skip that rule's children. Returns (executed_list, skipped_list).
+    Minimal BFS from a start rule. If a rule fails, we skip that rule
+    (but you can decide if you want to skip children, too).
+    Returns (executed_list, skipped_list).
     """
     adjacency, roots, parent_map = load_rule_relationships(conn)
     executed = []
     skipped = set()
-    queue = [parent_rule_id]
+    queue = [start_rule_id]
 
     while queue:
         rid = queue.pop(0)
         if rid in skipped:
             continue
 
-        ok, msg = run_single_rule_in_transaction(conn, rid)
+        ok, msg, rowcount, samples = run_single_rule_in_transaction(conn, rid, is_dry_run=False)
         if ok:
             executed.append(rid)
             # Add children
             if rid in adjacency:
-                for child in adjacency[rid]:
-                    if child not in skipped:
-                        queue.append(child)
+                for child_id in adjacency[rid]:
+                    if child_id not in skipped:
+                        queue.append(child_id)
         else:
-            # Mark this rule & its children as skipped
             skipped.add(rid)
-            if rid in adjacency:
-                for child in adjacency[rid]:
-                    skipped.add(child)
+            # If you want to skip children as well:
+            # if rid in adjacency:
+            #     for child_id in adjacency[rid]:
+            #         skipped.add(child_id)
 
     return executed, list(skipped)
 
@@ -5527,20 +5481,43 @@ from PyQt5.QtCore import Qt
 
 
 ###############################################################################
-# 1) HELPER: ADVANCED DRY-RUN
+# HELPER FUNCTION: LOAD RULE RELATIONSHIPS
+###############################################################################
+def load_rule_relationships(conn):
+    """
+    Builds adjacency from BRM_RULES, assuming a PARENT_RULE_ID column.
+    Returns (adjacency_dict, list_of_root_ids, parent_map).
+    """
+    c = conn.cursor()
+    c.execute("SELECT RULE_ID, PARENT_RULE_ID FROM BRM_RULES")
+    rows = c.fetchall()
+
+    adjacency = {}
+    parent_map = {}
+    all_rule_ids = set()
+
+    for (rule_id, parent_id) in rows:
+        all_rule_ids.add(rule_id)
+        if parent_id:
+            adjacency.setdefault(parent_id, set()).add(rule_id)
+            parent_map[rule_id] = parent_id
+
+    # Identify roots (rules that have no parent)
+    child_ids = set(parent_map.keys())
+    roots = [r for r in all_rule_ids if r not in child_ids]
+
+    return adjacency, roots, parent_map
+
+###############################################################################
+# HELPER FUNCTION: DRY-RUN RULE SQL (SHOW 10 SAMPLE ROWS)
 ###############################################################################
 def dry_run_rule_sql_enhanced(conn, sql_text):
     """
-    Runs the given SQL in a transaction, *always* rolls back.
+    Runs the given SQL in a transaction, always ROLLS BACK.
+    Returns tuple: (ok_flag, message, rowcount, sample_rows)
 
-    Returns:
-      - ok (bool): whether the statement ran without error
-      - message (str): error or success message
-      - rowcount (int): # of rows impacted or returned
-      - sample_rows (list): up to 10 sample rows (if a result set was returned)
-
-    If the SQL is a SELECT or returns rows, we fetch them all then roll back.
-    If it is an UPDATE/INSERT/DELETE that doesn't return rows, we rely on c.rowcount.
+    - rowcount => # of rows returned (SELECT) or impacted (INSERT/UPDATE/DELETE)
+    - sample_rows => up to 10 sample rows if it returns a result set
     """
     c = conn.cursor()
     try:
@@ -5550,27 +5527,26 @@ def dry_run_rule_sql_enhanced(conn, sql_text):
         rowcount = 0
         sample_rows = []
 
-        # Attempt to fetch rows
+        # Try fetching rows (if it's a SELECT or returns data)
         try:
             all_data = c.fetchall()
             rowcount = len(all_data)
-            # Keep only up to 10 sample rows
-            sample_rows = all_data[:10]
-        except:
-            # Possibly a DML with no result set
+            sample_rows = all_data[:10]  # up to 10 samples
+        except pyodbc.ProgrammingError:
+            # Possibly no result set (UPDATE/INSERT/DELETE)
             rowcount = c.rowcount
             sample_rows = []
 
         c.execute("ROLLBACK")
-        return (True, "Dry‑run successful.", rowcount, sample_rows)
+        return (True, "Dry-run OK", rowcount, sample_rows)
 
     except Exception as ex:
-        # Attempt rollback anyway
+        # Attempt rollback
         try:
             c.execute("ROLLBACK")
         except:
             pass
-        return (False, f"Dry‑run error: {ex}", 0, [])
+        return (False, f"Dry-run error: {ex}", 0, [])
 
 
 ###############################################################################
@@ -5657,14 +5633,15 @@ def simulate_custom_group_rules_enhanced(conn, group_id):
 
 
 ###############################################################################
-# 5) THE BUSINESS RULES TAB
+# THE BUSINESSRULES TAB
 ###############################################################################
 class BusinessRulesTab(QWidget):
     """
-    Enhanced 'BusinessRulesTab' with:
-      - Dry-run that shows record count & up to 10 sample rows
-      - Lock status displayed in a new column
-      - Force unlock button for Admin users
+    A fully integrated replacement:
+      - Fixes locked_by via LEFT JOIN
+      - Shows Dry Run (#records & up to 10 sample rows)
+      - Provides BFS run button
+      - Force unlock for Admin
     """
 
     def __init__(self, connection, user_id, user_group, parent=None):
@@ -5673,6 +5650,7 @@ class BusinessRulesTab(QWidget):
         self.user_id = user_id
         self.user_group = user_group
         self.selected_rule_id = None
+
         self.init_ui()
 
     def init_ui(self):
@@ -5702,23 +5680,25 @@ class BusinessRulesTab(QWidget):
         deactivate_btn.clicked.connect(self.deactivate_rule)
         toolbar_layout.addWidget(deactivate_btn)
 
-        dryrun_btn = QPushButton("Dry‑Run (Single)")
-        dryrun_btn.clicked.connect(self.dryrun_single)
+        # Dry Run (single)
+        dryrun_btn = QPushButton("Dry Run")
+        dryrun_btn.clicked.connect(self.dry_run_selected_rule)
         toolbar_layout.addWidget(dryrun_btn)
 
-        group_dry_btn = QPushButton("Dry‑Run (Group)")
-        group_dry_btn.clicked.connect(self.dryrun_group)
-        toolbar_layout.addWidget(group_dry_btn)
+        # BFS Execution
+        bfs_btn = QPushButton("Run BFS")
+        bfs_btn.clicked.connect(self.run_bfs)
+        toolbar_layout.addWidget(bfs_btn)
 
         toolbar_layout.addStretch()
         layout.addLayout(toolbar_layout)
 
-        # The rule table: now with 2 extra columns => "Lock Status" and "Force Unlock"
+        # Table for rules (8 columns)
         self.rules_table = QTableWidget()
         self.rules_table.setColumnCount(8)
         self.rules_table.setHorizontalHeaderLabels([
             "RuleID", "Name", "Status", "Version", "OwnerGroup",
-            "CreatedTS", "Lock Status", "Force Unlock"
+            "CreatedTS", "LockStatus", "ForceUnlock"
         ])
         self.rules_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.rules_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -5729,68 +5709,106 @@ class BusinessRulesTab(QWidget):
         self.load_rules()
 
     def load_rules(self):
+        """
+        Use LEFT JOIN on BRM_RULE_LOCKS to get locked_by if present (ACTIVE_LOCK=1).
+        """
         self.rules_table.setRowCount(0)
         search_term = self.search_edit.text().strip()
         c = self.connection.cursor()
+
         try:
             if search_term:
-                query = ("""
-                    SELECT RULE_ID, RULE_NAME, STATUS, VERSION, OWNER_GROUP,
-                           CONVERT(VARCHAR, CREATED_TIMESTAMP, 120)
-                    FROM BRM_RULES
-                    WHERE RULE_NAME LIKE ? OR RULE_SQL LIKE ?
-                    ORDER BY RULE_ID DESC
-                """)
+                query = """
+                    SELECT R.RULE_ID,
+                           R.RULE_NAME,
+                           R.STATUS,
+                           R.VERSION,
+                           R.OWNER_GROUP,
+                           CONVERT(VARCHAR, R.CREATED_TIMESTAMP, 120) as CreatedTS,
+                           L.LOCKED_BY
+                    FROM BRM_RULES R
+                    LEFT JOIN BRM_RULE_LOCKS L
+                           ON R.RULE_ID = L.RULE_ID
+                          AND L.ACTIVE_LOCK=1
+                    WHERE R.RULE_NAME LIKE ? OR R.RULE_SQL LIKE ?
+                    ORDER BY R.RULE_ID DESC
+                """
                 c.execute(query, (f"%{search_term}%", f"%{search_term}%"))
             else:
-                c.execute("""
-                    SELECT RULE_ID, RULE_NAME, STATUS, VERSION, OWNER_GROUP,
-                           CONVERT(VARCHAR, CREATED_TIMESTAMP, 120)
-                    FROM BRM_RULES
-                    ORDER BY RULE_ID DESC
-                """)
+                query = """
+                    SELECT R.RULE_ID,
+                           R.RULE_NAME,
+                           R.STATUS,
+                           R.VERSION,
+                           R.OWNER_GROUP,
+                           CONVERT(VARCHAR, R.CREATED_TIMESTAMP, 120) as CreatedTS,
+                           L.LOCKED_BY
+                    FROM BRM_RULES R
+                    LEFT JOIN BRM_RULE_LOCKS L
+                           ON R.RULE_ID = L.RULE_ID
+                          AND L.ACTIVE_LOCK=1
+                    ORDER BY R.RULE_ID DESC
+                """
+                c.execute(query)
+
             rows = c.fetchall()
             for i, row in enumerate(rows):
                 self.rules_table.insertRow(i)
 
-                rule_id = row[0]
-                for col_index, val in enumerate(row):
-                    self.rules_table.setItem(i, col_index, QTableWidgetItem(str(val) if val else ""))
+                rule_id   = row[0]
+                rule_name = row[1]
+                status    = row[2]
+                version   = row[3]
+                owner_grp = row[4]
+                createdts = row[5]
+                locked_by = row[6]
 
-                # 6) Lock Status
-                locked_by = get_rule_locked_by(self.connection, rule_id)
+                # Fill table columns
+                self.rules_table.setItem(i, 0, QTableWidgetItem(str(rule_id)))
+                self.rules_table.setItem(i, 1, QTableWidgetItem(str(rule_name)))
+                self.rules_table.setItem(i, 2, QTableWidgetItem(str(status)))
+                self.rules_table.setItem(i, 3, QTableWidgetItem(str(version)))
+                self.rules_table.setItem(i, 4, QTableWidgetItem(str(owner_grp)))
+                self.rules_table.setItem(i, 5, QTableWidgetItem(str(createdts)))
+
+                # 6) Lock status
                 if locked_by:
                     lock_str = f"Locked by {locked_by}"
                 else:
                     lock_str = "Unlocked"
                 self.rules_table.setItem(i, 6, QTableWidgetItem(lock_str))
 
-                # 7) Force Unlock column => show a button if user is admin
-                if self.user_group.lower() == "admin" and locked_by:
-                    # Only show the button if it's locked
-                    force_button = QPushButton("Force Unlock")
-                    force_button.clicked.connect(lambda _, rid=rule_id: self.on_force_unlock(rid))
-                    self.rules_table.setCellWidget(i, 7, force_button)
+                # 7) Force unlock column => show button if Admin & locked
+                if (self.user_group.lower() == "admin") and locked_by:
+                    force_btn = QPushButton("Force Unlock")
+                    force_btn.clicked.connect(lambda _, rid=rule_id: self.force_unlock(rid))
+                    self.rules_table.setCellWidget(i, 7, force_btn)
                 else:
                     item = QTableWidgetItem("N/A")
-                    item.setFlags(Qt.ItemIsEnabled)  # read-only
+                    item.setFlags(Qt.ItemIsEnabled)
                     self.rules_table.setItem(i, 7, item)
 
         except Exception as e:
             QMessageBox.critical(self, "Load Rules Error", str(e))
 
     def on_rule_selection(self):
-        items = self.rules_table.selectedItems()
-        if items:
+        selected = self.rules_table.selectedItems()
+        if selected:
+            # RuleID is in column 0
             try:
-                self.selected_rule_id = int(items[0].text())
+                self.selected_rule_id = int(selected[0].text())
             except:
                 self.selected_rule_id = None
         else:
             self.selected_rule_id = None
 
+    # ----------------------------------------------------------------
+    # CRUD-LIKE OPERATIONS (STUBS)
+    # ----------------------------------------------------------------
     def add_rule(self):
-        QMessageBox.information(self, "Add Rule", "Replace with your custom add-rule logic.")
+        if not self.user_id:
+            return
+        QMessageBox.information(self, "Add Rule", "Replace with your add-rule logic.")
         self.load_rules()
 
     def edit_rule(self):
@@ -5804,8 +5822,8 @@ class BusinessRulesTab(QWidget):
         if not self.selected_rule_id:
             QMessageBox.warning(self, "Delete Rule", "No rule selected.")
             return
-        confirm = QMessageBox.question(self, "Delete Rule",
-                                       f"Are you sure you want to delete Rule {self.selected_rule_id}?",
+        confirm = QMessageBox.question(self, "Confirm Delete",
+                                       f"Delete rule {self.selected_rule_id}?",
                                        QMessageBox.Yes | QMessageBox.No)
         if confirm != QMessageBox.Yes:
             return
@@ -5826,116 +5844,90 @@ class BusinessRulesTab(QWidget):
             c = self.connection.cursor()
             c.execute("UPDATE BRM_RULES SET STATUS='INACTIVE' WHERE RULE_ID=?", (self.selected_rule_id,))
             self.connection.commit()
-            QMessageBox.information(self, "Deactivated", f"Rule {self.selected_rule_id} is now INACTIVE.")
+            QMessageBox.information(self, "Deactivated", f"Rule {self.selected_rule_id} => INACTIVE.")
             self.load_rules()
         except Exception as ex:
             QMessageBox.critical(self, "Deactivate Error", str(ex))
 
-    def dryrun_single(self):
-        """
-        Perform advanced dry-run:
-          - Show # of impacted records
-          - Show up to 10 sample rows
-        """
+    # ----------------------------------------------------------------
+    # DRY RUN A SINGLE RULE
+    # ----------------------------------------------------------------
+    def dry_run_selected_rule(self):
         if not self.selected_rule_id:
-            QMessageBox.warning(self, "Dry‑Run", "No rule selected.")
+            QMessageBox.warning(self, "Dry Run", "No rule selected.")
             return
-        try:
-            c = self.connection.cursor()
-            c.execute("SELECT RULE_SQL FROM BRM_RULES WHERE RULE_ID=?", (self.selected_rule_id,))
-            row = c.fetchone()
-            if not row:
-                QMessageBox.warning(self, "Dry‑Run", f"Rule {self.selected_rule_id} not found in DB.")
-                return
+        ok, msg, rowcount, samples = run_single_rule_in_transaction(
+            self.connection,
+            self.selected_rule_id,
+            is_dry_run=True
+        )
+        if ok:
+            # Build a textual result
+            sample_text = ""
+            for row in samples:
+                sample_text += str(row) + "\n"
 
-            sql_text = row[0] or ""
-            if not sql_text.strip():
-                QMessageBox.information(self, "Dry‑Run", "No SQL => trivially pass. 0 rows impacted.")
-                return
+            full_msg = (f"DRY-RUN => SUCCESS\n"
+                        f"RuleID = {self.selected_rule_id}\n"
+                        f"RowCount = {rowcount}\n"
+                        f"\nSample Rows (up to 10):\n"
+                        f"{sample_text if sample_text else 'No rows returned'}")
 
-            ok, msg, rowcount, samples = dry_run_rule_sql_enhanced(self.connection, sql_text)
-            if ok:
-                # Format sample rows
-                sample_str = ""
-                for r in samples:
-                    sample_str += str(r) + "\n"
+            self.show_text_dialog("Dry-Run Result", full_msg)
+        else:
+            self.show_text_dialog("Dry-Run FAILED", f"{msg}\n(0 records)")
 
-                full_msg = (f"DRY-RUN => SUCCESS\n"
-                            f"RuleID = {self.selected_rule_id}\n"
-                            f"RowCount = {rowcount}\n"
-                            f"\nSample Rows (up to 10):\n{sample_str if sample_str else 'No rows returned.'}")
-                self.show_text_dialog("Dry‑Run Result", full_msg)
-            else:
-                # fail
-                self.show_text_dialog("Dry‑Run FAILED", f"{msg}\nNo records.")
-        except Exception as ex:
-            QMessageBox.critical(self, "Dry‑Run Error", str(ex))
-
-    def dryrun_group(self):
-        """
-        Prompt user for a group ID, then run a dry-run for each rule in that group.
-        Show # of impacted records and up to 10 sample rows for each rule that passes.
-        """
-        group_id, ok = QInputDialog.getInt(self, "Group Dry‑Run", "Enter custom group ID:")
-        if not ok:
+    # ----------------------------------------------------------------
+    # BFS EXECUTION
+    # ----------------------------------------------------------------
+    def run_bfs(self):
+        if not self.selected_rule_id:
+            QMessageBox.warning(self, "Run BFS", "No rule selected.")
             return
-        try:
-            passed, failed = simulate_custom_group_rules_enhanced(self.connection, group_id)
-            # Build a result string
-            msg_parts = []
-            msg_parts.append(f"GROUP {group_id} DRY-RUN RESULTS:\n")
-            if passed:
-                msg_parts.append("== PASSED ==\n")
-                for (rid, rcount, samples) in passed:
-                    msg_parts.append(f"Rule {rid} => rowcount={rcount}")
-                    if samples:
-                        msg_parts.append(f"  SampleRows (up to 10):")
-                        for sr in samples:
-                            msg_parts.append(f"     {sr}")
-                    msg_parts.append("")  # blank line
-            else:
-                msg_parts.append("No rules passed.\n")
+        executed, skipped = run_chain_bfs_from_rule(self.connection, self.selected_rule_id)
 
-            if failed:
-                msg_parts.append("== FAILED ==\n")
-                for (rid, err) in failed:
-                    msg_parts.append(f"Rule {rid} => error: {err}")
-                msg_parts.append("")
+        msg = (f"BFS Execution starting at Rule {self.selected_rule_id}:\n\n"
+               f"Executed: {executed}\n"
+               f"Skipped : {skipped}")
+        self.show_text_dialog("BFS Execution", msg)
 
-            final_msg = "\n".join(msg_parts)
-            self.show_text_dialog("Group Dry‑Run Result", final_msg)
-        except Exception as ex:
-            QMessageBox.critical(self, "Group Dry‑Run Error", str(ex))
-
-    def on_force_unlock(self, rule_id):
-        """
-        Called when Admin clicks 'Force Unlock' for a locked rule in the table.
-        """
+    # ----------------------------------------------------------------
+    # FORCE UNLOCK (ADMIN)
+    # ----------------------------------------------------------------
+    def force_unlock(self, rule_id):
         confirm = QMessageBox.question(self, "Force Unlock",
-                                       f"Are you sure you want to force unlock Rule {rule_id}?",
+                                       f"Force unlock rule {rule_id}?",
                                        QMessageBox.Yes | QMessageBox.No)
         if confirm != QMessageBox.Yes:
             return
-        ok, msg = force_unlock_rule(self.connection, rule_id, admin_user="Admin")
-        if ok:
-            QMessageBox.information(self, "Force Unlock", msg)
-        else:
-            QMessageBox.critical(self, "Force Unlock", msg)
-        self.load_rules()
 
+        try:
+            c = self.connection.cursor()
+            c.execute("DELETE FROM BRM_RULE_LOCKS WHERE RULE_ID=? AND ACTIVE_LOCK=1", (rule_id,))
+            self.connection.commit()
+            QMessageBox.information(self, "Unlocked", f"Rule {rule_id} forcibly unlocked.")
+            self.load_rules()
+        except Exception as ex:
+            QMessageBox.critical(self, "Force Unlock Error", str(ex))
+
+    # ----------------------------------------------------------------
+    # UTILITY: SHOW TEXT DIALOG
+    # ----------------------------------------------------------------
     def show_text_dialog(self, title, text):
-
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
         dlg.resize(600, 400)
-        layout = QVBoxLayout(dlg)
+
+        vlayout = QVBoxLayout(dlg)
         ptxt = QPlainTextEdit()
         ptxt.setReadOnly(True)
         ptxt.setPlainText(text)
-        layout.addWidget(ptxt)
+        vlayout.addWidget(ptxt)
+
         ok_btn = QPushButton("OK")
         ok_btn.clicked.connect(dlg.accept)
-        layout.addWidget(ok_btn)
+        vlayout.addWidget(ok_btn)
+
         dlg.exec_()
 
 # ---------------------- Scheduling Tab ----------------------
@@ -6945,7 +6937,7 @@ class PredictiveAnalyticsTab(QWidget):
             QMessageBox.critical(self, "Forecast Error", str(e))
 
 
-# ---------------------- Enhanced Lineage Analysis Tab ----------------------
+# ----------------------  Lineage Analysis Tab ----------------------
 class EnhancedLineageAnalysisTab(QWidget):
     """
     Provides an interactive lineage view with a button to view a textual representation.
@@ -6993,31 +6985,6 @@ class EnhancedLineageAnalysisTab(QWidget):
         vbox.addWidget(close_btn)
         dlg.exec_()
 
-
-# ---------------------- Admin Tab ----------------------
-class AdminTab(QWidget):
-
-    def __init__(self, connection, user_id, user_group, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.user_id = user_id
-        self.user_group = user_group
-        layout = QVBoxLayout(self)
-        if self.user_group != "Admin":
-            layout.addWidget(QLabel("Access Denied: Admin only."))
-            self.setLayout(layout)
-            return
-        self.inner_tabs = QTabWidget()
-        layout.addWidget(self.inner_tabs)
-        self.user_mgmt_tab = UserManagementTab(self.connection)
-        self.inner_tabs.addTab(self.user_mgmt_tab, "User Management")
-        self.group_mgmt_tab = GroupManagementTab(self.connection, self.user_id, self.user_group)
-        self.inner_tabs.addTab(self.group_mgmt_tab, "Group Management")
-        self.group_perm_tab = GroupPermissionsTab(self.connection)
-        self.inner_tabs.addTab(self.group_perm_tab, "Group Permissions")
-        self.ctrl_tables_tab = CtrlTablesTab(self.connection, self.user_group)
-        self.inner_tabs.addTab(self.ctrl_tables_tab, "Control Tables")
-        self.setLayout(layout)
 
 
 # ---------------------- Main Window ----------------------
@@ -7082,7 +7049,7 @@ class MainWindow(QMainWindow):
         self.predictive_tab = PredictiveAnalyticsTab(self.connection)
         self.tabs.addTab(self.predictive_tab, QIcon(), "Predictive Analytics")
         self.lineage_tab = EnhancedLineageAnalysisTab(self.connection)
-        self.tabs.addTab(self.lineage_tab, QIcon(), "Enhanced Lineage")
+        self.tabs.addTab(self.lineage_tab, QIcon(), "Lineage")
         self.help_tab = HelpFeedbackTab(self.connection)
         self.tabs.addTab(self.help_tab, QIcon(), "Help & Feedback")
         central_widget.setLayout(central_layout)
