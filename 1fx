@@ -1,57 +1,72 @@
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QFormLayout, QLineEdit, QPushButton, QMessageBox
-
-class ApproverAddTab(QWidget):
+def run_single_rule_in_transaction(conn, rule_info, is_dry_run=False):
     """
-    A widget that allows an admin to add a new approver.
-    Adjust the INSERT statement and field names to match your database schema.
+    Executes a single rule within a transaction.
+    If the rule's operation type is "DECISION_TABLE", it executes that logic.
+    Otherwise, it executes the SQL stored in RULE_SQL and checks whether the first column
+    of the first returned row equals 1 (PASS).
+    
+    Returns a tuple: (success_flag, message, record_count)
+    
+    For SELECT statements, record_count is determined from the fetched rows.
+    For DML statements (or if fetching fails), c.rowcount is used (with negative values reset to 0).
     """
-    def __init__(self, connection, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.init_ui()
+    # If the rule is a decision table, call that execution function.
+    op_type = rule_info.get("OPERATION_TYPE", "OTHER")
+    if op_type.upper() == "DECISION_TABLE":
+        dt_id = rule_info.get("DECISION_TABLE_ID")
+        if not dt_id:
+            return (False, "No DECISION_TABLE_ID provided", 0)
+        ok, msg, rec_count = execute_decision_table(conn, dt_id, dry_run=True)
+        return (ok, msg, rec_count)
 
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        form_layout = QFormLayout()
+    # Otherwise, use the SQL stored in RULE_SQL.
+    sql_text = rule_info.get("RULE_SQL") or ""
+    c = conn.cursor()
 
-        self.username_edit = QLineEdit()
-        form_layout.addRow("Username:", self.username_edit)
+    try:
+        c.execute("BEGIN TRANSACTION")
+    except Exception as ex:
+        logger.error(f"Error beginning transaction for rule {rule_info.get('RULE_ID')}: {ex}")
+        return (False, str(ex), 0)
 
-        self.group_edit = QLineEdit()
-        form_layout.addRow("Group:", self.group_edit)
+    success = False
+    msg = ""
+    rec_count = 0
 
-        self.email_edit = QLineEdit()
-        form_layout.addRow("Email:", self.email_edit)
-
-        layout.addLayout(form_layout)
-
-        add_button = QPushButton("Add Approver")
-        add_button.clicked.connect(self.add_approver)
-        layout.addWidget(add_button)
-
-        self.setLayout(layout)
-
-    def add_approver(self):
-        username = self.username_edit.text().strip()
-        group = self.group_edit.text().strip()
-        email = self.email_edit.text().strip()
-
-        if not username or not group:
-            QMessageBox.warning(self, "Input Error", "Username and Group are required.")
-            return
-
-        c = self.connection.cursor()
+    try:
+        c.execute(sql_text)
         try:
-            # Adjust the table and column names as needed.
-            c.execute("""
-                INSERT INTO APPROVERS (USERNAME, GROUP_NAME, EMAIL)
-                VALUES (?, ?, ?)
-            """, (username, group, email))
-            self.connection.commit()
-            QMessageBox.information(self, "Success", f"Approver '{username}' added successfully.")
-            # Clear fields after successful addition.
-            self.username_edit.clear()
-            self.group_edit.clear()
-            self.email_edit.clear()
-        except Exception as e:
-            QMessageBox.critical(self, "Error Adding Approver", str(e))
+            # Try to fetch rows (for SELECT queries)
+            rows = c.fetchall()
+            rec_count = len(rows)
+        except Exception:
+            # If fetchall() fails (common with DML statements), use rowcount.
+            rec_count = c.rowcount
+            if rec_count < 0:
+                rec_count = 0
+            rows = []
+
+        if rows:
+            # If rows are returned, assume the first value determines PASS.
+            val = rows[0][0]
+            success = (val == 1)
+            msg = f"Returned: {val}"
+        else:
+            # For statements that do not return rows, report the number of rows affected.
+            success = True
+            msg = f"No rows returned => PASS. Rows affected: {rec_count}"
+
+        # Roll back if it’s a dry run or the rule did not succeed; otherwise commit.
+        if is_dry_run or not success:
+            c.execute("ROLLBACK")
+        else:
+            c.execute("COMMIT")
+    except Exception as ex:
+        try:
+            c.execute("ROLLBACK")
+        except Exception:
+            pass
+        success = False
+        msg = str(ex)
+
+    return (success, msg, rec_count)
