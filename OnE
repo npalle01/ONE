@@ -1,16 +1,4 @@
 
-"""
-  • Centralized logging config with robust formatting and error reporting
-  • Enhanced EmailNotifier class with improved error handling
-  • DatabaseConnectionDialog with robust connection testing and user feedback
-  • Basic DB helpers (fetch, audit insertion) with advanced error handling
-  • LoginDialog (using plain-text password comparison as requested)
-  • A unified LockManager for rules with auto-expiry and forced unlock logic
-  • detect_operation_type: enhanced to remove comments/whitespace before determining type
-  • parse_sql_dependencies: advanced extraction of tables, columns, CTEs, and alias mapping
-  • OnboardingWizard: a fully implemented multi-step user guidance (no placeholders)
-  • sync_metadata_improved: comprehensive metadata synchronization with robust logging
-"""
 from datetime import datetime
 dt = datetime.now()
 formatted = dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -39,7 +27,7 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton, QHBoxLayout,
     QMessageBox, QComboBox, QPlainTextEdit, QCalendarWidget, QTimeEdit,
-    QFormLayout, QWidget, QCheckBox
+    QFormLayout, QWidget, QCheckBox, QButtonGroup
 )
 
 ###############################################################################
@@ -271,20 +259,15 @@ class CollaborationManager(QtCore.QObject):
             # For production, consider logging this error
             print(f"Error polling collaboration messages: {ex}")
 def run_chain_bfs_from_rule(conn, parent_rule_id):
-    """
-    Enhanced BFS that detects cycles and logs them.
-    If a cycle is detected, that branch is skipped, preventing infinite loops.
 
-    We still skip descendants on rule failure or for critical/global rules.
-    Now we also track 'in_stack' to detect cycles.
-    """
+
     adjacency, roots, parent_map = load_rule_relationships(conn)
     rule_lookup = get_all_rules_map(conn)
 
     executed = []
     skipped = set()
 
-    # We track visited + an "in_stack" set to detect cycles in BFS.
+
     visited = set()
     in_stack = set()
     queue = [parent_rule_id]
@@ -541,17 +524,6 @@ def detect_operation_type(sql_text: str) -> str:
 
 
 def parse_sql_dependencies(sql_text: str):
-    """
-    Use sqlparse to identify table references, columns, CTE usage, etc.
-    Enhanced:
-      - Handles 'MERGE' statements
-      - More robust capturing of top-level WITH clauses
-      - Additional error traps
-    Returns a dict with keys 'tables', 'cte_tables', 'alias_map', 'columns'.
-
-    NOTE: This is still a heuristic parser; advanced T-SQL or special syntax may
-    need further customization.
-    """
     try:
         statements = sqlparse.parse(sql_text)
     except Exception as ex:
@@ -3540,31 +3512,6 @@ def create_multistep_approvals(conn, rule_id, initiated_by):
         logger.error(f"Error creating multi‑step approvals for rule {rule_id}: {ex}")
         raise
 
-
-# End of PART 4
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""
-BRM TOOL – PART 5 of 8 (FINAL, REVISED + FULLY ENHANCED)
-Features:
- • MultiStepApprovalTab: Multi-level approvals with options to approve, reject, and forced unlock (admin only)
- • GlobalCriticalAdminTab: Admin-only interface for forced activation/deactivation and managing global-critical links
- • HierarchyViewTab: A drag-and-drop hierarchical view for groups and rules; updates DB on drop
- • EnhancedLineageGraphWidget: An advanced, interactive, MANTA-like lineage visualization using QGraphicsView.
-   - Uses a force-directed layout algorithm to position nodes.
-   - Supports zooming (via mouse wheel), panning, and dragging nodes.
-   - Nodes are color-coded based on rule status.
-"""
-
-import sys
-import math
-import json
-import logging
-from datetime import datetime
-from collections import defaultdict, deque
-
-from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt, QPointF, QTimer
 from PyQt5.QtGui import QPen, QBrush, QColor, QFont
 from PyQt5.QtWidgets import (
@@ -3573,166 +3520,6 @@ from PyQt5.QtWidgets import (
     QDialog, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QMenu, QInputDialog,
     QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsItem, QGraphicsTextItem
 )
-
-# Assumed imported from previous parts:
-#   insert_audit_log(conn, action, table_name, record_id, actor, old_data, new_data)
-#   LockManager (with lock_rule_for_edit and unlock_rule_for_edit)
-#   load_rule_relationships(conn), get_all_rules_map(conn), skip_all_descendants(start_id, adjacency, skipped)
-#   detect_operation_type(sql_text), parse_sql_dependencies(sql_text)
-#   run_data_validations(conn)
-#   create_multistep_approvals(conn, rule_id, initiated_by)
-# For brevity, these functions/classes are assumed available.
-
-###############################################################################
-# MULTI-STEP APPROVAL TAB
-###############################################################################
-class MultiStepApprovalTab(QWidget):
-    def __init__(self, connection, logged_in_username, user_group, parent=None):
-        super().__init__(parent)
-        self.connection = connection
-        self.logged_in_username = logged_in_username
-        self.user_group = user_group
-        layout = QVBoxLayout(self)
-        self.approvals_table = QTableWidget(0, 9)
-        self.approvals_table.setHorizontalHeaderLabels([
-            "RuleID", "GroupName", "RuleName", "Stage", "Approved?",
-            "Approve", "Reject", "LockStatus", "ForceUnlock"
-        ])
-        self.approvals_table.horizontalHeader().setStretchLastSection(True)
-        self.approvals_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.approvals_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.approvals_table)
-
-        btn_layout = QHBoxLayout()
-        refresh_btn = QPushButton("Refresh Approvals")
-        refresh_btn.clicked.connect(self.load_approvals)
-        btn_layout.addWidget(refresh_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        self.setLayout(layout)
-        self.load_approvals()
-
-    def load_approvals(self):
-        self.approvals_table.setRowCount(0)
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                SELECT A.RULE_ID, A.GROUP_NAME, R.RULE_NAME, A.APPROVAL_STAGE, A.APPROVED_FLAG, R.LOCKED_BY
-                FROM BRM_RULE_APPROVALS A
-                JOIN BRM_RULES R ON A.RULE_ID = R.RULE_ID
-                WHERE A.USERNAME=? AND A.APPROVED_FLAG=0
-                ORDER BY A.RULE_ID
-            """, (self.logged_in_username,))
-            rows = c.fetchall()
-
-            def get_min_stage(rule_id):
-                cur = self.connection.cursor()
-                cur.execute("""
-                    SELECT MIN(APPROVAL_STAGE)
-                    FROM BRM_RULE_APPROVALS
-                    WHERE RULE_ID=? AND APPROVED_FLAG=0
-                """, (rule_id,))
-                result = cur.fetchone()
-                return result[0] if result and result[0] is not None else None
-
-            filtered = [r for r in rows if r[3] == get_min_stage(r[0])]
-            self.approvals_table.setRowCount(len(filtered))
-            for i, row in enumerate(filtered):
-                rule_id, group_name, rule_name, stage, approved_flag, locked_by = row
-                self.approvals_table.setItem(i, 0, QTableWidgetItem(str(rule_id)))
-                self.approvals_table.setItem(i, 1, QTableWidgetItem(str(group_name)))
-                self.approvals_table.setItem(i, 2, QTableWidgetItem(str(rule_name)))
-                self.approvals_table.setItem(i, 3, QTableWidgetItem(str(stage)))
-                self.approvals_table.setItem(i, 4, QTableWidgetItem(str(approved_flag)))
-                approve_btn = QPushButton("Approve")
-                approve_btn.clicked.connect(lambda _, idx=i: self.do_approve(idx))
-                self.approvals_table.setCellWidget(i, 5, approve_btn)
-                reject_btn = QPushButton("Reject")
-                reject_btn.clicked.connect(lambda _, idx=i: self.do_reject(idx))
-                self.approvals_table.setCellWidget(i, 6, reject_btn)
-                lock_status = f"Locked by {locked_by}" if locked_by else "Unlocked"
-                self.approvals_table.setItem(i, 7, QTableWidgetItem(lock_status))
-                force_btn = QPushButton("ForceUnlock")
-                force_btn.setEnabled(self.user_group == "Admin")
-                force_btn.clicked.connect(lambda _, idx=i: self.do_forceunlock(idx))
-                self.approvals_table.setCellWidget(i, 8, force_btn)
-        except Exception as ex:
-            QMessageBox.critical(self, "Approval Load Error", str(ex))
-
-    def do_approve(self, row_index):
-        rule_id = int(self.approvals_table.item(row_index, 0).text())
-        group_name = self.approvals_table.item(row_index, 1).text()
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                UPDATE BRM_RULE_APPROVALS
-                SET APPROVED_FLAG=1, APPROVED_TIMESTAMP=GETDATE()
-                WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=? AND APPROVED_FLAG=0
-            """, (rule_id, group_name, self.logged_in_username))
-            cur = self.connection.cursor()
-            cur.execute("""
-                SELECT MIN(APPROVAL_STAGE)
-                FROM BRM_RULE_APPROVALS
-                WHERE RULE_ID=? AND APPROVED_FLAG=0
-            """, (rule_id,))
-            result = cur.fetchone()
-            if result is None or result[0] is None:
-                c.execute("""
-                    UPDATE BRM_RULES
-                    SET APPROVAL_STATUS='APPROVED', STATUS='ACTIVE', LIFECYCLE_STATE='ACTIVE'
-                    WHERE RULE_ID=?
-                """, (rule_id,))
-            else:
-                c.execute("""
-                    UPDATE BRM_RULES
-                    SET APPROVAL_STATUS='APPROVAL_IN_PROGRESS', STATUS='INACTIVE'
-                    WHERE RULE_ID=?
-                """, (rule_id,))
-            insert_audit_log(self.connection, "APPROVE", "BRM_RULE_APPROVALS", rule_id, self.logged_in_username, None, {"approved": True})
-            self.connection.commit()
-            QMessageBox.information(self, "Approved", f"Rule {rule_id} approved for current stage.")
-            self.load_approvals()
-        except Exception as ex:
-            QMessageBox.critical(self, "Approval Error", str(ex))
-
-    def do_reject(self, row_index):
-        rule_id = int(self.approvals_table.item(row_index, 0).text())
-        group_name = self.approvals_table.item(row_index, 1).text()
-        confirm = QMessageBox.question(self, "Confirm Reject", f"Reject rule {rule_id}?")
-        if confirm != QMessageBox.Yes:
-            return
-        c = self.connection.cursor()
-        try:
-            c.execute("""
-                UPDATE BRM_RULE_APPROVALS
-                SET APPROVED_FLAG=2, APPROVED_TIMESTAMP=GETDATE()
-                WHERE RULE_ID=? AND GROUP_NAME=? AND USERNAME=? AND APPROVED_FLAG=0
-            """, (rule_id, group_name, self.logged_in_username))
-            c.execute("""
-                UPDATE BRM_RULES
-                SET APPROVAL_STATUS='REJECTED', STATUS='INACTIVE', LIFECYCLE_STATE='INACTIVE'
-                WHERE RULE_ID=?
-            """, (rule_id,))
-            insert_audit_log(self.connection, "REJECT", "BRM_RULE_APPROVALS", rule_id, self.logged_in_username, None, {"rejected": True})
-            self.connection.commit()
-            QMessageBox.information(self, "Rejected", f"Rule {rule_id} rejected.")
-            self.load_approvals()
-        except Exception as ex:
-            QMessageBox.critical(self, "Rejection Error", str(ex))
-
-    def do_forceunlock(self, row_index):
-        if self.user_group != "Admin":
-            return
-        rule_id = int(self.approvals_table.item(row_index, 0).text())
-        c = self.connection.cursor()
-        try:
-            c.execute("DELETE FROM BRM_RULE_LOCKS WHERE RULE_ID=? AND ACTIVE_LOCK=1", (rule_id,))
-            insert_audit_log(self.connection, "FORCE_UNLOCK", "BRM_RULE_LOCKS", rule_id, "Admin", None, {"forced": True})
-            self.connection.commit()
-            QMessageBox.information(self, "Force Unlock", f"Rule {rule_id} forcibly unlocked.")
-            self.load_approvals()
-        except Exception as ex:
-            QMessageBox.critical(self, "Force Unlock Error", str(ex))
 
 ###############################################################################
 # GLOBAL CRITICAL ADMIN TAB
@@ -6164,6 +5951,30 @@ class BusinessRulesTab(QWidget):
         deactivate_btn.clicked.connect(self.deactivate_rule)
         toolbar_layout.addWidget(deactivate_btn)
 
+        # --- New: Radio Buttons for Execution Mode ---
+        self.dryrun_radio = QRadioButton("Dry‑Run")
+        self.real_run_radio = QRadioButton("Real Run")
+        # Set default selection
+        self.dryrun_radio.setChecked(True)
+        # Group the radio buttons so that only one can be selected
+        self.exec_mode_group = QButtonGroup(self)
+        self.exec_mode_group.addButton(self.dryrun_radio)
+        self.exec_mode_group.addButton(self.real_run_radio)
+        toolbar_layout.addWidget(self.dryrun_radio)
+        toolbar_layout.addWidget(self.real_run_radio)
+        # ------------------------------------------------
+
+        execute_rule_btn = QPushButton("Execute Rule")
+        execute_rule_btn.clicked.connect(self.run_selected_rule)
+        toolbar_layout.addWidget(execute_rule_btn)
+
+        group_run_btn = QPushButton("Run (Group)")
+        group_run_btn.clicked.connect(self.dryrun_group)
+        toolbar_layout.addWidget(group_run_btn)
+
+        toolbar_layout.addStretch()
+        main_layout.addLayout(toolbar_layout)
+
         single_dryrun_btn = QPushButton("Dry‑Run (Single)")
         single_dryrun_btn.clicked.connect(self.dryrun_single)
         toolbar_layout.addWidget(single_dryrun_btn)
@@ -6194,6 +6005,33 @@ class BusinessRulesTab(QWidget):
 
         self.setLayout(main_layout)
         self.load_rules()
+    def run_selected_rule(self):
+        if not self.selected_rule_id:
+            QMessageBox.warning(self, "Run Rule", "No rule selected.")
+            return
+
+        # Check the selected execution mode from radio buttons
+        if self.dryrun_radio.isChecked():
+            # Call the dry-run function
+            self.show_dryrun_result(self.selected_rule_id)
+        else:
+            # Call the actual execution function (you'd have to implement this)
+            self.execute_rule(self.selected_rule_id)
+
+    def execute_rule(self, rule_id):
+        # Example placeholder for actual rule execution logic.
+        try:
+            c = self.connection.cursor()
+            c.execute("SELECT RULE_SQL, OPERATION_TYPE FROM BRM_RULES WHERE RULE_ID=?", (rule_id,))
+            row = c.fetchone()
+            if not row:
+                QMessageBox.warning(self, "Run Rule", "Rule not found.")
+                return
+            sql_text, op_type = row
+            # Implement real execution logic here...
+            QMessageBox.information(self, "Run Rule", f"Real execution for Rule {rule_id} invoked.")
+        except Exception as e:
+            QMessageBox.critical(self, "Execution Error", str(e))
 
     def load_rules(self):
         """Loads rules from BRM_RULES plus the new multi-step approval column."""
@@ -6337,17 +6175,32 @@ class BusinessRulesTab(QWidget):
             self.selected_rule_id = None
 
     def add_rule(self):
-        QMessageBox.information(self, "Add Rule", "Add Rule functionality invoked.")
-        # Hook to your actual add-rule logic
-        self.load_rules()
+
+        editor = RuleEditorDialog(self.connection, self.user_group, rule_data=None)
+        if editor.exec_() == QDialog.Accepted:
+
+            self.load_rules()
 
     def edit_rule(self):
         if not self.selected_rule_id:
             QMessageBox.warning(self, "Edit Rule", "No rule selected.")
             return
-        QMessageBox.information(self, "Edit Rule", f"Edit Rule {self.selected_rule_id} invoked.")
-        # Hook to your actual edit-rule logic
-        self.load_rules()
+
+        c = self.connection.cursor()
+        c.execute("SELECT * FROM BRM_RULES WHERE RULE_ID=?", (self.selected_rule_id,))
+        row = c.fetchone()
+        if not row:
+            QMessageBox.warning(self, "Edit Rule", "Selected rule not found in the database.")
+            return
+        # Build a dictionary mapping column names to values
+        colnames = [desc[0] for desc in c.description]
+        rule_data = dict(zip(colnames, row))
+
+        # Open the rule editor dialog pre-populated with the existing data
+        editor = RuleEditorDialog(self.connection, self.user_group, rule_data)
+        if editor.exec_() == QDialog.Accepted:
+            # After a successful edit, refresh the rules list
+            self.load_rules()
 
     def delete_rule(self):
         if not self.selected_rule_id:
@@ -7189,9 +7042,9 @@ class EnhancedLineageAnalysisTab(QWidget):
         filter_layout.addStretch()
         layout.addLayout(filter_layout)
         # For demonstration, we use a plain text area to represent the graph
-        self.lineage_view = QPlainTextEdit("Lineage Graph Visualization (Graphical view would be here)")
-        self.lineage_view.setReadOnly(True)
-        layout.addWidget(self.lineage_view)
+        self.graph_widget = EnhancedLineageGraphWidget(self.connection)
+        layout.addWidget(self.graph_widget)
+
         self.setLayout(layout)
 
     def view_textual_lineage(self):
