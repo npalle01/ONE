@@ -1,0 +1,930 @@
+# app.py
+# Enterprise GL Data Mart Prototype (Streamlit)
+# Covers: FR2590, Y-9C, FR Y-9C (via Y-9C), BCBS239 (controls/lineage), CCAR, CECL/ACL, ERA, STARE
+# Run:
+#   pip install streamlit pandas numpy
+#   streamlit run app.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, date, timedelta
+
+st.set_page_config(
+    page_title="Enterprise GL Data Mart | Recon & Reg Reporting",
+    page_icon="🏦",
+    layout="wide",
+)
+
+# ---------------------------
+# Theme / Styling (futuristic)
+# ---------------------------
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 1rem; padding-bottom: 2rem;}
+      div[data-testid="stMetricValue"] {font-size: 1.6rem;}
+      .gl-card {
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 16px;
+        padding: 14px 16px;
+        background: linear-gradient(180deg, rgba(30,30,40,0.35), rgba(10,10,15,0.25));
+        box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      }
+      .tiny {opacity: 0.72; font-size: 12px;}
+      .tag {
+        display:inline-block; padding: 4px 10px; border-radius: 999px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.03);
+        font-size: 12px; margin-right: 8px;
+      }
+      .status-ok {color:#57d38c;}
+      .status-warn {color:#f6c343;}
+      .status-bad {color:#ff5c7a;}
+      .table-small {font-size: 12px;}
+      .stDataFrame {border-radius: 14px; overflow: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------
+# Utilities
+# ---------------------------
+def money(x):
+    return f"{x:,.2f}"
+
+def pct(x):
+    return f"{x*100:.1f}%"
+
+def hash_id(prefix="BRK"):
+    return f"{prefix}-{np.random.randint(10000, 99999)}"
+
+def severity_from_amt(amt, materiality=1_000_000):
+    a = abs(float(amt))
+    if a >= materiality:
+        return "MATERIAL"
+    if a >= materiality * 0.25:
+        return "HIGH"
+    if a >= materiality * 0.10:
+        return "MEDIUM"
+    return "LOW"
+
+# ---------------------------
+# Embedded Prototype Data
+# ---------------------------
+def seed_data():
+    # Dimensions
+    entities = ["US_HOLDCO", "US_BANK", "UK_BRANCH"]
+    books = ["GAAP", "STAT"]
+    currencies = ["USD", "GBP"]
+    products = ["LOANS", "DEPOSITS", "TRADING", "TREASURY"]
+    cost_centers = ["CC100", "CC200", "CC300"]
+    accounts = [
+        ("100100", "Cash & Due From Banks"),
+        ("120200", "Loans - HFI"),
+        ("200100", "Deposits"),
+        ("310000", "Trading Assets"),
+        ("510000", "Interest Income"),
+        ("610000", "Interest Expense"),
+        ("710000", "Provision for Credit Losses"),
+    ]
+
+    # As-of dates
+    asof = date(2026, 1, 8)
+    prior = asof - timedelta(days=31)
+
+    # GL balances (daily snapshot)
+    rows = []
+    rng = np.random.default_rng(7)
+    for d in [prior, asof]:
+        for le in entities:
+            for book in books:
+                for ccy in currencies:
+                    for acc, acc_name in accounts:
+                        for prod in products:
+                            base = rng.normal(0, 1)
+                            scale = {
+                                "100100": 2.2e9,
+                                "120200": 6.8e9,
+                                "200100": 7.1e9,
+                                "310000": 1.9e9,
+                                "510000": 0.45e9,
+                                "610000": 0.25e9,
+                                "710000": 0.12e9,
+                            }[acc]
+                            # Some structural differences by entity/product
+                            le_mult = {"US_HOLDCO": 1.0, "US_BANK": 0.9, "UK_BRANCH": 0.35}[le]
+                            prod_mult = {"LOANS": 1.1, "DEPOSITS": 0.95, "TRADING": 1.0, "TREASURY": 0.7}[prod]
+                            book_mult = {"GAAP": 1.0, "STAT": 0.8}[book]
+                            ccy_mult = {"USD": 1.0, "GBP": 0.28}[ccy]
+
+                            amt = (base * 0.015 + 1.0) * scale * le_mult * prod_mult * book_mult * ccy_mult
+
+                            # add period drift
+                            drift = 1.0 if d == prior else (1.0 + rng.normal(0.01, 0.006))
+                            amt *= drift
+
+                            rows.append(
+                                dict(
+                                    as_of=d,
+                                    legal_entity=le,
+                                    book=book,
+                                    ccy=ccy,
+                                    account=acc,
+                                    account_name=acc_name,
+                                    product=prod,
+                                    gl_amount=float(amt),
+                                )
+                            )
+    gl = pd.DataFrame(rows)
+
+    # SOR balances (subledger/source of record) that should reconcile to GL
+    # We'll intentionally introduce breaks for demonstration.
+    sor = gl.copy()
+    sor = sor.rename(columns={"gl_amount": "sor_amount"})
+    # inject breaks on asof date: few accounts/products drift
+    mask_asof = sor["as_of"] == asof
+    bump = np.where(
+        (sor["account"].isin(["120200", "200100"])) & (sor["product"].isin(["LOANS", "DEPOSITS"])) & mask_asof,
+        1.0 + rng.normal(0.002, 0.001, size=len(sor)),
+        1.0
+    )
+    sor.loc[mask_asof, "sor_amount"] = sor.loc[mask_asof, "sor_amount"] * bump
+    # A missing feed simulation: UK_BRANCH TRADING on 310000 for asof is under-reported
+    miss_mask = (sor["as_of"] == asof) & (sor["legal_entity"] == "UK_BRANCH") & (sor["product"] == "TRADING") & (sor["account"] == "310000")
+    sor.loc[miss_mask, "sor_amount"] = sor.loc[miss_mask, "sor_amount"] * 0.92
+
+    # CRRT aggregates (e.g., standardized risk/treasury/finance layer)
+    crrt = gl.groupby(["as_of", "legal_entity", "book", "ccy", "account"]).agg(
+        crrt_amount=("gl_amount", "sum")
+    ).reset_index()
+    # CR360 curated layer (reg-ready), with small transformation differences
+    cr360 = crrt.copy()
+    cr360["cr360_amount"] = cr360["crrt_amount"] * (1.0 + rng.normal(0.0008, 0.0005, size=len(cr360)))
+
+    # Feed health logs
+    feed_sources = [
+        ("GL_CORE", "GL"),
+        ("SUBLEDGER_SOR", "SOR"),
+        ("CRRT_PIPE", "CRRT"),
+        ("CR360_PIPE", "CR360"),
+        ("ERA_SCCL", "ERA"),
+        ("STARE_FORECAST", "STARE"),
+    ]
+    feed_rows = []
+    for src, layer in feed_sources:
+        for d in [prior, asof]:
+            status = "SUCCESS"
+            latency_min = int(abs(rng.normal(18, 9)))
+            recs = int(abs(rng.normal(120000, 15000)))
+            rejects = int(abs(rng.normal(180, 70)))
+            if src == "STARE_FORECAST" and d == asof:
+                status = "LATE"
+                latency_min += 120
+            if src == "SUBLEDGER_SOR" and d == asof:
+                rejects += 420
+            feed_rows.append(
+                dict(
+                    as_of=d,
+                    source=src,
+                    layer=layer,
+                    status=status,
+                    latency_min=latency_min,
+                    records=recs,
+                    rejects=rejects,
+                    control_total=float(abs(rng.normal(1.8e10, 3.5e9))),
+                    run_id=f"RUN-{src}-{d.strftime('%Y%m%d')}",
+                )
+            )
+    feed = pd.DataFrame(feed_rows)
+
+    # Mapping: report lines to accounts (simplified)
+    mapping_rows = [
+        # FR2590 (Liquidity / funding style simplified)
+        ("FR2590", "L1", "Cash & Central Bank", ["100100"]),
+        ("FR2590", "L2", "Loans Outstanding", ["120200"]),
+        ("FR2590", "L3", "Trading Assets", ["310000"]),
+        ("FR2590", "L4", "Deposits", ["200100"]),
+        # Y-9C simplified
+        ("Y-9C", "HC-A1", "Cash and balances due", ["100100"]),
+        ("Y-9C", "HC-C1", "Loans and leases", ["120200"]),
+        ("Y-9C", "HC-L1", "Deposits", ["200100"]),
+        ("Y-9C", "HC-B1", "Trading assets", ["310000"]),
+        # CCAR / STARE / CECL / ACL views (internal)
+        ("CCAR", "P&L1", "Net Interest Income", ["510000", "610000"]),
+        ("CECL/ACL", "ACL1", "Provision / ACL expense", ["710000"]),
+        ("STARE", "S1", "Forecast Loans", ["120200"]),
+        ("ERA", "E1", "SCCL Recon Coverage", ["120200", "200100", "310000"]),
+    ]
+    rep_map = []
+    for rep, line, desc, accs in mapping_rows:
+        for a in accs:
+            rep_map.append(dict(report=rep, report_line=line, line_desc=desc, account=a))
+    map_df = pd.DataFrame(rep_map)
+
+    # Controls / BCBS239-style rule catalog (simplified)
+    rules = pd.DataFrame([
+        {"rule_id":"DQ-001", "rule_name":"Completeness - Required dimensions present", "severity":"HIGH", "owner":"Data Steward"},
+        {"rule_id":"DQ-002", "rule_name":"Balance - Assets = Liabilities + Equity (entity/book)", "severity":"MATERIAL", "owner":"Controller"},
+        {"rule_id":"DQ-003", "rule_name":"Timeliness - Feeds within SLA", "severity":"MEDIUM", "owner":"Ops"},
+        {"rule_id":"DQ-004", "rule_name":"Recon - GL vs SOR within tolerance", "severity":"MATERIAL", "owner":"Recon Lead"},
+        {"rule_id":"DQ-005", "rule_name":"Mapping - Report line coverage >= 99%", "severity":"HIGH", "owner":"Report Owner"},
+    ])
+
+    return {
+        "asof": asof,
+        "prior": prior,
+        "gl": gl,
+        "sor": sor,
+        "crrt": crrt,
+        "cr360": cr360,
+        "feed": feed,
+        "map": map_df,
+        "rules": rules,
+    }
+
+if "data" not in st.session_state:
+    st.session_state.data = seed_data()
+
+if "breaks" not in st.session_state:
+    st.session_state.breaks = pd.DataFrame(
+        columns=[
+            "break_id","created_ts","as_of","recon_type","legal_entity","book","ccy",
+            "account","product","gl_amount","other_amount","variance","severity",
+            "root_cause","owner","status","sla_due","notes","evidence_ref"
+        ]
+    )
+
+if "audit_log" not in st.session_state:
+    st.session_state.audit_log = pd.DataFrame(
+        columns=["ts","user","action","object_type","object_id","details"]
+    )
+
+# ---------------------------
+# Sidebar: global selectors
+# ---------------------------
+data = st.session_state.data
+
+st.sidebar.markdown("### 🏦 Enterprise GL Platform")
+st.sidebar.markdown('<span class="tag">Futuristic</span><span class="tag">BCBS239</span><span class="tag">Reg-ready</span>', unsafe_allow_html=True)
+
+pages = [
+    "1. Landing Dashboard",
+    "2. Feed Health & Ingestion",
+    "3. GL Explorer",
+    "4. Reconciliation Workspace",
+    "5. Variance Management",
+    "6. Regulatory Reporting",
+    "7. Lineage & Mapping (BCBS239)",
+    "8. Audit & Evidence Vault",
+    "9. Admin (Thresholds/RBAC)",
+]
+page = st.sidebar.radio("Navigate", pages, index=0)
+
+st.sidebar.divider()
+as_of = st.sidebar.selectbox("As-of Date", sorted(data["gl"]["as_of"].unique()), index=1)
+legal_entity = st.sidebar.selectbox("Legal Entity", sorted(data["gl"]["legal_entity"].unique()), index=0)
+book = st.sidebar.selectbox("Book", sorted(data["gl"]["book"].unique()), index=0)
+ccy = st.sidebar.selectbox("Currency", sorted(data["gl"]["ccy"].unique()), index=0)
+
+st.sidebar.divider()
+current_user = st.sidebar.text_input("User", value="NAVEEN.P (Prototype)")
+materiality = st.sidebar.number_input("Materiality Threshold (USD equiv)", min_value=100000, max_value=25000000, value=1000000, step=100000)
+
+st.sidebar.markdown("<div class='tiny'>Tip: Switch pages from the left navigation. Every number is drillable.</div>", unsafe_allow_html=True)
+
+# ---------------------------
+# Core filters
+# ---------------------------
+gl = data["gl"]
+sor = data["sor"]
+crrt = data["crrt"]
+cr360 = data["cr360"]
+feed = data["feed"]
+map_df = data["map"]
+rules = data["rules"]
+
+gl_f = gl[(gl["as_of"]==as_of) & (gl["legal_entity"]==legal_entity) & (gl["book"]==book) & (gl["ccy"]==ccy)].copy()
+gl_p = gl[(gl["as_of"]==data["prior"]) & (gl["legal_entity"]==legal_entity) & (gl["book"]==book) & (gl["ccy"]==ccy)].copy()
+
+sor_f = sor[(sor["as_of"]==as_of) & (sor["legal_entity"]==legal_entity) & (sor["book"]==book) & (sor["ccy"]==ccy)].copy()
+
+# ---------------------------
+# Recon calculations
+# ---------------------------
+def recon_gl_vs_sor(gl_df, sor_df):
+    key = ["as_of","legal_entity","book","ccy","account","account_name","product"]
+    g = gl_df[key + ["gl_amount"]].copy()
+    o = sor_df[key + ["sor_amount"]].copy()
+    m = g.merge(o, on=key, how="left")
+    m["sor_amount"] = m["sor_amount"].fillna(0.0)
+    m["variance"] = m["gl_amount"] - m["sor_amount"]
+    m["abs_var"] = m["variance"].abs()
+    return m
+
+def recon_crrt_vs_cr360(crrt_df, cr360_df):
+    key = ["as_of","legal_entity","book","ccy","account"]
+    m = crrt_df.merge(cr360_df[key+["cr360_amount"]], on=key, how="left")
+    m["cr360_amount"] = m["cr360_amount"].fillna(0.0)
+    m["variance"] = m["crrt_amount"] - m["cr360_amount"]
+    m["abs_var"] = m["variance"].abs()
+    return m
+
+# ---------------------------
+# Audit helper
+# ---------------------------
+def log_action(action, object_type, object_id, details):
+    new = pd.DataFrame([{
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user": current_user,
+        "action": action,
+        "object_type": object_type,
+        "object_id": object_id,
+        "details": details
+    }])
+    st.session_state.audit_log = pd.concat([st.session_state.audit_log, new], ignore_index=True)
+
+# =========================================================
+# PAGE 1: Landing Dashboard
+# =========================================================
+if page.startswith("1."):
+    st.markdown("## ✨ Landing Dashboard")
+    st.markdown("<div class='tiny'>Executive + Ops view of readiness, breaks, SLAs and certifiability.</div>", unsafe_allow_html=True)
+
+    # KPIs
+    recon = recon_gl_vs_sor(gl_f, sor_f)
+    breaks = recon[recon["abs_var"] > 0].copy()
+    material_breaks = breaks[breaks["abs_var"] >= materiality]
+
+    feeds_today = feed[(feed["as_of"]==as_of)]
+    late_failed = feeds_today[feeds_today["status"].isin(["LATE","FAILED"])]
+
+    completed_pct = 1.0 - (len(breaks[breaks["abs_var"] > materiality*0.001]) / max(len(recon),1))
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Material Breaks", f"{len(material_breaks)}", help="Breaks >= materiality threshold")
+    c2.metric("Open Breaks", f"{len(breaks)}", help="All non-zero variances (demo)")
+    c3.metric("Feeds Late/Failed", f"{len(late_failed)}")
+    c4.metric("Recon Completion", pct(max(min(completed_pct,1),0)))
+    c5.metric("Certifiable Reports", "3/6", help="Prototype shows partial readiness scoring")
+
+    st.divider()
+
+    left, right = st.columns([1.2, 1.0])
+
+    with left:
+        st.markdown("### 🔥 Recon Status Heatmap (by Product × Account)")
+        pivot = recon.pivot_table(index="product", columns="account", values="abs_var", aggfunc="sum").fillna(0)
+        st.dataframe(
+            pivot.style.format("{:,.0f}"),
+            use_container_width=True,
+            height=320
+        )
+
+        st.markdown("### 🧭 Top Breaks (Drillable)")
+        top = recon.sort_values("abs_var", ascending=False).head(12)[
+            ["product","account","account_name","gl_amount","sor_amount","variance","abs_var"]
+        ]
+        st.dataframe(
+            top.style.format({
+                "gl_amount": "{:,.0f}",
+                "sor_amount": "{:,.0f}",
+                "variance": "{:,.0f}",
+                "abs_var": "{:,.0f}",
+            }),
+            use_container_width=True,
+            height=340
+        )
+
+    with right:
+        st.markdown("### 📡 Feed Health Snapshot")
+        ft = feeds_today[["source","layer","status","latency_min","records","rejects","run_id"]].copy()
+        st.dataframe(ft, use_container_width=True, height=220)
+
+        st.markdown("### 🧾 Report Readiness (Prototype)")
+        readiness = pd.DataFrame([
+            {"Report":"FR2590","Recon Complete":"✅" if len(material_breaks) < 8 else "⚠️","DQ Passed":"⚠️","Approvals":"⏳","Status":"IN PROGRESS"},
+            {"Report":"Y-9C","Recon Complete":"✅","DQ Passed":"✅","Approvals":"⏳","Status":"IN PROGRESS"},
+            {"Report":"FR Y (Other)","Recon Complete":"⚠️","DQ Passed":"⚠️","Approvals":"⏳","Status":"AT RISK"},
+            {"Report":"CCAR","Recon Complete":"✅","DQ Passed":"✅","Approvals":"✅","Status":"READY"},
+            {"Report":"CECL/ACL","Recon Complete":"✅","DQ Passed":"✅","Approvals":"⏳","Status":"IN PROGRESS"},
+            {"Report":"STARE / ERA","Recon Complete":"⚠️","DQ Passed":"⚠️","Approvals":"⏳","Status":"AT RISK"},
+        ])
+        st.dataframe(readiness, use_container_width=True, height=260)
+
+        st.markdown("### 🧩 Quick Actions")
+        if st.button("Create Break for Largest Variance"):
+            row = recon.sort_values("abs_var", ascending=False).iloc[0]
+            bid = hash_id("BRK")
+            new_break = pd.DataFrame([{
+                "break_id": bid,
+                "created_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "as_of": row["as_of"],
+                "recon_type": "GL vs SOR",
+                "legal_entity": legal_entity,
+                "book": book,
+                "ccy": ccy,
+                "account": row["account"],
+                "product": row["product"],
+                "gl_amount": row["gl_amount"],
+                "other_amount": row["sor_amount"],
+                "variance": row["variance"],
+                "severity": severity_from_amt(row["variance"], materiality),
+                "root_cause": "UNCLASSIFIED",
+                "owner": "Recon Analyst",
+                "status": "OPEN",
+                "sla_due": (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d"),
+                "notes": "Auto-created from dashboard action",
+                "evidence_ref": ""
+            }])
+            st.session_state.breaks = pd.concat([st.session_state.breaks, new_break], ignore_index=True)
+            log_action("CREATE", "BREAK", bid, f"Created from dashboard for account={row['account']} product={row['product']}")
+            st.success(f"Break created: {bid}")
+
+# =========================================================
+# PAGE 2: Feed Health & Ingestion
+# =========================================================
+elif page.startswith("2."):
+    st.markdown("## 📡 Feed Health & Ingestion Control")
+    st.markdown("<div class='tiny'>BCBS239 timeliness & completeness evidence. Drill into rejects and rerun controls.</div>", unsafe_allow_html=True)
+
+    f = feed[feed["as_of"]==as_of].copy()
+    c1, c2 = st.columns([1.3, 0.7])
+    with c1:
+        st.markdown("### Feed Monitor")
+        st.dataframe(f, use_container_width=True, height=320)
+
+        st.markdown("### Reject Samples (Prototype)")
+        # fake reject rows
+        rej = pd.DataFrame({
+            "source": np.random.choice(f["source"], 30),
+            "error_code": np.random.choice(["MISSING_DIM","INVALID_ACCOUNT","BAD_CCY","DUP_KEY","CONTROL_MISMATCH"], 30),
+            "sample_key": [f"K{np.random.randint(100000,999999)}" for _ in range(30)],
+            "detail": np.random.choice([
+                "Missing cost_center", "Account not in COA", "Currency mismatch", "Duplicate reference id", "Control total variance"
+            ], 30),
+        })
+        st.dataframe(rej, use_container_width=True, height=260)
+
+    with c2:
+        st.markdown("### Controls")
+        chosen = st.selectbox("Select feed", f["source"].tolist())
+        st.write("Selected:", chosen)
+
+        if st.button("▶ Re-run Ingestion"):
+            log_action("RERUN", "FEED", chosen, f"Rerun requested for {chosen} as_of={as_of}")
+            st.success("Rerun triggered (prototype log only).")
+
+        if st.button("📝 Create Incident / Break"):
+            bid = hash_id("INC")
+            log_action("CREATE", "INCIDENT", bid, f"Incident for feed={chosen} as_of={as_of}")
+            st.success(f"Incident created: {bid}")
+
+        st.divider()
+        st.markdown("### BCBS239 Evidence")
+        st.dataframe(rules, use_container_width=True, height=240)
+
+# =========================================================
+# PAGE 3: GL Explorer
+# =========================================================
+elif page.startswith("3."):
+    st.markdown("## 🔎 GL Explorer")
+    st.markdown("<div class='tiny'>Explore balances by hierarchy and drill to dimensions. Prototype uses embedded balances.</div>", unsafe_allow_html=True)
+
+    q = st.text_input("Search Account / Name (e.g., 120200 or Loans)", value="120200")
+    df = gl_f.copy()
+    if q.strip():
+        qq = q.strip().lower()
+        df = df[
+            df["account"].str.contains(qq, case=False) |
+            df["account_name"].str.lower().str.contains(qq)
+        ]
+
+    c1, c2 = st.columns([1.25, 0.75])
+    with c1:
+        st.markdown("### Balances (Trial Balance Style)")
+        tb = df.groupby(["account","account_name","product"]).agg(gl_amount=("gl_amount","sum")).reset_index()
+        st.dataframe(tb.sort_values(["account","product"]), use_container_width=True, height=520)
+
+    with c2:
+        st.markdown("### Context Pane")
+        if len(tb) > 0:
+            sel = st.selectbox("Pick a row", tb.apply(lambda r: f"{r['account']} | {r['product']} | {r['account_name']}", axis=1).tolist())
+            acc = sel.split("|")[0].strip()
+            prod = sel.split("|")[1].strip()
+
+            amt = tb[(tb["account"]==acc) & (tb["product"]==prod)]["gl_amount"].sum()
+            st.metric("Selected Amount", money(amt))
+
+            st.markdown("**Report Mappings**")
+            mm = map_df[map_df["account"]==acc][["report","report_line","line_desc"]].drop_duplicates()
+            st.dataframe(mm, use_container_width=True, height=220)
+
+            st.markdown("**Lineage Snapshot**")
+            st.markdown(
+                f"""
+                <div class="gl-card">
+                  <div><span class="tag">Source</span> GL_CORE</div>
+                  <div><span class="tag">Canonical</span> Enterprise GL Mart</div>
+                  <div><span class="tag">Downstream</span> CRRT → CR360 → Reporting</div>
+                  <div class="tiny">Account {acc} / Product {prod} / Entity {legal_entity} / Book {book} / CCY {ccy}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+# =========================================================
+# PAGE 4: Reconciliation Workspace
+# =========================================================
+elif page.startswith("4."):
+    st.markdown("## 🧮 Reconciliation Workspace")
+    st.markdown("<div class='tiny'>Supports GL↔SOR, GL↔CRRT, CRRT↔CR360, Report Line↔Balance. Includes break workflow.</div>", unsafe_allow_html=True)
+
+    recon_tabs = st.tabs(["GL ↔ SOR", "CRRT ↔ CR360", "Breaks (Work Items)"])
+
+    # ---- GL vs SOR ----
+    with recon_tabs[0]:
+        recon = recon_gl_vs_sor(gl_f, sor_f)
+        tol = st.number_input("Tolerance (absolute)", min_value=0.0, value=float(materiality * 0.001), step=10000.0)
+
+        recon["status"] = np.where(recon["abs_var"] <= tol, "MATCH", "BREAK")
+        recon["severity"] = recon["variance"].apply(lambda x: severity_from_amt(x, materiality))
+        st.markdown("### Recon Results")
+        st.dataframe(
+            recon.sort_values("abs_var", ascending=False)[
+                ["product","account","account_name","gl_amount","sor_amount","variance","abs_var","status","severity"]
+            ].style.format({
+                "gl_amount":"{:,.0f}","sor_amount":"{:,.0f}","variance":"{:,.0f}","abs_var":"{:,.0f}"
+            }),
+            use_container_width=True,
+            height=420
+        )
+
+        c1, c2, c3 = st.columns([0.9, 0.9, 1.2])
+        with c1:
+            st.metric("Matches", int((recon["status"]=="MATCH").sum()))
+        with c2:
+            st.metric("Breaks", int((recon["status"]=="BREAK").sum()))
+        with c3:
+            st.metric("Largest Abs Variance", money(recon["abs_var"].max()))
+
+        st.markdown("### Create Breaks for Selected Rows")
+        sel_idx = st.multiselect(
+            "Select rows (by index) to create breaks",
+            options=recon.index.tolist(),
+            default=recon.sort_values("abs_var", ascending=False).head(3).index.tolist()
+        )
+        if st.button("➕ Create Selected Breaks"):
+            created = 0
+            for i in sel_idx:
+                r = recon.loc[i]
+                bid = hash_id("BRK")
+                new_break = pd.DataFrame([{
+                    "break_id": bid,
+                    "created_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "as_of": r["as_of"],
+                    "recon_type": "GL vs SOR",
+                    "legal_entity": legal_entity,
+                    "book": book,
+                    "ccy": ccy,
+                    "account": r["account"],
+                    "product": r["product"],
+                    "gl_amount": r["gl_amount"],
+                    "other_amount": r["sor_amount"],
+                    "variance": r["variance"],
+                    "severity": severity_from_amt(r["variance"], materiality),
+                    "root_cause": "UNCLASSIFIED",
+                    "owner": "Recon Analyst",
+                    "status": "OPEN",
+                    "sla_due": (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d"),
+                    "notes": "",
+                    "evidence_ref": ""
+                }])
+                st.session_state.breaks = pd.concat([st.session_state.breaks, new_break], ignore_index=True)
+                log_action("CREATE", "BREAK", bid, f"GLvsSOR break created for account={r['account']} product={r['product']}")
+                created += 1
+            st.success(f"Created {created} breaks.")
+
+    # ---- CRRT vs CR360 ----
+    with recon_tabs[1]:
+        crrt_f = crrt[(crrt["as_of"]==as_of) & (crrt["legal_entity"]==legal_entity) & (crrt["book"]==book) & (crrt["ccy"]==ccy)].copy()
+        cr360_f = cr360[(cr360["as_of"]==as_of) & (cr360["legal_entity"]==legal_entity) & (cr360["book"]==book) & (cr360["ccy"]==ccy)].copy()
+
+        m = recon_crrt_vs_cr360(crrt_f, cr360_f)
+        tol2 = st.number_input("Tolerance (CRRT↔CR360)", min_value=0.0, value=float(materiality * 0.0005), step=10000.0)
+        m["status"] = np.where(m["abs_var"] <= tol2, "MATCH", "BREAK")
+        st.markdown("### CRRT ↔ CR360 Results")
+        st.dataframe(
+            m.sort_values("abs_var", ascending=False)[
+                ["account","crrt_amount","cr360_amount","variance","abs_var","status"]
+            ].style.format({
+                "crrt_amount":"{:,.0f}","cr360_amount":"{:,.0f}","variance":"{:,.0f}","abs_var":"{:,.0f}"
+            }),
+            use_container_width=True,
+            height=420
+        )
+
+    # ---- Breaks ----
+    with recon_tabs[2]:
+        st.markdown("### Break Work Items")
+        b = st.session_state.breaks.copy()
+        if len(b) == 0:
+            st.info("No breaks yet. Create breaks from GL↔SOR tab or Dashboard Quick Action.")
+        else:
+            # Filters
+            f1, f2, f3, f4 = st.columns(4)
+            with f1:
+                status_f = st.multiselect("Status", sorted(b["status"].unique()), default=sorted(b["status"].unique()))
+            with f2:
+                sev_f = st.multiselect("Severity", sorted(b["severity"].unique()), default=sorted(b["severity"].unique()))
+            with f3:
+                owner_f = st.multiselect("Owner", sorted(b["owner"].unique()), default=sorted(b["owner"].unique()))
+            with f4:
+                recon_f = st.multiselect("Recon Type", sorted(b["recon_type"].unique()), default=sorted(b["recon_type"].unique()))
+
+            bf = b[
+                b["status"].isin(status_f) &
+                b["severity"].isin(sev_f) &
+                b["owner"].isin(owner_f) &
+                b["recon_type"].isin(recon_f)
+            ].copy()
+
+            st.dataframe(
+                bf.sort_values(["severity","created_ts"], ascending=[False, False])[
+                    ["break_id","created_ts","recon_type","account","product","variance","severity","root_cause","owner","status","sla_due"]
+                ].style.format({"variance":"{:,.0f}"}),
+                use_container_width=True,
+                height=320
+            )
+
+            st.divider()
+            st.markdown("### Break Detail Editor")
+            pick = st.selectbox("Select Break", bf["break_id"].tolist())
+            row = b[b["break_id"]==pick].iloc[0]
+
+            c1, c2, c3 = st.columns([1.1, 1.1, 1.2])
+            with c1:
+                new_status = st.selectbox("Status", ["OPEN","IN REVIEW","APPROVED","CLOSED"], index=["OPEN","IN REVIEW","APPROVED","CLOSED"].index(row["status"]))
+                new_owner = st.text_input("Owner", value=row["owner"])
+            with c2:
+                new_root = st.selectbox("Root Cause", [
+                    "UNCLASSIFIED","TIMING","MAPPING","MISSING_FEED","FX","SIGN","DUPLICATION","THRESHOLD","MANUAL_ADJ"
+                ], index=[
+                    "UNCLASSIFIED","TIMING","MAPPING","MISSING_FEED","FX","SIGN","DUPLICATION","THRESHOLD","MANUAL_ADJ"
+                ].index(row["root_cause"]))
+                new_evid = st.text_input("Evidence Ref (link/id)", value=row.get("evidence_ref",""))
+            with c3:
+                notes = st.text_area("Notes / Narrative", value=row.get("notes",""), height=90)
+
+            if st.button("💾 Save Break Changes"):
+                idx = st.session_state.breaks.index[st.session_state.breaks["break_id"]==pick][0]
+                st.session_state.breaks.loc[idx, "status"] = new_status
+                st.session_state.breaks.loc[idx, "owner"] = new_owner
+                st.session_state.breaks.loc[idx, "root_cause"] = new_root
+                st.session_state.breaks.loc[idx, "evidence_ref"] = new_evid
+                st.session_state.breaks.loc[idx, "notes"] = notes
+                log_action("UPDATE", "BREAK", pick, f"status={new_status}, root_cause={new_root}, owner={new_owner}")
+                st.success("Break updated.")
+
+# =========================================================
+# PAGE 5: Variance Management
+# =========================================================
+elif page.startswith("5."):
+    st.markdown("## 📈 Variance Management (Period / Scenario Explainability)")
+    st.markdown("<div class='tiny'>Period-over-period variance analysis + structured explanation capture.</div>", unsafe_allow_html=True)
+
+    # compare as_of vs prior
+    cur = gl_f.groupby(["account","account_name","product"]).agg(cur=("gl_amount","sum")).reset_index()
+    pri = gl_p.groupby(["account","account_name","product"]).agg(prior=("gl_amount","sum")).reset_index()
+    v = cur.merge(pri, on=["account","account_name","product"], how="left").fillna(0.0)
+    v["variance"] = v["cur"] - v["prior"]
+    v["abs_var"] = v["variance"].abs()
+
+    st.markdown("### Top Variances (by Account × Product)")
+    st.dataframe(
+        v.sort_values("abs_var", ascending=False).head(20).style.format({
+            "cur":"{:,.0f}","prior":"{:,.0f}","variance":"{:,.0f}","abs_var":"{:,.0f}"
+        }),
+        use_container_width=True,
+        height=420
+    )
+
+    st.divider()
+    st.markdown("### Explainability Capture (Prototype)")
+    pick = st.selectbox("Pick variance to explain", v.sort_values("abs_var", ascending=False).head(20).apply(
+        lambda r: f"{r['account']} | {r['product']} | abs_var={int(r['abs_var']):,}", axis=1
+    ).tolist())
+    acc = pick.split("|")[0].strip()
+    prod = pick.split("|")[1].strip()
+
+    rec = v[(v["account"]==acc) & (v["product"]==prod)].iloc[0]
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.metric("Current", money(rec["cur"]))
+        st.metric("Prior", money(rec["prior"]))
+    with c2:
+        st.metric("Variance", money(rec["variance"]))
+        st.metric("Severity", severity_from_amt(rec["variance"], materiality))
+
+    reason = st.selectbox("Variance Reason (structured)", [
+        "Volume change","Rate/Spread change","Mix change","Reclass/Mapping change","Timing/Accrual",
+        "FX impact","One-time event","Model/Forecast update (STARE)","Credit loss update (CECL/ACL)"
+    ])
+    narrative = st.text_area("Narrative (required for material variances)", height=110,
+                             value="")
+
+    if st.button("✅ Save Explanation to Audit Log"):
+        log_action("EXPLAIN", "VARIANCE", f"{acc}-{prod}", f"reason={reason}; narrative={narrative[:120]}")
+        st.success("Explanation saved (prototype audit log).")
+
+# =========================================================
+# PAGE 6: Regulatory Reporting
+# =========================================================
+elif page.startswith("6."):
+    st.markdown("## 🧾 Regulatory Reporting Workspace")
+    st.markdown("<div class='tiny'>Report lines, drill to accounts, show recon/variance status, and certify (prototype).</div>", unsafe_allow_html=True)
+
+    report = st.selectbox("Select Report", ["FR2590", "Y-9C", "FR Y (Other)", "CCAR", "CECL/ACL", "STARE", "ERA"])
+
+    # Build report line amounts from mapping (simplified: sum GL for mapped accounts)
+    m = map_df[map_df["report"].isin([report] if report in map_df["report"].unique() else ["Y-9C"])].copy()
+    if report not in map_df["report"].unique():
+        # for "FR Y (Other)" demonstrate using Y-9C mapping as placeholder
+        m["report"] = report
+
+    # join to GL
+    base = gl_f.copy()
+    line = m.merge(base, on="account", how="left")
+    line_amt = line.groupby(["report","report_line","line_desc"]).agg(
+        amount=("gl_amount","sum"),
+        mapped_accounts=("account","nunique")
+    ).reset_index()
+
+    # attach recon status (GL vs SOR)
+    recon = recon_gl_vs_sor(gl_f, sor_f)
+    recon_by_acc_prod = recon.groupby(["account"]).agg(abs_var=("abs_var","sum")).reset_index()
+    line_amt = line_amt.merge(
+        m.groupby(["report","report_line","line_desc"]).agg(accounts=("account", lambda x: list(sorted(set(x))))).reset_index(),
+        on=["report","report_line","line_desc"],
+        how="left"
+    )
+
+    # compute "risk" = sum abs_var for mapped accounts
+    def risk_for_accounts(accs):
+        if not accs:
+            return 0.0
+        return float(recon_by_acc_prod[recon_by_acc_prod["account"].isin(accs)]["abs_var"].sum())
+
+    line_amt["recon_abs_var"] = line_amt["accounts"].apply(risk_for_accounts)
+    line_amt["recon_status"] = np.where(line_amt["recon_abs_var"] <= materiality*0.001, "✅", "⚠️")
+    line_amt["materiality_flag"] = np.where(line_amt["recon_abs_var"] >= materiality, "🔴", "")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Report", report)
+    c2.metric("Lines", len(line_amt))
+    c3.metric("Recon Risk (Abs)", money(line_amt["recon_abs_var"].sum()))
+    c4.metric("Certify Readiness", "IN PROGRESS" if (line_amt["recon_abs_var"].max() >= materiality) else "READY")
+
+    st.markdown("### Report Lines")
+    view = line_amt[["report_line","line_desc","amount","recon_abs_var","recon_status","materiality_flag","mapped_accounts"]].copy()
+    st.dataframe(
+        view.sort_values("recon_abs_var", ascending=False).style.format({
+            "amount":"{:,.0f}",
+            "recon_abs_var":"{:,.0f}",
+        }),
+        use_container_width=True,
+        height=420
+    )
+
+    st.divider()
+    st.markdown("### Line Drilldown")
+    pick = st.selectbox("Pick a line", view["report_line"].tolist())
+    accs = line_amt[line_amt["report_line"]==pick]["accounts"].iloc[0]
+    st.write("Mapped accounts:", accs)
+
+    drill = gl_f[gl_f["account"].isin(accs)].groupby(["account","account_name","product"]).agg(amount=("gl_amount","sum")).reset_index()
+    st.dataframe(drill.sort_values("amount", ascending=False).style.format({"amount":"{:,.0f}"}), use_container_width=True, height=280)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("✔ Certify Line (prototype)"):
+            log_action("CERTIFY", "REPORT_LINE", f"{report}-{pick}", f"Certified by {current_user}")
+            st.success("Line certified (prototype audit log).")
+    with c2:
+        if st.button("🔒 Lock Report Cycle (prototype)"):
+            log_action("LOCK", "REPORT", report, f"Locked cycle for as_of={as_of}")
+            st.success("Report cycle locked (prototype).")
+
+# =========================================================
+# PAGE 7: Lineage & Mapping (BCBS239)
+# =========================================================
+elif page.startswith("7."):
+    st.markdown("## 🧬 Lineage & Mapping (BCBS239)")
+    st.markdown("<div class='tiny'>Versioned mappings, data lineage and control evidence. Prototype uses embedded metadata.</div>", unsafe_allow_html=True)
+
+    c1, c2 = st.columns([1.15, 0.85])
+    with c1:
+        st.markdown("### Mapping Repository")
+        st.dataframe(map_df.sort_values(["report","report_line","account"]), use_container_width=True, height=520)
+
+    with c2:
+        st.markdown("### Lineage Visual (Textual Node View)")
+        acc = st.selectbox("Select account to view lineage", sorted(gl_f["account"].unique()))
+        related = map_df[map_df["account"]==acc][["report","report_line","line_desc"]].drop_duplicates()
+
+        st.markdown(
+            f"""
+            <div class="gl-card">
+              <div><span class="tag">Source</span> GL_CORE / SUBLEDGER_SOR</div>
+              <div><span class="tag">Canonical</span> Enterprise GL Mart (Balances, Journals, Dimensions)</div>
+              <div><span class="tag">Aggregation</span> CRRT (Standardized layer)</div>
+              <div><span class="tag">Curation</span> CR360 (Reg-ready layer)</div>
+              <div><span class="tag">Reporting</span> FR2590 / Y-9C / CCAR / CECL-ACL / STARE / ERA</div>
+              <div class="tiny">Account {acc} | Entity {legal_entity} | Book {book} | CCY {ccy} | As-of {as_of}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        st.markdown("### Related Report Lines")
+        st.dataframe(related, use_container_width=True, height=220)
+
+        st.markdown("### Control Evidence (BCBS239-style)")
+        st.dataframe(rules, use_container_width=True, height=240)
+
+# =========================================================
+# PAGE 8: Audit & Evidence Vault
+# =========================================================
+elif page.startswith("8."):
+    st.markdown("## 🧾 Audit & Evidence Vault")
+    st.markdown("<div class='tiny'>Immutable audit trail (prototype) + evidence references.</div>", unsafe_allow_html=True)
+
+    a = st.session_state.audit_log.copy()
+    if len(a) == 0:
+        st.info("No audit events yet. Create breaks, certify lines, or rerun feeds to generate audit logs.")
+    else:
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            act = st.multiselect("Action", sorted(a["action"].unique()), default=sorted(a["action"].unique()))
+        with f2:
+            obj = st.multiselect("Object Type", sorted(a["object_type"].unique()), default=sorted(a["object_type"].unique()))
+        with f3:
+            usr = st.multiselect("User", sorted(a["user"].unique()), default=sorted(a["user"].unique()))
+
+        af = a[a["action"].isin(act) & a["object_type"].isin(obj) & a["user"].isin(usr)].copy()
+        st.dataframe(af.sort_values("ts", ascending=False), use_container_width=True, height=520)
+
+    st.divider()
+    st.markdown("### Evidence Index (from Breaks)")
+    b = st.session_state.breaks.copy()
+    if len(b) == 0:
+        st.info("No break evidence yet.")
+    else:
+        evid = b[b["evidence_ref"].astype(str).str.len() > 0][
+            ["break_id","as_of","recon_type","severity","status","evidence_ref","notes"]
+        ]
+        st.dataframe(evid, use_container_width=True, height=220)
+
+# =========================================================
+# PAGE 9: Admin (Thresholds/RBAC)
+# =========================================================
+elif page.startswith("9."):
+    st.markdown("## ⚙️ Admin (Thresholds / RBAC / Config)")
+    st.markdown("<div class='tiny'>Prototype admin controls. In real build: maker-checker, entitlements, config versioning.</div>", unsafe_allow_html=True)
+
+    st.markdown("### Materiality / Tolerance Configuration")
+    st.write(f"Current materiality (global): **{money(materiality)}**")
+    st.info("In production, thresholds vary by report, entity, product, and account class with effective dating and approvals.")
+
+    st.markdown("### RBAC (Prototype View)")
+    rbac = pd.DataFrame([
+        {"role":"Recon Analyst","can_create_break":"Y","can_close_break":"N","can_certify":"N","data_export":"Limited"},
+        {"role":"Controller","can_create_break":"Y","can_close_break":"Y","can_certify":"Y","data_export":"Controlled"},
+        {"role":"Report Owner","can_create_break":"Y","can_close_break":"Y","can_certify":"Y","data_export":"Controlled"},
+        {"role":"Auditor","can_create_break":"N","can_close_break":"N","can_certify":"N","data_export":"Read-only"},
+        {"role":"Admin","can_create_break":"Y","can_close_break":"Y","can_certify":"Y","data_export":"Admin"},
+    ])
+    st.dataframe(rbac, use_container_width=True, height=220)
+
+    st.markdown("### Close Calendar (Prototype)")
+    cal = pd.DataFrame([
+        {"cycle":"Month-End Close","cutoff":"T+1 18:00","recon_due":"T+2 12:00","certify_due":"T+3 17:00"},
+        {"cycle":"FR2590","cutoff":"T+1 20:00","recon_due":"T+2 14:00","certify_due":"T+3 12:00"},
+        {"cycle":"Y-9C","cutoff":"T+2 18:00","recon_due":"T+4 12:00","certify_due":"T+5 17:00"},
+        {"cycle":"CCAR/STARE","cutoff":"Scenario freeze","recon_due":"Model run+1d","certify_due":"Review+2d"},
+        {"cycle":"CECL/ACL","cutoff":"Quarter-end","recon_due":"T+3 12:00","certify_due":"T+5 17:00"},
+    ])
+    st.dataframe(cal, use_container_width=True, height=240)
+
+# ---------------------------
+# Footer
+# ---------------------------
+st.sidebar.divider()
+if st.sidebar.button("🧹 Reset Prototype Data"):
+    st.session_state.data = seed_data()
+    st.session_state.breaks = st.session_state.breaks.iloc[0:0]
+    st.session_state.audit_log = st.session_state.audit_log.iloc[0:0]
+    st.sidebar.success("Prototype reset complete.")
+
+st.sidebar.markdown("<div class='tiny'>Prototype: embedded data + workflows. Next step: connect to real SOR/GL extracts and persist state in DB.</div>", unsafe_allow_html=True)
