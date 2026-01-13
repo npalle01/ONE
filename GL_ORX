@@ -1,0 +1,1404 @@
+import sys
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt
+from PyQt6.QtGui import QAction, QFont
+from PyQt6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMessageBox, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStatusBar,
+    QTableView, QTabWidget, QTextEdit, QVBoxLayout, QWidget
+)
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and np.isnan(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def fmt_money(x: Any) -> str:
+    return f"{safe_float(x):,.2f}"
+
+def fmt_pct(x: float) -> str:
+    x = max(0.0, min(1.0, float(x)))
+    return f"{x * 100:.1f}%"
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def hash_id(prefix: str = "BRK") -> str:
+    return f"{prefix}-{np.random.randint(10000, 99999)}"
+
+def severity_from_amt(amt: Any, materiality: float) -> str:
+    a = abs(safe_float(amt, 0.0))
+    if a >= materiality:
+        return "MATERIAL"
+    if a >= materiality * 0.25:
+        return "HIGH"
+    if a >= materiality * 0.10:
+        return "MEDIUM"
+    return "LOW"
+
+# ----------------------------
+# Demo data seeding (embedded)
+# ----------------------------
+
+def seed_data() -> Dict[str, Any]:
+    entities = ["US_HOLDCO", "US_BANK", "UK_BRANCH"]
+    books = ["GAAP", "STAT"]
+    currencies = ["USD", "GBP"]
+    products = ["LOANS", "DEPOSITS", "TRADING", "TREASURY"]
+    accounts = [
+        ("100100", "Cash & Due From Banks"),
+        ("120200", "Loans - HFI"),
+        ("200100", "Deposits"),
+        ("310000", "Trading Assets"),
+        ("510000", "Interest Income"),
+        ("610000", "Interest Expense"),
+        ("710000", "Provision for Credit Losses"),
+    ]
+
+    asof = date(2026, 1, 8)
+    prior = asof - timedelta(days=31)
+
+    rng = np.random.default_rng(7)
+    rows: List[Dict[str, Any]] = []
+    for d in [prior, asof]:
+        for le in entities:
+            for book in books:
+                for ccy in currencies:
+                    for acc, acc_name in accounts:
+                        for prod in products:
+                            base = float(rng.normal(0, 1))
+                            scale = {
+                                "100100": 2.2e9,
+                                "120200": 6.8e9,
+                                "200100": 7.1e9,
+                                "310000": 1.9e9,
+                                "510000": 0.45e9,
+                                "610000": 0.25e9,
+                                "710000": 0.12e9,
+                            }[acc]
+                            le_mult = {"US_HOLDCO": 1.0, "US_BANK": 0.9, "UK_BRANCH": 0.35}[le]
+                            prod_mult = {"LOANS": 1.1, "DEPOSITS": 0.95, "TRADING": 1.0, "TREASURY": 0.7}[prod]
+                            book_mult = {"GAAP": 1.0, "STAT": 0.8}[book]
+                            ccy_mult = {"USD": 1.0, "GBP": 0.28}[ccy]
+
+                            amt = (base * 0.015 + 1.0) * scale * le_mult * prod_mult * book_mult * ccy_mult
+                            drift = 1.0 if d == prior else (1.0 + float(rng.normal(0.01, 0.006)))
+                            amt *= drift
+
+                            rows.append({
+                                "as_of": d,
+                                "legal_entity": le,
+                                "book": book,
+                                "ccy": ccy,
+                                "account": acc,
+                                "account_name": acc_name,
+                                "product": prod,
+                                "gl_amount": float(amt),
+                            })
+
+    gl = pd.DataFrame(rows)
+
+    # SOR copy + controlled variance
+    sor = gl.rename(columns={"gl_amount": "sor_amount"}).copy()
+    mask_asof = sor["as_of"] == asof
+    # Apply controlled variances only for the current as-of slice (avoid shape/broadcast issues)
+    cond_asof = (sor.loc[mask_asof, "account"].isin(["120200", "200100"])) & (sor.loc[mask_asof, "product"].isin(["LOANS", "DEPOSITS"]))
+    noise = rng.normal(0.002, 0.001, size=int(mask_asof.sum()))
+    multipliers = np.where(cond_asof.to_numpy(), 1.0 + noise, 1.0)
+    sor.loc[mask_asof, "sor_amount"] = sor.loc[mask_asof, "sor_amount"].to_numpy() * multipliers
+
+    miss_mask = (sor["as_of"] == asof) & (sor["legal_entity"] == "UK_BRANCH") & (sor["product"] == "TRADING") & (sor["account"] == "310000")
+    sor.loc[miss_mask, "sor_amount"] = sor.loc[miss_mask, "sor_amount"] * 0.92
+
+    # CRRT/CR360
+    crrt = gl.groupby(["as_of", "legal_entity", "book", "ccy", "account"], as_index=False).agg(crrt_amount=("gl_amount", "sum"))
+    cr360 = crrt.copy()
+    cr360["cr360_amount"] = cr360["crrt_amount"] * (1.0 + rng.normal(0.0008, 0.0005, size=len(cr360)))
+
+    # Feeds
+    feed_sources = [
+        ("GL_CORE", "GL"),
+        ("SUBLEDGER_SOR", "SOR"),
+        ("CRRT_PIPE", "CRRT"),
+        ("CR360_PIPE", "CR360"),
+        ("ERA_SCCL", "ERA"),
+        ("STARE_FORECAST", "STARE"),
+    ]
+    feed_rows: List[Dict[str, Any]] = []
+    for src, layer in feed_sources:
+        for d in [prior, asof]:
+            status = "SUCCESS"
+            latency_min = int(abs(rng.normal(18, 9)))
+            records = int(abs(rng.normal(120000, 15000)))
+            rejects = int(abs(rng.normal(180, 70)))
+            if src == "STARE_FORECAST" and d == asof:
+                status = "LATE"
+                latency_min += 120
+            if src == "SUBLEDGER_SOR" and d == asof:
+                rejects += 420
+            feed_rows.append({
+                "as_of": d, "source": src, "layer": layer, "status": status,
+                "latency_min": latency_min, "records": records, "rejects": rejects,
+                "control_total": float(abs(rng.normal(1.8e10, 3.5e9))),
+                "run_id": f"RUN-{src}-{d.strftime('%Y%m%d')}"
+            })
+    feed = pd.DataFrame(feed_rows)
+
+    # Report mapping
+    mapping_rows = [
+        ("FR2590", "L1", "Cash & Central Bank", ["100100"]),
+        ("FR2590", "L2", "Loans Outstanding", ["120200"]),
+        ("FR2590", "L3", "Trading Assets", ["310000"]),
+        ("FR2590", "L4", "Deposits", ["200100"]),
+        ("Y-9C", "HC-A1", "Cash and balances due", ["100100"]),
+        ("Y-9C", "HC-C1", "Loans and leases", ["120200"]),
+        ("Y-9C", "HC-L1", "Deposits", ["200100"]),
+        ("Y-9C", "HC-B1", "Trading assets", ["310000"]),
+        ("CCAR", "P&L1", "Net Interest Income", ["510000", "610000"]),
+        ("CECL/ACL", "ACL1", "Provision / ACL expense", ["710000"]),
+        ("STARE", "S1", "Forecast Loans", ["120200"]),
+        ("ERA", "E1", "SCCL Recon Coverage", ["120200", "200100", "310000"]),
+    ]
+    rep_map = []
+    for rep, line, desc, accs in mapping_rows:
+        for a in accs:
+            rep_map.append({"report": rep, "report_line": line, "line_desc": desc, "account": a})
+    map_df = pd.DataFrame(rep_map)
+
+    rules = pd.DataFrame([
+        {"rule_id": "DQ-001", "rule_name": "Completeness - Required dimensions present", "severity": "HIGH", "owner": "Data Steward"},
+        {"rule_id": "DQ-002", "rule_name": "Balance - Assets = Liabilities + Equity (entity/book)", "severity": "MATERIAL", "owner": "Controller"},
+        {"rule_id": "DQ-003", "rule_name": "Timeliness - Feeds within SLA", "severity": "MEDIUM", "owner": "Ops"},
+        {"rule_id": "DQ-004", "rule_name": "Recon - GL vs SOR within tolerance", "severity": "MATERIAL", "owner": "Recon Lead"},
+        {"rule_id": "DQ-005", "rule_name": "Mapping - Report line coverage >= 99%", "severity": "HIGH", "owner": "Report Owner"},
+    ])
+
+    return {"asof": asof, "prior": prior, "gl": gl, "sor": sor, "crrt": crrt, "cr360": cr360, "feed": feed, "map": map_df, "rules": rules}
+
+# ----------------------------
+# Pandas table model
+# ----------------------------
+
+class DataFrameModel(QAbstractTableModel):
+    def __init__(self, df: Optional[pd.DataFrame] = None, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._df = df.copy() if df is not None else pd.DataFrame()
+
+    def set_df(self, df: Optional[pd.DataFrame]):
+        self.beginResetModel()
+        self._df = df.copy() if df is not None else pd.DataFrame()
+        self.endResetModel()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._df)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._df.columns)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid() or role not in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            return None
+        try:
+            v = self._df.iat[index.row(), index.column()]
+            if isinstance(v, float):
+                return f"{v:,.4f}" if abs(v) < 1e6 else f"{v:,.0f}"
+            return str(v)
+        except Exception:
+            return ""
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return str(self._df.columns[section]) if section < len(self._df.columns) else ""
+        return str(section + 1)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def get_row(self, row: int) -> Dict[str, Any]:
+        if row < 0 or row >= len(self._df):
+            return {}
+        return self._df.iloc[row].to_dict()
+
+# ----------------------------
+# Break editor dialog
+# ----------------------------
+
+class BreakEditorDialog(QDialog):
+    def __init__(self, break_row: Dict[str, Any], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Break Detail")
+        self.setMinimumWidth(520)
+        self.break_row = break_row.copy()
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.lbl_id = QLabel(self.break_row.get("break_id", ""))
+        self.cmb_status = QComboBox()
+        self.cmb_status.addItems(["OPEN", "IN REVIEW", "APPROVED", "CLOSED"])
+        self.cmb_status.setCurrentText(self.break_row.get("status", "OPEN"))
+
+        self.ed_owner = QLineEdit(self.break_row.get("owner", "Recon Analyst"))
+        self.cmb_root = QComboBox()
+        self.cmb_root.addItems(["UNCLASSIFIED", "TIMING", "MAPPING", "MISSING_FEED", "FX", "SIGN", "DUPLICATION", "THRESHOLD", "MANUAL_ADJ"])
+        self.cmb_root.setCurrentText(self.break_row.get("root_cause", "UNCLASSIFIED"))
+
+        self.ed_evidence = QLineEdit(self.break_row.get("evidence_ref", ""))
+        self.txt_notes = QTextEdit()
+        self.txt_notes.setPlainText(self.break_row.get("notes", ""))
+
+        form.addRow("Break ID", self.lbl_id)
+        form.addRow("Status", self.cmb_status)
+        form.addRow("Owner", self.ed_owner)
+        form.addRow("Root Cause", self.cmb_root)
+        form.addRow("Evidence Ref", self.ed_evidence)
+        form.addRow("Notes / Narrative", self.txt_notes)
+
+        layout.addLayout(form)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setDefault(True)
+        btns.addWidget(self.btn_cancel)
+        btns.addWidget(self.btn_save)
+        layout.addLayout(btns)
+
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_save.clicked.connect(self._on_save)
+
+    def _on_save(self):
+        self.break_row["status"] = self.cmb_status.currentText()
+        self.break_row["owner"] = self.ed_owner.text().strip() or "Recon Analyst"
+        self.break_row["root_cause"] = self.cmb_root.currentText()
+        self.break_row["evidence_ref"] = self.ed_evidence.text().strip()
+        self.break_row["notes"] = self.txt_notes.toPlainText().strip()
+        self.accept()
+
+# ----------------------------
+# App main window
+# ----------------------------
+
+@dataclass
+class GlobalFilters:
+    as_of: date
+    legal_entity: str
+    book: str
+    ccy: str
+    materiality: float
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Enterprise GL Platform | Recon & Regulatory Reporting (Live Demo)")
+        self.resize(1500, 860)
+
+        self.data = seed_data()
+        self.current_user = "Recon Analyst"
+        self.filters = GlobalFilters(
+            as_of=self.data["asof"],
+            legal_entity="US_HOLDCO",
+            book="GAAP",
+            ccy="USD",
+            materiality=1_000_000.0,
+        )
+
+        self.breaks = pd.DataFrame(columns=[
+            "break_id", "created_ts", "as_of", "recon_type", "legal_entity", "book", "ccy",
+            "account", "product", "gl_amount", "other_amount", "variance", "severity",
+            "root_cause", "owner", "status", "sla_due", "notes", "evidence_ref"
+        ])
+        self.audit = pd.DataFrame(columns=["ts", "user", "action", "object_type", "object_id", "details"])
+
+        self._accs_by_line: Dict[str, List[str]] = {}
+        self._selected_variance_key: Optional[str] = None
+        self._selected_report_line: Optional[str] = None
+
+        self._build_menu()
+        self._build_ui()
+        self.refresh_all()
+
+    # -------- menu
+    def _build_menu(self):
+        mb = self.menuBar()
+        file_menu = mb.addMenu("&File")
+
+        act_reset = QAction("Reset Demo", self)
+        act_reset.triggered.connect(self.reset_demo)
+        file_menu.addAction(act_reset)
+
+        act_exit = QAction("Exit", self)
+        act_exit.triggered.connect(self.close)
+        file_menu.addAction(act_exit)
+
+    # -------- UI skeleton
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+
+        nav = QFrame()
+        nav.setFrameShape(QFrame.Shape.StyledPanel)
+        nav.setFixedWidth(280)
+        nav_l = QVBoxLayout(nav)
+
+        title = QLabel("🏦 Enterprise GL")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        nav_l.addWidget(title)
+
+        self.nav_list = QListWidget()
+        for p in [
+            "1. Landing Dashboard",
+            "2. Feed Health & Ingestion",
+            "3. GL Explorer",
+            "4. Reconciliation Workspace",
+            "5. Variance Management",
+            "6. Regulatory Reporting",
+            "7. Lineage & BCBS239",
+            "8. Audit & Evidence Vault",
+            "9. Admin & Governance",
+        ]:
+            self.nav_list.addItem(QListWidgetItem(p))
+        self.nav_list.setCurrentRow(0)
+        self.nav_list.currentRowChanged.connect(self._on_nav_change)
+        nav_l.addWidget(self.nav_list, 1)
+
+        filters_box = QGroupBox("Global Filters")
+        fl = QFormLayout(filters_box)
+
+        self.cmb_asof = QComboBox()
+        dates = sorted(self.data["gl"]["as_of"].unique())
+        for d in dates:
+            self.cmb_asof.addItem(str(d), d)
+        self.cmb_asof.setCurrentIndex(len(dates) - 1)
+        self.cmb_asof.currentIndexChanged.connect(self._update_filters_and_refresh)
+        fl.addRow("As-of", self.cmb_asof)
+
+        self.cmb_le = QComboBox()
+        for le in sorted(self.data["gl"]["legal_entity"].unique()):
+            self.cmb_le.addItem(le)
+        self.cmb_le.setCurrentText(self.filters.legal_entity)
+        self.cmb_le.currentTextChanged.connect(self._update_filters_and_refresh)
+        fl.addRow("Legal Entity", self.cmb_le)
+
+        self.cmb_book = QComboBox()
+        for b in sorted(self.data["gl"]["book"].unique()):
+            self.cmb_book.addItem(b)
+        self.cmb_book.setCurrentText(self.filters.book)
+        self.cmb_book.currentTextChanged.connect(self._update_filters_and_refresh)
+        fl.addRow("Book", self.cmb_book)
+
+        self.cmb_ccy = QComboBox()
+        for c in sorted(self.data["gl"]["ccy"].unique()):
+            self.cmb_ccy.addItem(c)
+        self.cmb_ccy.setCurrentText(self.filters.ccy)
+        self.cmb_ccy.currentTextChanged.connect(self._update_filters_and_refresh)
+        fl.addRow("CCY", self.cmb_ccy)
+
+        self.spn_mat = QSpinBox()
+        self.spn_mat.setRange(100_000, 25_000_000)
+        self.spn_mat.setSingleStep(100_000)
+        self.spn_mat.setValue(int(self.filters.materiality))
+        self.spn_mat.valueChanged.connect(self._update_filters_and_refresh)
+        fl.addRow("Materiality", self.spn_mat)
+
+        self.ed_user = QLineEdit(self.current_user)
+        self.ed_user.textChanged.connect(self._on_user_changed)
+        fl.addRow("User", self.ed_user)
+
+        nav_l.addWidget(filters_box)
+
+        self.stack = QStackedWidget()
+        self.page_dashboard = self._make_dashboard_page()
+        self.page_feed = self._make_feed_page()
+        self.page_gl = self._make_gl_page()
+        self.page_recon = self._make_recon_page()
+        self.page_var = self._make_variance_page()
+        self.page_report = self._make_reporting_page()
+        self.page_lineage = self._make_lineage_page()
+        self.page_audit = self._make_audit_page()
+        self.page_admin = self._make_admin_page()
+
+        for w in [
+            self.page_dashboard, self.page_feed, self.page_gl, self.page_recon,
+            self.page_var, self.page_report, self.page_lineage, self.page_audit, self.page_admin
+        ]:
+            self.stack.addWidget(w)
+
+        root.addWidget(nav)
+        root.addWidget(self.stack, 1)
+
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+
+    # -------- pages
+    def _make_kpi(self, title: str) -> Tuple[QGroupBox, QLabel]:
+        box = QGroupBox(title)
+        v = QVBoxLayout(box)
+        lbl = QLabel("0")
+        lbl.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+        v.addWidget(lbl)
+        return box, lbl
+
+    def _make_dashboard_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        header = QLabel("✨ Landing Dashboard")
+        header.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        kpi_row = QHBoxLayout()
+        b1, self.lbl_kpi_material = self._make_kpi("Material Breaks")
+        b2, self.lbl_kpi_open = self._make_kpi("Open Breaks")
+        b3, self.lbl_kpi_feeds = self._make_kpi("Feeds Late/Failed")
+        b4, self.lbl_kpi_recon = self._make_kpi("Recon Completion")
+        b5, self.lbl_kpi_cert = self._make_kpi("Certifiable Reports")
+        for b in [b1, b2, b3, b4, b5]:
+            kpi_row.addWidget(b)
+        layout.addLayout(kpi_row)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Top Breaks (GL↔SOR)"))
+        self.tbl_top_breaks = QTableView()
+        self.model_top_breaks = DataFrameModel(pd.DataFrame())
+        self.tbl_top_breaks.setModel(self.model_top_breaks)
+        self.tbl_top_breaks.setSortingEnabled(True)
+        ll.addWidget(self.tbl_top_breaks, 1)
+        self.btn_create_largest = QPushButton("Create Break for Largest Variance")
+        self.btn_create_largest.clicked.connect(self.create_largest_break)
+        ll.addWidget(self.btn_create_largest)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Feed Health Snapshot"))
+        self.tbl_feed_snap = QTableView()
+        self.model_feed_snap = DataFrameModel(pd.DataFrame())
+        self.tbl_feed_snap.setModel(self.model_feed_snap)
+        self.tbl_feed_snap.setSortingEnabled(True)
+        rl.addWidget(self.tbl_feed_snap, 1)
+
+        rl.addWidget(QLabel("Report Readiness"))
+        self.tbl_readiness = QTableView()
+        self.model_readiness = DataFrameModel(pd.DataFrame())
+        self.tbl_readiness.setModel(self.model_readiness)
+        rl.addWidget(self.tbl_readiness)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([900, 600])
+        layout.addWidget(splitter, 1)
+        return w
+
+    def _make_feed_page(self) -> QWidget:
+        w = QWidget()
+        layout = QHBoxLayout(w)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        header = QLabel("📡 Feed Health & Ingestion Control")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        ll.addWidget(header)
+
+        self.tbl_feed = QTableView()
+        self.model_feed = DataFrameModel(pd.DataFrame())
+        self.tbl_feed.setModel(self.model_feed)
+        self.tbl_feed.setSortingEnabled(True)
+        ll.addWidget(self.tbl_feed, 1)
+
+        ll.addWidget(QLabel("Reject Samples (Prototype)"))
+        self.tbl_rejects = QTableView()
+        self.model_rejects = DataFrameModel(pd.DataFrame())
+        self.tbl_rejects.setModel(self.model_rejects)
+        ll.addWidget(self.tbl_rejects)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Actions"))
+        self.cmb_feed_pick = QComboBox()
+        rl.addWidget(self.cmb_feed_pick)
+
+        btn_rerun = QPushButton("▶ Re-run Ingestion (log)")
+        btn_rerun.clicked.connect(self.rerun_feed)
+        rl.addWidget(btn_rerun)
+
+        btn_inc = QPushButton("📝 Create Incident (log)")
+        btn_inc.clicked.connect(self.create_incident)
+        rl.addWidget(btn_inc)
+
+        rl.addWidget(QLabel("BCBS239 Controls / Rules"))
+        self.tbl_rules = QTableView()
+        self.model_rules = DataFrameModel(pd.DataFrame())
+        self.tbl_rules.setModel(self.model_rules)
+        rl.addWidget(self.tbl_rules, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([1000, 450])
+        layout.addWidget(splitter)
+        return w
+
+    def _make_gl_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        header = QLabel("🔎 GL Explorer")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Search account/name:"))
+        self.ed_gl_search = QLineEdit("120200")
+        self.ed_gl_search.textChanged.connect(self.refresh_gl_explorer)
+        top.addWidget(self.ed_gl_search, 1)
+        layout.addLayout(top)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Balances (Account × Product)"))
+        self.tbl_gl = QTableView()
+        self.model_gl = DataFrameModel(pd.DataFrame())
+        self.tbl_gl.setModel(self.model_gl)
+        self.tbl_gl.setSortingEnabled(True)
+        self.tbl_gl.clicked.connect(self.on_gl_row_selected)
+        ll.addWidget(self.tbl_gl, 1)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Context Pane"))
+        self.lbl_ctx = QLabel("Select a row to see mappings and lineage.")
+        self.lbl_ctx.setWordWrap(True)
+        rl.addWidget(self.lbl_ctx)
+
+        rl.addWidget(QLabel("Report Mappings"))
+        self.tbl_map_for_acc = QTableView()
+        self.model_map_for_acc = DataFrameModel(pd.DataFrame())
+        self.tbl_map_for_acc.setModel(self.model_map_for_acc)
+        rl.addWidget(self.tbl_map_for_acc, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([950, 500])
+        layout.addWidget(splitter, 1)
+        return w
+
+    def _make_recon_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        header = QLabel("🧮 Reconciliation Workspace")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        self.recon_tabs = QTabWidget()
+
+        tab1 = QWidget()
+        t1 = QVBoxLayout(tab1)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Tolerance (abs):"))
+        self.spn_tol = QSpinBox()
+        self.spn_tol.setRange(0, 100_000_000)
+        self.spn_tol.setSingleStep(10_000)
+        self.spn_tol.valueChanged.connect(self.refresh_recon)
+        controls.addWidget(self.spn_tol)
+        controls.addStretch(1)
+        self.btn_create_breaks = QPushButton("➕ Create Break(s) for Selected Rows")
+        self.btn_create_breaks.clicked.connect(self.create_breaks_from_selected_recon_rows)
+        controls.addWidget(self.btn_create_breaks)
+        t1.addLayout(controls)
+
+        self.tbl_recon = QTableView()
+        self.model_recon = DataFrameModel(pd.DataFrame())
+        self.tbl_recon.setModel(self.model_recon)
+        self.tbl_recon.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.tbl_recon.setSortingEnabled(True)
+        t1.addWidget(self.tbl_recon, 1)
+
+        tab2 = QWidget()
+        t2 = QVBoxLayout(tab2)
+        controls2 = QHBoxLayout()
+        controls2.addWidget(QLabel("Tolerance (CRRT↔CR360):"))
+        self.spn_tol2 = QSpinBox()
+        self.spn_tol2.setRange(0, 100_000_000)
+        self.spn_tol2.setSingleStep(10_000)
+        self.spn_tol2.valueChanged.connect(self.refresh_recon)
+        controls2.addWidget(self.spn_tol2)
+        controls2.addStretch(1)
+        t2.addLayout(controls2)
+
+        self.tbl_recon2 = QTableView()
+        self.model_recon2 = DataFrameModel(pd.DataFrame())
+        self.tbl_recon2.setModel(self.model_recon2)
+        self.tbl_recon2.setSortingEnabled(True)
+        t2.addWidget(self.tbl_recon2, 1)
+
+        tab3 = QWidget()
+        t3 = QVBoxLayout(tab3)
+        top = QHBoxLayout()
+        self.cmb_break_status = QComboBox()
+        self.cmb_break_status.addItems(["(All)", "OPEN", "IN REVIEW", "APPROVED", "CLOSED"])
+        self.cmb_break_status.currentIndexChanged.connect(self.refresh_breaks)
+        top.addWidget(QLabel("Status:"))
+        top.addWidget(self.cmb_break_status)
+        top.addStretch(1)
+        self.btn_edit_break = QPushButton("✏️ Edit Selected Break")
+        self.btn_edit_break.clicked.connect(self.edit_selected_break)
+        top.addWidget(self.btn_edit_break)
+        t3.addLayout(top)
+
+        self.tbl_breaks = QTableView()
+        self.model_breaks = DataFrameModel(pd.DataFrame())
+        self.tbl_breaks.setModel(self.model_breaks)
+        self.tbl_breaks.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.tbl_breaks.setSortingEnabled(True)
+        t3.addWidget(self.tbl_breaks, 1)
+
+        self.recon_tabs.addTab(tab1, "GL ↔ SOR")
+        self.recon_tabs.addTab(tab2, "CRRT ↔ CR360")
+        self.recon_tabs.addTab(tab3, "Breaks (Work Items)")
+        layout.addWidget(self.recon_tabs, 1)
+        return w
+
+    def _make_variance_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        header = QLabel("📈 Variance Management")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        self.tbl_variance = QTableView()
+        self.model_variance = DataFrameModel(pd.DataFrame())
+        self.tbl_variance.setModel(self.model_variance)
+        self.tbl_variance.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.tbl_variance.clicked.connect(self.on_variance_selected)
+        self.tbl_variance.setSortingEnabled(True)
+        layout.addWidget(self.tbl_variance, 1)
+
+        explain = QGroupBox("Explainability Capture")
+        ex = QFormLayout(explain)
+        self.lbl_var_pick = QLabel("(Select a variance row)")
+        self.cmb_var_reason = QComboBox()
+        self.cmb_var_reason.addItems([
+            "Volume change", "Rate/Spread change", "Mix change", "Reclass/Mapping change", "Timing/Accrual",
+            "FX impact", "One-time event", "Model/Forecast update (STARE)", "Credit loss update (CECL/ACL)"
+        ])
+        self.txt_var_narr = QTextEdit()
+        self.txt_var_narr.setFixedHeight(90)
+        self.btn_save_expl = QPushButton("✅ Save Explanation (Audit Log)")
+        self.btn_save_expl.clicked.connect(self.save_variance_explanation)
+
+        ex.addRow("Selected", self.lbl_var_pick)
+        ex.addRow("Reason", self.cmb_var_reason)
+        ex.addRow("Narrative", self.txt_var_narr)
+        ex.addRow("", self.btn_save_expl)
+        layout.addWidget(explain)
+        return w
+
+    def _make_reporting_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        header = QLabel("🧾 Regulatory Reporting Workspace")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Report:"))
+        self.cmb_report = QComboBox()
+        self.cmb_report.addItems(["FR2590", "Y-9C", "FR Y (Other)", "CCAR", "CECL/ACL", "STARE", "ERA"])
+        self.cmb_report.currentTextChanged.connect(self.refresh_reporting)
+        top.addWidget(self.cmb_report)
+        top.addStretch(1)
+
+        self.btn_cert_line = QPushButton("✔ Certify Selected Line (log)")
+        self.btn_cert_line.clicked.connect(self.certify_selected_line)
+        top.addWidget(self.btn_cert_line)
+
+        self.btn_lock_report = QPushButton("🔒 Lock Report Cycle (log)")
+        self.btn_lock_report.clicked.connect(self.lock_report_cycle)
+        top.addWidget(self.btn_lock_report)
+
+        layout.addLayout(top)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Report Lines"))
+        self.tbl_report_lines = QTableView()
+        self.model_report_lines = DataFrameModel(pd.DataFrame())
+        self.tbl_report_lines.setModel(self.model_report_lines)
+        self.tbl_report_lines.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.tbl_report_lines.clicked.connect(self.on_report_line_selected)
+        self.tbl_report_lines.setSortingEnabled(True)
+        ll.addWidget(self.tbl_report_lines, 1)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Line Drilldown (GL by mapped accounts)"))
+        self.tbl_line_drill = QTableView()
+        self.model_line_drill = DataFrameModel(pd.DataFrame())
+        self.tbl_line_drill.setModel(self.model_line_drill)
+        self.tbl_line_drill.setSortingEnabled(True)
+        rl.addWidget(self.tbl_line_drill, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([900, 600])
+        layout.addWidget(splitter, 1)
+
+        return w
+
+    def _make_lineage_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        header = QLabel("🧬 Lineage & Mapping (BCBS239)")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Mapping Repository"))
+        self.tbl_map = QTableView()
+        self.model_map = DataFrameModel(pd.DataFrame())
+        self.tbl_map.setModel(self.model_map)
+        self.tbl_map.setSortingEnabled(True)
+        ll.addWidget(self.tbl_map, 1)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        hl = QHBoxLayout()
+        hl.addWidget(QLabel("Account:"))
+        self.cmb_lineage_acc = QComboBox()
+        self.cmb_lineage_acc.currentTextChanged.connect(self.refresh_lineage_side)
+        hl.addWidget(self.cmb_lineage_acc, 1)
+        rl.addLayout(hl)
+
+        self.lbl_lineage = QLabel("")
+        self.lbl_lineage.setWordWrap(True)
+        rl.addWidget(self.lbl_lineage)
+
+        rl.addWidget(QLabel("Related Report Lines"))
+        self.tbl_related = QTableView()
+        self.model_related = DataFrameModel(pd.DataFrame())
+        self.tbl_related.setModel(self.model_related)
+        rl.addWidget(self.tbl_related, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([900, 600])
+        layout.addWidget(splitter, 1)
+        return w
+
+    def _make_audit_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        header = QLabel("🧾 Audit & Evidence Vault")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        self.tbl_audit = QTableView()
+        self.model_audit = DataFrameModel(pd.DataFrame())
+        self.tbl_audit.setModel(self.model_audit)
+        self.tbl_audit.setSortingEnabled(True)
+        layout.addWidget(self.tbl_audit, 1)
+
+        layout.addWidget(QLabel("Evidence Index (from Breaks)"))
+        self.tbl_evidence = QTableView()
+        self.model_evidence = DataFrameModel(pd.DataFrame())
+        self.tbl_evidence.setModel(self.model_evidence)
+        layout.addWidget(self.tbl_evidence)
+        return w
+
+    def _make_admin_page(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        header = QLabel("⚙️ Admin & Governance")
+        header.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(header)
+
+        rbac = pd.DataFrame([
+            {"role": "Recon Analyst", "can_create_break": "Y", "can_close_break": "N", "can_certify": "N", "data_export": "Limited"},
+            {"role": "Controller", "can_create_break": "Y", "can_close_break": "Y", "can_certify": "Y", "data_export": "Controlled"},
+            {"role": "Report Owner", "can_create_break": "Y", "can_close_break": "Y", "can_certify": "Y", "data_export": "Controlled"},
+            {"role": "Auditor", "can_create_break": "N", "can_close_break": "N", "can_certify": "N", "data_export": "Read-only"},
+            {"role": "Admin", "can_create_break": "Y", "can_close_break": "Y", "can_certify": "Y", "data_export": "Admin"},
+        ])
+        cal = pd.DataFrame([
+            {"cycle": "Month-End Close", "cutoff": "T+1 18:00", "recon_due": "T+2 12:00", "certify_due": "T+3 17:00"},
+            {"cycle": "FR2590", "cutoff": "T+1 20:00", "recon_due": "T+2 14:00", "certify_due": "T+3 12:00"},
+            {"cycle": "Y-9C", "cutoff": "T+2 18:00", "recon_due": "T+4 12:00", "certify_due": "T+5 17:00"},
+            {"cycle": "CCAR/STARE", "cutoff": "Scenario freeze", "recon_due": "Model run+1d", "certify_due": "Review+2d"},
+            {"cycle": "CECL/ACL", "cutoff": "Quarter-end", "recon_due": "T+3 12:00", "certify_due": "T+5 17:00"},
+        ])
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("RBAC Matrix"))
+        self.tbl_rbac = QTableView()
+        self.model_rbac = DataFrameModel(rbac)
+        self.tbl_rbac.setModel(self.model_rbac)
+        ll.addWidget(self.tbl_rbac, 1)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Close Calendar"))
+        self.tbl_cal = QTableView()
+        self.model_cal = DataFrameModel(cal)
+        self.tbl_cal.setModel(self.model_cal)
+        rl.addWidget(self.tbl_cal, 1)
+
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([700, 700])
+        layout.addWidget(splitter, 1)
+        return w
+
+    # -------- navigation + filters
+    def _on_nav_change(self, idx: int):
+        idx = max(0, min(idx, self.stack.count() - 1))
+        self.stack.setCurrentIndex(idx)
+
+    def _on_user_changed(self, txt: str):
+        self.current_user = txt.strip() or "User"
+
+    def _update_filters_and_refresh(self):
+        self.filters.as_of = self.cmb_asof.currentData()
+        self.filters.legal_entity = self.cmb_le.currentText()
+        self.filters.book = self.cmb_book.currentText()
+        self.filters.ccy = self.cmb_ccy.currentText()
+        self.filters.materiality = float(self.spn_mat.value())
+        self.refresh_all()
+
+    # -------- filtered datasets
+    def gl_filtered(self, as_of: Optional[date] = None) -> pd.DataFrame:
+        d = as_of if as_of is not None else self.filters.as_of
+        gl = self.data["gl"]
+        return gl[
+            (gl["as_of"] == d)
+            & (gl["legal_entity"] == self.filters.legal_entity)
+            & (gl["book"] == self.filters.book)
+            & (gl["ccy"] == self.filters.ccy)
+        ].copy()
+
+    def sor_filtered(self, as_of: Optional[date] = None) -> pd.DataFrame:
+        d = as_of if as_of is not None else self.filters.as_of
+        sor = self.data["sor"]
+        return sor[
+            (sor["as_of"] == d)
+            & (sor["legal_entity"] == self.filters.legal_entity)
+            & (sor["book"] == self.filters.book)
+            & (sor["ccy"] == self.filters.ccy)
+        ].copy()
+
+    # -------- computations
+    def recon_gl_vs_sor(self) -> pd.DataFrame:
+        gl = self.gl_filtered()
+        sor = self.sor_filtered()
+        key = ["as_of", "legal_entity", "book", "ccy", "account", "account_name", "product"]
+        if gl.empty:
+            return pd.DataFrame(columns=key + ["gl_amount", "sor_amount", "variance", "abs_var", "status", "severity"])
+        g = gl[key + ["gl_amount"]].copy()
+        o = sor[key + ["sor_amount"]].copy() if not sor.empty else pd.DataFrame(columns=key + ["sor_amount"])
+        m = g.merge(o, on=key, how="left")
+        m["sor_amount"] = m["sor_amount"].fillna(0.0)
+        m["variance"] = m["gl_amount"] - m["sor_amount"]
+        m["abs_var"] = m["variance"].abs()
+        tol = float(self.spn_tol.value())
+        m["status"] = np.where(m["abs_var"] <= tol, "MATCH", "BREAK")
+        m["severity"] = m["variance"].apply(lambda x: severity_from_amt(x, self.filters.materiality))
+        return m
+
+    def recon_crrt_vs_cr360(self) -> pd.DataFrame:
+        d = self.filters.as_of
+        crrt = self.data["crrt"]
+        cr360 = self.data["cr360"]
+        crrt_f = crrt[(crrt["as_of"] == d) & (crrt["legal_entity"] == self.filters.legal_entity) & (crrt["book"] == self.filters.book) & (crrt["ccy"] == self.filters.ccy)].copy()
+        cr360_f = cr360[(cr360["as_of"] == d) & (cr360["legal_entity"] == self.filters.legal_entity) & (cr360["book"] == self.filters.book) & (cr360["ccy"] == self.filters.ccy)].copy()
+        key = ["as_of", "legal_entity", "book", "ccy", "account"]
+        if crrt_f.empty:
+            return pd.DataFrame(columns=key + ["crrt_amount", "cr360_amount", "variance", "abs_var", "status"])
+        m = crrt_f.merge(cr360_f[key + ["cr360_amount"]], on=key, how="left")
+        m["cr360_amount"] = m["cr360_amount"].fillna(0.0)
+        m["variance"] = m["crrt_amount"] - m["cr360_amount"]
+        m["abs_var"] = m["variance"].abs()
+        tol2 = float(self.spn_tol2.value())
+        m["status"] = np.where(m["abs_var"] <= tol2, "MATCH", "BREAK")
+        return m
+
+    def variance_pop(self) -> pd.DataFrame:
+        cur = self.gl_filtered(self.filters.as_of)
+        prior = self.gl_filtered(self.data["prior"])
+        if cur.empty:
+            return pd.DataFrame(columns=["account", "account_name", "product", "cur", "prior", "variance", "abs_var", "severity"])
+        c = cur.groupby(["account", "account_name", "product"], as_index=False).agg(cur=("gl_amount", "sum"))
+        p = prior.groupby(["account", "account_name", "product"], as_index=False).agg(prior=("gl_amount", "sum")) if not prior.empty else pd.DataFrame(columns=["account", "account_name", "product", "prior"])
+        v = c.merge(p, on=["account", "account_name", "product"], how="left").fillna(0.0)
+        v["variance"] = v["cur"] - v["prior"]
+        v["abs_var"] = v["variance"].abs()
+        v["severity"] = v["variance"].apply(lambda x: severity_from_amt(x, self.filters.materiality))
+        return v.sort_values("abs_var", ascending=False)
+
+    def report_lines(self, report: str) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+        map_df = self.data["map"].copy()
+        if report == "FR Y (Other)":
+            map_df = map_df[map_df["report"] == "Y-9C"].copy()
+            map_df["report"] = report
+        else:
+            map_df = map_df[map_df["report"] == report].copy()
+
+        gl = self.gl_filtered()
+        cols = ["report_line", "line_desc", "amount", "recon_abs_var", "recon_status", "mapped_accounts"]
+        if map_df.empty or gl.empty:
+            return pd.DataFrame(columns=cols), {}
+
+        joined = map_df.merge(gl, on="account", how="left")
+        joined["gl_amount"] = joined["gl_amount"].fillna(0.0)
+        line_amt = joined.groupby(["report_line", "line_desc"], as_index=False).agg(
+            amount=("gl_amount", "sum"),
+            mapped_accounts=("account", "nunique"),
+        )
+
+        accs_by_line = map_df.groupby("report_line")["account"].apply(lambda x: sorted(set(x))).to_dict()
+        recon = self.recon_gl_vs_sor()
+        by_acc = recon.groupby("account", as_index=False).agg(abs_var=("abs_var", "sum")) if not recon.empty else pd.DataFrame(columns=["account", "abs_var"])
+
+        def risk(accs: List[str]) -> float:
+            if not accs or by_acc.empty:
+                return 0.0
+            return float(by_acc[by_acc["account"].isin(accs)]["abs_var"].sum())
+
+        line_amt["recon_abs_var"] = line_amt["report_line"].apply(lambda ln: risk(accs_by_line.get(ln, [])))
+        line_amt["recon_status"] = np.where(line_amt["recon_abs_var"] <= self.filters.materiality * 0.001, "OK", "AT_RISK")
+        return line_amt.sort_values("recon_abs_var", ascending=False), accs_by_line
+
+    # -------- audit log
+    def log_action(self, action: str, object_type: str, object_id: str, details: str):
+        new = pd.DataFrame([{
+            "ts": now_str(),
+            "user": self.current_user,
+            "action": action,
+            "object_type": object_type,
+            "object_id": object_id,
+            "details": details
+        }])
+        self.audit = pd.concat([self.audit, new], ignore_index=True)
+        self.refresh_audit()
+
+    # -------- refresh
+    def refresh_all(self):
+        self.spn_tol.blockSignals(True)
+        self.spn_tol.setValue(max(0, int(self.filters.materiality * 0.001)))
+        self.spn_tol.blockSignals(False)
+
+        self.spn_tol2.blockSignals(True)
+        self.spn_tol2.setValue(max(0, int(self.filters.materiality * 0.0005)))
+        self.spn_tol2.blockSignals(False)
+
+        self.refresh_dashboard()
+        self.refresh_feed()
+        self.refresh_gl_explorer()
+        self.refresh_recon()
+        self.refresh_breaks()
+        self.refresh_variance()
+        self.refresh_reporting()
+        self.refresh_lineage()
+        self.refresh_audit()
+
+        self.status.showMessage(
+            f"{self.filters.as_of} | {self.filters.legal_entity} | {self.filters.book} | {self.filters.ccy} | Mat={int(self.filters.materiality):,}",
+            5000
+        )
+
+    def refresh_dashboard(self):
+        recon = self.recon_gl_vs_sor()
+        breaks = recon[recon["status"] == "BREAK"].copy() if not recon.empty else pd.DataFrame()
+        material_breaks = breaks[breaks["abs_var"] >= self.filters.materiality].copy() if not breaks.empty else pd.DataFrame()
+
+        feeds_today = self.data["feed"][self.data["feed"]["as_of"] == self.filters.as_of].copy()
+        late_failed = feeds_today[feeds_today["status"].isin(["LATE", "FAILED"])].copy()
+
+        completion = 1.0 - (len(breaks) / max(len(recon), 1)) if not recon.empty else 1.0
+
+        self.lbl_kpi_material.setText(str(len(material_breaks)))
+        self.lbl_kpi_open.setText(str(len(breaks)))
+        self.lbl_kpi_feeds.setText(str(len(late_failed)))
+        self.lbl_kpi_recon.setText(fmt_pct(completion))
+        self.lbl_kpi_cert.setText("3/6")
+
+        top = recon.sort_values("abs_var", ascending=False).head(12)[
+            ["product", "account", "account_name", "gl_amount", "sor_amount", "variance", "abs_var", "status", "severity"]
+        ].copy() if not recon.empty else pd.DataFrame()
+        self.model_top_breaks.set_df(top)
+
+        snap = feeds_today[["source", "layer", "status", "latency_min", "records", "rejects", "run_id"]].copy() if not feeds_today.empty else pd.DataFrame()
+        self.model_feed_snap.set_df(snap)
+
+        readiness = pd.DataFrame([
+            {"Report": "FR2590", "Recon Complete": "OK" if len(material_breaks) < 8 else "AT RISK", "DQ": "AT RISK", "Approvals": "PENDING", "Status": "IN PROGRESS"},
+            {"Report": "Y-9C", "Recon Complete": "OK", "DQ": "OK", "Approvals": "PENDING", "Status": "IN PROGRESS"},
+            {"Report": "FR Y (Other)", "Recon Complete": "AT RISK", "DQ": "AT RISK", "Approvals": "PENDING", "Status": "AT RISK"},
+            {"Report": "CCAR", "Recon Complete": "OK", "DQ": "OK", "Approvals": "OK", "Status": "READY"},
+            {"Report": "CECL/ACL", "Recon Complete": "OK", "DQ": "OK", "Approvals": "PENDING", "Status": "IN PROGRESS"},
+            {"Report": "STARE", "Recon Complete": "AT RISK", "DQ": "AT RISK", "Approvals": "PENDING", "Status": "AT RISK"},
+            {"Report": "ERA", "Recon Complete": "OK", "DQ": "OK", "Approvals": "PENDING", "Status": "IN PROGRESS"},
+        ])
+        self.model_readiness.set_df(readiness)
+
+    def refresh_feed(self):
+        f = self.data["feed"][self.data["feed"]["as_of"] == self.filters.as_of].copy()
+        self.model_feed.set_df(f)
+
+        self.cmb_feed_pick.blockSignals(True)
+        self.cmb_feed_pick.clear()
+        for s in f["source"].tolist():
+            self.cmb_feed_pick.addItem(s)
+        self.cmb_feed_pick.blockSignals(False)
+
+        if not f.empty:
+            rej = pd.DataFrame({
+                "source": np.random.choice(f["source"], 30),
+                "error_code": np.random.choice(["MISSING_DIM", "INVALID_ACCOUNT", "BAD_CCY", "DUP_KEY", "CONTROL_MISMATCH"], 30),
+                "sample_key": [f"K{np.random.randint(100000, 999999)}" for _ in range(30)],
+                "detail": np.random.choice(
+                    ["Missing cost_center", "Account not in COA", "Currency mismatch", "Duplicate reference id", "Control total variance"],
+                    30
+                ),
+            })
+        else:
+            rej = pd.DataFrame(columns=["source", "error_code", "sample_key", "detail"])
+        self.model_rejects.set_df(rej)
+        self.model_rules.set_df(self.data["rules"].copy())
+
+    def refresh_gl_explorer(self):
+        q = (self.ed_gl_search.text() or "").strip().lower()
+        gl = self.gl_filtered()
+        if gl.empty:
+            self.model_gl.set_df(pd.DataFrame(columns=["account", "account_name", "product", "gl_amount"]))
+            self.model_map_for_acc.set_df(pd.DataFrame(columns=["report", "report_line", "line_desc"]))
+            self.lbl_ctx.setText("No GL data for current filters.")
+            return
+
+        tb = gl.groupby(["account", "account_name", "product"], as_index=False).agg(gl_amount=("gl_amount", "sum"))
+        if q:
+            tb = tb[
+                tb["account"].astype(str).str.contains(q, case=False)
+                | tb["account_name"].astype(str).str.lower().str.contains(q)
+            ].copy()
+        tb = tb.sort_values(["account", "product"])
+        self.model_gl.set_df(tb)
+
+        self.model_map_for_acc.set_df(pd.DataFrame(columns=["report", "report_line", "line_desc"]))
+        self.lbl_ctx.setText("Select a row to see mappings and lineage.")
+
+    def on_gl_row_selected(self, idx: QModelIndex):
+        item = self.model_gl.get_row(idx.row())
+        acc = str(item.get("account", ""))
+        prod = str(item.get("product", ""))
+        amt = item.get("gl_amount", 0.0)
+
+        mm = self.data["map"][self.data["map"]["account"] == acc][["report", "report_line", "line_desc"]].drop_duplicates().copy()
+        self.model_map_for_acc.set_df(mm)
+
+        self.lbl_ctx.setText(
+            f"Account {acc} | Product {prod}\nAmount: {fmt_money(amt)}\n\n"
+            "Lineage:\nSource: GL_CORE / SUBLEDGER_SOR → Enterprise GL Mart → CRRT → CR360 → Reporting"
+        )
+
+    def refresh_recon(self):
+        recon = self.recon_gl_vs_sor()
+        view = recon.sort_values("abs_var", ascending=False)[
+            ["product", "account", "account_name", "gl_amount", "sor_amount", "variance", "abs_var", "status", "severity"]
+        ].copy() if not recon.empty else pd.DataFrame(columns=["product", "account", "account_name", "gl_amount", "sor_amount", "variance", "abs_var", "status", "severity"])
+        self.model_recon.set_df(view)
+
+        recon2 = self.recon_crrt_vs_cr360()
+        view2 = recon2.sort_values("abs_var", ascending=False)[
+            ["account", "crrt_amount", "cr360_amount", "variance", "abs_var", "status"]
+        ].copy() if not recon2.empty else pd.DataFrame(columns=["account", "crrt_amount", "cr360_amount", "variance", "abs_var", "status"])
+        self.model_recon2.set_df(view2)
+
+        self.refresh_dashboard()
+
+    def refresh_breaks(self):
+        b = self.breaks.copy()
+        status = self.cmb_break_status.currentText()
+        if status != "(All)" and not b.empty:
+            b = b[b["status"] == status].copy()
+        self.model_breaks.set_df(b.sort_values(["severity", "created_ts"], ascending=[False, False]) if not b.empty else b)
+
+    def refresh_variance(self):
+        v = self.variance_pop()
+        view = v.head(30)[["account", "account_name", "product", "cur", "prior", "variance", "abs_var", "severity"]].copy() if not v.empty else pd.DataFrame(columns=["account", "account_name", "product", "cur", "prior", "variance", "abs_var", "severity"])
+        self.model_variance.set_df(view)
+        self._selected_variance_key = None
+        self.lbl_var_pick.setText("(Select a variance row)")
+        self.txt_var_narr.setPlainText("")
+
+    def refresh_reporting(self):
+        report = self.cmb_report.currentText()
+        lines, accs_by_line = self.report_lines(report)
+        self._accs_by_line = accs_by_line
+
+        view = lines[["report_line", "line_desc", "amount", "recon_abs_var", "recon_status", "mapped_accounts"]].copy() if not lines.empty else pd.DataFrame(columns=["report_line", "line_desc", "amount", "recon_abs_var", "recon_status", "mapped_accounts"])
+        self.model_report_lines.set_df(view)
+        self.model_line_drill.set_df(pd.DataFrame(columns=["account", "account_name", "product", "amount"]))
+        self._selected_report_line = None
+
+    def refresh_lineage(self):
+        self.model_map.set_df(self.data["map"].sort_values(["report", "report_line", "account"]).copy())
+        gl = self.gl_filtered()
+        accs = sorted(gl["account"].unique().tolist()) if not gl.empty else sorted(self.data["map"]["account"].unique().tolist())
+
+        self.cmb_lineage_acc.blockSignals(True)
+        self.cmb_lineage_acc.clear()
+        for a in accs:
+            self.cmb_lineage_acc.addItem(str(a))
+        self.cmb_lineage_acc.blockSignals(False)
+
+        if accs:
+            self.cmb_lineage_acc.setCurrentIndex(0)
+            self.refresh_lineage_side()
+
+    def refresh_lineage_side(self):
+        acc = self.cmb_lineage_acc.currentText().strip()
+        if not acc:
+            self.lbl_lineage.setText("No account selected.")
+            self.model_related.set_df(pd.DataFrame(columns=["report", "report_line", "line_desc"]))
+            return
+        related = self.data["map"][self.data["map"]["account"] == acc][["report", "report_line", "line_desc"]].drop_duplicates().copy()
+        self.model_related.set_df(related)
+        self.lbl_lineage.setText(
+            f"Account: {acc}\nEntity: {self.filters.legal_entity} | Book: {self.filters.book} | CCY: {self.filters.ccy} | As-of: {self.filters.as_of}\n\n"
+            "Lineage Path:\n1) GL_CORE + SUBLEDGER_SOR\n2) Enterprise GL Data Mart\n3) CRRT\n4) CR360\n5) Reporting: FR2590 / Y-9C / FR-Y / CCAR / CECL-ACL / STARE / ERA"
+        )
+
+    def refresh_audit(self):
+        a = self.audit.sort_values("ts", ascending=False).copy() if not self.audit.empty else pd.DataFrame(columns=["ts", "user", "action", "object_type", "object_id", "details"])
+        self.model_audit.set_df(a)
+
+        b = self.breaks.copy()
+        evid = b[b["evidence_ref"].astype(str).str.len() > 0][["break_id", "as_of", "recon_type", "severity", "status", "evidence_ref", "notes"]].copy() if not b.empty else pd.DataFrame(columns=["break_id", "as_of", "recon_type", "severity", "status", "evidence_ref", "notes"])
+        self.model_evidence.set_df(evid)
+
+    # -------- actions
+    def create_largest_break(self):
+        recon = self.recon_gl_vs_sor()
+        if recon.empty:
+            QMessageBox.warning(self, "No Data", "No recon data for current filters.")
+            return
+        row = recon.sort_values("abs_var", ascending=False).iloc[0].to_dict()
+        bid = hash_id("BRK")
+        new_break = {
+            "break_id": bid,
+            "created_ts": now_str(),
+            "as_of": self.filters.as_of,
+            "recon_type": "GL vs SOR",
+            "legal_entity": self.filters.legal_entity,
+            "book": self.filters.book,
+            "ccy": self.filters.ccy,
+            "account": row.get("account", ""),
+            "product": row.get("product", ""),
+            "gl_amount": safe_float(row.get("gl_amount"), 0.0),
+            "other_amount": safe_float(row.get("sor_amount"), 0.0),
+            "variance": safe_float(row.get("variance"), 0.0),
+            "severity": severity_from_amt(row.get("variance"), self.filters.materiality),
+            "root_cause": "UNCLASSIFIED",
+            "owner": "Recon Analyst",
+            "status": "OPEN",
+            "sla_due": (date.today() + timedelta(days=2)).isoformat(),
+            "notes": "Auto-created from dashboard action",
+            "evidence_ref": "",
+        }
+        self.breaks = pd.concat([self.breaks, pd.DataFrame([new_break])], ignore_index=True)
+        self.log_action("CREATE", "BREAK", bid, f"Dashboard create account={new_break['account']} product={new_break['product']}")
+        self.refresh_breaks()
+        QMessageBox.information(self, "Break Created", f"Created break: {bid}")
+
+    def create_breaks_from_selected_recon_rows(self):
+        sel = self.tbl_recon.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select Rows", "Select one or more recon rows first.")
+            return
+        if self.model_recon._df.empty:
+            QMessageBox.warning(self, "No Data", "Recon table is empty.")
+            return
+
+        created = 0
+        for s in sel:
+            r = self.model_recon.get_row(s.row())
+            bid = hash_id("BRK")
+            new_break = {
+                "break_id": bid,
+                "created_ts": now_str(),
+                "as_of": self.filters.as_of,
+                "recon_type": "GL vs SOR",
+                "legal_entity": self.filters.legal_entity,
+                "book": self.filters.book,
+                "ccy": self.filters.ccy,
+                "account": r.get("account", ""),
+                "product": r.get("product", ""),
+                "gl_amount": safe_float(r.get("gl_amount"), 0.0),
+                "other_amount": safe_float(r.get("sor_amount"), 0.0),
+                "variance": safe_float(r.get("variance"), 0.0),
+                "severity": severity_from_amt(r.get("variance"), self.filters.materiality),
+                "root_cause": "UNCLASSIFIED",
+                "owner": "Recon Analyst",
+                "status": "OPEN",
+                "sla_due": (date.today() + timedelta(days=2)).isoformat(),
+                "notes": "",
+                "evidence_ref": "",
+            }
+            self.breaks = pd.concat([self.breaks, pd.DataFrame([new_break])], ignore_index=True)
+            self.log_action("CREATE", "BREAK", bid, f"Recon selection account={new_break['account']} product={new_break['product']}")
+            created += 1
+
+        self.refresh_breaks()
+        QMessageBox.information(self, "Breaks Created", f"Created {created} breaks.")
+
+    def edit_selected_break(self):
+        sel = self.tbl_breaks.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select Break", "Select a break row to edit.")
+            return
+        pick = self.model_breaks.get_row(sel[0].row())
+        bid = pick.get("break_id", "")
+        if not bid:
+            QMessageBox.warning(self, "Invalid", "Selected break is invalid.")
+            return
+
+        idxs = self.breaks.index[self.breaks["break_id"] == bid]
+        if len(idxs) == 0:
+            QMessageBox.warning(self, "Not Found", "Break not found.")
+            return
+
+        master_row = self.breaks.loc[idxs[0]].to_dict()
+        dlg = BreakEditorDialog(master_row, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            updated = dlg.break_row
+            for k, v in updated.items():
+                if k in self.breaks.columns:
+                    self.breaks.loc[idxs[0], k] = v
+            self.log_action("UPDATE", "BREAK", bid, f"status={updated.get('status')} root={updated.get('root_cause')} owner={updated.get('owner')}")
+            self.refresh_breaks()
+            QMessageBox.information(self, "Saved", "Break updated.")
+
+    def rerun_feed(self):
+        src = self.cmb_feed_pick.currentText().strip()
+        if not src:
+            QMessageBox.warning(self, "No Feed", "No feed selected.")
+            return
+        self.log_action("RERUN", "FEED", src, f"Rerun requested as_of={self.filters.as_of}")
+        QMessageBox.information(self, "Logged", "Rerun request logged (demo).")
+
+    def create_incident(self):
+        src = self.cmb_feed_pick.currentText().strip() or "(none)"
+        inc = hash_id("INC")
+        self.log_action("CREATE", "INCIDENT", inc, f"Incident for feed={src} as_of={self.filters.as_of}")
+        QMessageBox.information(self, "Incident Created", f"Incident created: {inc}")
+
+    def on_variance_selected(self, idx: QModelIndex):
+        r = self.model_variance.get_row(idx.row())
+        acc = r.get("account", "")
+        prod = r.get("product", "")
+        self._selected_variance_key = f"{acc}|{prod}"
+        self.lbl_var_pick.setText(f"{acc} | {prod} | abs_var={fmt_money(r.get('abs_var', 0.0))}")
+
+    def save_variance_explanation(self):
+        if not self._selected_variance_key:
+            QMessageBox.information(self, "Select Variance", "Select a variance row first.")
+            return
+        reason = self.cmb_var_reason.currentText()
+        narrative = self.txt_var_narr.toPlainText().strip()
+        if not narrative:
+            QMessageBox.warning(self, "Narrative Required", "Please enter a narrative explanation.")
+            return
+        self.log_action("EXPLAIN", "VARIANCE", self._selected_variance_key, f"reason={reason}; narrative={narrative[:240]}")
+        QMessageBox.information(self, "Saved", "Variance explanation saved to audit log.")
+
+    def on_report_line_selected(self, idx: QModelIndex):
+        r = self.model_report_lines.get_row(idx.row())
+        line = r.get("report_line", "")
+        if not line:
+            self.model_line_drill.set_df(pd.DataFrame(columns=["account", "account_name", "product", "amount"]))
+            self._selected_report_line = None
+            return
+
+        self._selected_report_line = f"{self.cmb_report.currentText()}-{line}"
+        accs = self._accs_by_line.get(line, [])
+        gl = self.gl_filtered()
+
+        if gl.empty or not accs:
+            self.model_line_drill.set_df(pd.DataFrame(columns=["account", "account_name", "product", "amount"]))
+            return
+
+        drill = gl[gl["account"].isin(accs)].groupby(["account", "account_name", "product"], as_index=False).agg(amount=("gl_amount", "sum"))
+        drill = drill.sort_values("amount", ascending=False)
+        self.model_line_drill.set_df(drill)
+
+    def certify_selected_line(self):
+        sel = self.tbl_report_lines.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select Line", "Select a report line to certify.")
+            return
+        r = self.model_report_lines.get_row(sel[0].row())
+        line = r.get("report_line", "")
+        if not line:
+            QMessageBox.warning(self, "Invalid", "Selected line is invalid.")
+            return
+        rep = self.cmb_report.currentText()
+        self.log_action("CERTIFY", "REPORT_LINE", f"{rep}-{line}", f"Certified as_of={self.filters.as_of}")
+        QMessageBox.information(self, "Certified", "Report line certified (demo log).")
+
+    def lock_report_cycle(self):
+        rep = self.cmb_report.currentText()
+        self.log_action("LOCK", "REPORT", rep, f"Locked as_of={self.filters.as_of}")
+        QMessageBox.information(self, "Locked", "Report cycle locked (demo log).")
+
+    def reset_demo(self):
+        self.data = seed_data()
+        self.breaks = self.breaks.iloc[0:0].copy()
+        self.audit = self.audit.iloc[0:0].copy()
+        self.refresh_all()
+        QMessageBox.information(self, "Reset", "Demo has been reset.")
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
+
+def main():
+    app = QApplication(sys.argv)
+    app.setFont(QFont("Arial", 10))
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
