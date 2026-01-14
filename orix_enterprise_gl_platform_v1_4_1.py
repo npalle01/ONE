@@ -1,0 +1,3596 @@
+# orix_enterprise_gl_platform.py
+# Enterprise-grade PyQt6 prototype (single-file, embedded demo data)
+# Install: pip install PyQt6 pandas numpy
+# Run:     python orix_enterprise_gl_platform.py
+
+import sys
+import json
+from pathlib import Path
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt
+from PyQt6.QtGui import QAction, QFont, QGuiApplication, QColor, QBrush
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame, QGroupBox,
+    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QInputDialog,
+    QMessageBox, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStatusBar, QDockWidget,
+    QStyledItemDelegate, QStyleOptionViewItem, QTableView, QTabWidget, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+)
+
+APP_NAME = "ORIX | Enterprise GL Platform (Prototype)"
+APP_VERSION = "v1.4"
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and np.isnan(x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def fmt_money(x: Any) -> str:
+    v = safe_float(x, 0.0)
+    s = f"{abs(v):,.0f}" if abs(v) >= 1e6 else f"{abs(v):,.2f}"
+    return f"({s})" if v < 0 else s
+
+def fmt_big(x: Any) -> str:
+    v = safe_float(x, 0.0)
+    av = abs(v)
+    if av >= 1e9:
+        return f"{v/1e9:.2f}B"
+    if av >= 1e6:
+        return f"{v/1e6:.2f}M"
+    if av >= 1e3:
+        return f"{v/1e3:.2f}K"
+    return f"{v:.2f}"
+
+def fmt_pct(x: float) -> str:
+    x = max(0.0, min(1.0, float(x)))
+    return f"{x*100:.1f}%"
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}-{np.random.randint(10000, 99999)}"
+
+def severity_from_amt(amt: Any, materiality: float) -> str:
+    a = abs(safe_float(amt, 0.0))
+    if a >= materiality:
+        return "MATERIAL"
+    if a >= materiality * 0.25:
+        return "HIGH"
+    if a >= materiality * 0.10:
+        return "MEDIUM"
+    return "LOW"
+
+def sla_status(age_days: int, sla_days: int) -> str:
+    if sla_days <= 0:
+        return "AT_RISK"
+    ratio = age_days / float(sla_days)
+    if ratio >= 1.0:
+        return "BREACHED"
+    if ratio >= 0.7:
+        return "AT_RISK"
+    return "ON_TRACK"
+
+# ----------------------------
+# Embedded demo data (shape-safe)
+# ----------------------------
+
+def seed_data() -> Dict[str, Any]:
+    entities = ["US_HOLDCO", "US_BANK", "UK_BRANCH"]
+    books = ["GAAP", "STAT"]
+    currencies = ["USD", "GBP"]
+    products = ["LOANS", "DEPOSITS", "TRADING", "TREASURY"]
+    accounts = [
+        ("100100", "Cash & Due From Banks"),
+        ("120200", "Loans - HFI"),
+        ("200100", "Deposits"),
+        ("310000", "Trading Assets"),
+        ("510000", "Interest Income"),
+        ("610000", "Interest Expense"),
+        ("710000", "Provision for Credit Losses"),
+    ]
+
+    asof = date(2026, 1, 8)
+    prior = asof - timedelta(days=31)
+
+    rng = np.random.default_rng(7)
+    rows: List[Dict[str, Any]] = []
+
+    # GL balances (two closes)
+    for d in [prior, asof]:
+        for le in entities:
+            for book in books:
+                for ccy in currencies:
+                    for acc, acc_name in accounts:
+                        for prod in products:
+                            base = float(rng.normal(0, 1))
+                            scale = {
+                                "100100": 2.2e9,
+                                "120200": 6.8e9,
+                                "200100": -7.1e9,
+                                "310000": 1.9e9,
+                                "510000": 0.45e9,
+                                "610000": -0.25e9,
+                                "710000": -0.12e9,
+                            }[acc]
+                            le_mult = {"US_HOLDCO": 1.0, "US_BANK": 0.9, "UK_BRANCH": 0.35}[le]
+                            prod_mult = {"LOANS": 1.1, "DEPOSITS": 0.95, "TRADING": 1.0, "TREASURY": 0.7}[prod]
+                            book_mult = {"GAAP": 1.0, "STAT": 0.8}[book]
+                            ccy_mult = {"USD": 1.0, "GBP": 0.28}[ccy]
+
+                            amt = (base * 0.015 + 1.0) * scale * le_mult * prod_mult * book_mult * ccy_mult
+                            drift = 1.0 if d == prior else (1.0 + float(rng.normal(0.01, 0.006)))
+                            amt *= drift
+
+                            rows.append({
+                                "as_of": d,
+                                "legal_entity": le,
+                                "book": book,
+                                "ccy": ccy,
+                                "account": acc,
+                                "account_name": acc_name,
+                                "product": prod,
+                                "gl_amount": float(amt),
+                            })
+
+    gl = pd.DataFrame(rows)
+
+    # SOR = GL + controlled recon noise on as-of slice
+    sor = gl.rename(columns={"gl_amount": "sor_amount"}).copy()
+    mask_asof = (sor["as_of"] == asof)
+    sor_asof = sor.loc[mask_asof].copy()
+
+    cond_asof = (sor_asof["account"].isin(["120200", "200100"])) & (sor_asof["product"].isin(["LOANS", "DEPOSITS"]))
+    noise = rng.normal(0.002, 0.001, size=int(mask_asof.sum()))
+    multipliers = np.where(cond_asof.to_numpy(), 1.0 + noise, 1.0)
+    sor.loc[mask_asof, "sor_amount"] = sor_asof["sor_amount"].to_numpy() * multipliers
+
+    # force a material break
+    miss_mask = (
+        (sor["as_of"] == asof) &
+        (sor["legal_entity"] == "UK_BRANCH") &
+        (sor["product"] == "TRADING") &
+        (sor["account"] == "310000")
+    )
+    sor.loc[miss_mask, "sor_amount"] = sor.loc[miss_mask, "sor_amount"] * 0.92
+
+    # CRRT and CR360 (aggregations)
+    crrt = gl.groupby(["as_of", "legal_entity", "book", "ccy", "account"], as_index=False).agg(crrt_amount=("gl_amount", "sum"))
+    cr360 = crrt.copy()
+    cr360["cr360_amount"] = cr360["crrt_amount"] * (1.0 + rng.normal(0.0008, 0.0005, size=len(cr360)))
+
+    # Feeds / ingestion runs
+    feed_sources = [
+        ("GL_CORE", "GL"),
+        ("SUBLEDGER_SOR", "SOR"),
+        ("CRRT_PIPE", "CRRT"),
+        ("CR360_PIPE", "CR360"),
+        ("ERA_SCCL", "ERA"),
+        ("STARE_FORECAST", "STARE"),
+    ]
+    feed_rows: List[Dict[str, Any]] = []
+    for src, layer in feed_sources:
+        for d in [prior, asof]:
+            status = "SUCCESS"
+            latency_min = int(abs(rng.normal(18, 9)))
+            records = int(abs(rng.normal(120000, 15000)))
+            rejects = int(abs(rng.normal(180, 70)))
+            if src == "STARE_FORECAST" and d == asof:
+                status = "LATE"
+                latency_min += 120
+            if src == "SUBLEDGER_SOR" and d == asof:
+                rejects += 420
+            feed_rows.append({
+                "as_of": d, "source": src, "layer": layer, "status": status,
+                "latency_min": latency_min, "records": records, "rejects": rejects,
+                "control_total": float(abs(rng.normal(1.8e10, 3.5e9))),
+                "run_id": f"RUN-{src}-{d.strftime('%Y%m%d')}"
+            })
+    feed = pd.DataFrame(feed_rows)
+
+    # Mapping repository (reg + analytics)
+    mapping_rows = [
+        ("FR2590", "L1", "Cash & Central Bank", ["100100"]),
+        ("FR2590", "L2", "Loans Outstanding", ["120200"]),
+        ("FR2590", "L3", "Trading Assets", ["310000"]),
+        ("FR2590", "L4", "Deposits", ["200100"]),
+        ("Y-9C", "HC-A1", "Cash and balances due", ["100100"]),
+        ("Y-9C", "HC-C1", "Loans and leases", ["120200"]),
+        ("Y-9C", "HC-L1", "Deposits", ["200100"]),
+        ("Y-9C", "HC-B1", "Trading assets", ["310000"]),
+        ("CCAR", "P&L1", "Net Interest Income", ["510000", "610000"]),
+        ("CECL/ACL", "ACL1", "Provision / ACL expense", ["710000"]),
+        ("STARE", "S1", "Forecast Loans", ["120200"]),
+        ("ERA", "E1", "SCCL Recon Coverage", ["120200", "200100", "310000"]),
+        ("FR Y-15", "Y15-1", "Systemic indicators (proxy)", ["100100","120200","200100","310000"]),
+        ("FR 2052a (LCR)", "LCR-1", "HQLA (proxy)", ["100100","310000"]),
+        ("FR 2052a (LCR)", "LCR-2", "Net cash outflows (proxy)", ["200100","510000","610000"]),
+        ("NSFR", "NSFR-1", "Available stable funding (proxy)", ["200100"]),
+        ("NSFR", "NSFR-2", "Required stable funding (proxy)", ["120200","310000"]),
+        ("Call Report", "FFIEC-1", "Schedule RC-R (proxy)", ["100100","120200","200100"]),
+    ]
+    rep_map = []
+    for rep, line, desc, accs in mapping_rows:
+        for a in accs:
+            rep_map.append({"report": rep, "report_line": line, "line_desc": desc, "account": a})
+    map_df = pd.DataFrame(rep_map)
+
+    # DQ rules / controls catalog
+    rules = pd.DataFrame([
+        {"rule_id":"DQ-001","rule_name":"Completeness - Required dimensions present","severity":"HIGH","owner":"Data Steward"},
+        {"rule_id":"DQ-002","rule_name":"Balance - Assets = Liabilities + Equity (entity/book)","severity":"MATERIAL","owner":"Controller"},
+        {"rule_id":"DQ-003","rule_name":"Timeliness - Feeds within SLA","severity":"MEDIUM","owner":"Ops"},
+        {"rule_id":"DQ-004","rule_name":"Recon - GL vs SOR within tolerance","severity":"MATERIAL","owner":"Recon Lead"},
+        {"rule_id":"DQ-005","rule_name":"Mapping - Report line coverage >= 99%","severity":"HIGH","owner":"Report Owner"},
+    ])
+
+    presets = pd.DataFrame([
+        {"preset":"Month-End Close (GAAP/USD)","legal_entity":"US_HOLDCO","book":"GAAP","ccy":"USD","materiality":1_000_000},
+        {"preset":"Reg Submission (FR2590)","legal_entity":"US_HOLDCO","book":"GAAP","ccy":"USD","materiality":2_000_000},
+        {"preset":"UK Branch (GAAP/GBP)","legal_entity":"UK_BRANCH","book":"GAAP","ccy":"GBP","materiality":500_000},
+        {"preset":"STAT View (US Bank)","legal_entity":"US_BANK","book":"STAT","ccy":"USD","materiality":1_500_000},
+    ])
+
+
+    # ----------------------------
+    # SCCL / FR2590 exposure hierarchy (demo)
+    # ----------------------------
+    # Org hierarchy (A-Node → Booking Entity)
+    org_hier = pd.DataFrame([
+        {"node_id":"A_US_CONSOL","node_name":"A-NODE: US Consolidated Perimeter","node_type":"A_NODE","parent_id":None},
+        {"node_id":"B_US_BANK","node_name":"B-NODE: US Bank","node_type":"B_NODE","parent_id":"A_US_CONSOL"},
+        {"node_id":"B_BD","node_name":"B-NODE: Broker-Dealer","node_type":"B_NODE","parent_id":"A_US_CONSOL"},
+        {"node_id":"B_UK","node_name":"B-NODE: UK Branch","node_type":"B_NODE","parent_id":"A_US_CONSOL"},
+        {"node_id":"LE_US_HOLDCO","node_name":"US_HOLDCO","node_type":"BOOKING_ENTITY","parent_id":"A_US_CONSOL"},
+        {"node_id":"LE_US_BANK","node_name":"US_BANK","node_type":"BOOKING_ENTITY","parent_id":"B_US_BANK"},
+        {"node_id":"LE_UK_BRANCH","node_name":"UK_BRANCH","node_type":"BOOKING_ENTITY","parent_id":"B_UK"},
+    ])
+
+    # Counterparty hierarchy (Counterparty → Ultimate Parent → Connected Group)
+    cps = [
+        ("CP1001","Alpha Energy LLC","UP900","Alpha Holdings","CG-A","Connected Group A"),
+        ("CP1002","Beta Telecom Inc","UP901","Beta Group","CG-B","Connected Group B"),
+        ("CP1003","Gamma Trading Co","UP900","Alpha Holdings","CG-A","Connected Group A"),
+        ("CP1004","Delta Infra SPV","UP902","Delta Parent","CG-C","Connected Group C"),
+        ("CP1005","Epsilon Retail Ltd","UP903","Epsilon Parent","CG-D","Connected Group D"),
+        ("CP1006","Zeta Capital Mgmt","UP904","Zeta Parent","CG-E","Connected Group E"),
+        ("CP1007","Omega Shipping BV","UP902","Delta Parent","CG-C","Connected Group C"),
+        ("CP1008","Sigma Metals SA","UP905","Sigma Parent","CG-F","Connected Group F"),
+    ]
+    counterparty = pd.DataFrame([{
+        "counterparty_id":cp,"counterparty_name":nm,
+        "ultimate_parent_id":up,"ultimate_parent_name":upnm,
+        "connected_group_id":cg,"connected_group_name":cgnm
+    } for cp,nm,up,upnm,cg,cgnm in cps])
+
+    # Netting / agreements
+    netting = pd.DataFrame([
+        {"netting_set_id":"NS-100","agreement_type":"ISDA/CSA","margining":"VM+IM","threshold":50_000_000},
+        {"netting_set_id":"NS-200","agreement_type":"GMRA","margining":"VM","threshold":25_000_000},
+        {"netting_set_id":"NS-300","agreement_type":"None","margining":"NONE","threshold":0},
+    ])
+
+    # Collateral catalog (allocated to netting sets / exposures downstream)
+    collateral = pd.DataFrame([
+        {"collateral_id":"COL-01","collateral_type":"Cash","ccy":"USD","haircut":0.00},
+        {"collateral_id":"COL-02","collateral_type":"UST","ccy":"USD","haircut":0.02},
+        {"collateral_id":"COL-03","collateral_type":"Gilt","ccy":"GBP","haircut":0.03},
+        {"collateral_id":"COL-04","collateral_type":"Corp Bond","ccy":"USD","haircut":0.08},
+    ])
+
+    # Atomic SCCL exposures (illustrative). Grain ≈ instrument/trade/facility.
+    exposure_categories = ["Loans/Commitments","Securities","Derivatives","SFT"]
+    inst_types = {
+        "Loans/Commitments":["FACILITY","TERM_LOAN","REVOLVER"],
+        "Securities":["BOND","EQUITY"],
+        "Derivatives":["IRS","FX_FWD","CDS"],
+        "SFT":["REPO","REV_REPO","SEC_LEND"]
+    }
+    booking_entities = ["US_HOLDCO","US_BANK","UK_BRANCH"]
+
+    sccl_rows: List[Dict[str, Any]] = []
+    for d in [prior, asof]:
+        for be in booking_entities:
+            # keep demo small but structured
+            for i, cp in enumerate(counterparty["counterparty_id"].tolist(), start=1):
+                cg = counterparty[counterparty["counterparty_id"]==cp].iloc[0]["connected_group_id"]
+                up = counterparty[counterparty["counterparty_id"]==cp].iloc[0]["ultimate_parent_id"]
+                for cat in exposure_categories:
+                    # 1-3 instruments per bucket
+                    n_inst = 1 + int(rng.integers(1, 3))
+                    for k in range(n_inst):
+                        inst_id = f"{cat[:3].upper()}-{cp}-{i:02d}-{k:02d}-{d.strftime('%m%d')}"
+                        it = str(rng.choice(inst_types[cat]))
+                        # base sizes (bank-style magnitudes)
+                        base = {
+                            "Loans/Commitments": 250_000_000,
+                            "Securities": 120_000_000,
+                            "Derivatives": 60_000_000,
+                            "SFT": 90_000_000,
+                        }[cat]
+                        be_mult = {"US_HOLDCO":1.00,"US_BANK":0.75,"UK_BRANCH":0.30}[be]
+                        cp_mult = 0.6 + 0.9 * float(rng.random())
+                        drift = 1.0 if d == prior else (1.0 + float(rng.normal(0.015, 0.01)))
+                        gross = base * be_mult * cp_mult * drift
+                        # netting/collateral only meaningful for derivatives/sft
+                        ns = "NS-300"
+                        col = None
+                        if cat in ("Derivatives","SFT"):
+                            ns = str(rng.choice(netting["netting_set_id"]))
+                            col = str(rng.choice(collateral["collateral_id"]))
+                        # simplistic netting & collateral impact
+                        net_factor = 0.88 if cat == "Derivatives" else (0.92 if cat == "SFT" else 1.0)
+                        col_hair = float(collateral[collateral["collateral_id"]==col]["haircut"].iloc[0]) if col else 0.0
+                        col_cover = 0.35 if col else 0.0
+                        net = gross * net_factor * (1.0 - (col_cover * (1.0 - col_hair)))
+                        ead = net * (1.05 if cat == "Loans/Commitments" else (1.12 if cat == "Derivatives" else 1.00))
+                        sccl_rows.append({
+                            "as_of": d,
+                            "a_node_id": "A_US_CONSOL",
+                            "booking_entity": be,
+                            "counterparty_id": cp,
+                            "ultimate_parent_id": up,
+                            "connected_group_id": cg,
+                            "exposure_category": cat,
+                            "instrument_id": inst_id,
+                            "instrument_type": it,
+                            "netting_set_id": ns,
+                            "collateral_id": col if col else "",
+                            "gross_exposure": float(gross),
+                            "net_exposure": float(net),
+                            "ead": float(ead),
+                        })
+    sccl_atomic = pd.DataFrame(sccl_rows)
+
+
+    return {
+        "asof": asof, "prior": prior,
+        "gl": gl, "sor": sor, "crrt": crrt, "cr360": cr360,
+        "feed": feed, "map": map_df, "rules": rules, "presets": presets,
+        "org_hier": org_hier, "counterparty": counterparty, "netting": netting,
+        "collateral": collateral, "sccl_atomic": sccl_atomic
+    }
+
+# ----------------------------
+# Pandas -> Qt model
+# ----------------------------
+
+class DataFrameModel(QAbstractTableModel):
+    def __init__(self, df: Optional[pd.DataFrame] = None, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._df = df.copy() if df is not None else pd.DataFrame()
+
+    def set_df(self, df: Optional[pd.DataFrame]):
+        self.beginResetModel()
+        self._df = df.copy() if df is not None else pd.DataFrame()
+        self.endResetModel()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._df)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._df.columns)
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if not index.isValid():
+            return None
+
+        # base formatting
+        if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
+            try:
+                v = self._df.iat[index.row(), index.column()]
+                col = str(self._df.columns[index.column()]).lower()
+                if isinstance(v, (float, np.floating, int, np.integer)) and any(
+                    k in col for k in ["amount", "variance", "control", "balance", "cur", "prior", "abs_var", "latency"]
+                ):
+                    return fmt_money(v) if "latency" not in col else str(int(safe_float(v, 0.0)))
+                return str(v)
+            except Exception:
+                return ""
+
+        # lightweight role-based coloring for key columns (delegate does the rest)
+        if role == Qt.ItemDataRole.ForegroundRole:
+            try:
+                col = str(self._df.columns[index.column()]).lower()
+                v = str(self._df.iat[index.row(), index.column()])
+                if "severity" in col:
+                    return QBrush(QColor({"LOW":"#A0A7B4","MEDIUM":"#F2C94C","HIGH":"#F2994A","MATERIAL":"#EB5757"}.get(v, "#A0A7B4")))
+                if "status" in col:
+                    if v in ("BREAK","FAILED","LATE","BREACHED"):
+                        return QBrush(QColor("#EB5757"))
+                    if v in ("MATCH","SUCCESS","ON_TRACK","OK","READY"):
+                        return QBrush(QColor("#27AE60"))
+                    if v in ("AT_RISK","IN REVIEW","IN PROGRESS"):
+                        return QBrush(QColor("#F2C94C"))
+            except Exception:
+                return None
+
+        return None
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            return str(self._df.columns[section]) if section < len(self._df.columns) else ""
+        return str(section + 1)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def get_row(self, row: int) -> Dict[str, Any]:
+        if row < 0 or row >= len(self._df):
+            return {}
+        return self._df.iloc[row].to_dict()
+
+# ----------------------------
+# Delegate for enterprise "badge" feel
+# ----------------------------
+
+class BadgeDelegate(QStyledItemDelegate):
+    def paint(self, painter, option: QStyleOptionViewItem, index: QModelIndex):
+        # Let default paint happen first
+        super().paint(painter, option, index)
+
+# ----------------------------
+# Dialogs
+# ----------------------------
+
+class BreakDialog(QDialog):
+    def __init__(self, row: Dict[str, Any], read_only: bool, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Break Detail")
+        self.setMinimumWidth(620)
+        self.row = row.copy()
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.lbl_id = QLabel(str(self.row.get("break_id", "")))
+        self.cmb_status = QComboBox()
+        self.cmb_status.addItems(["OPEN", "IN REVIEW", "APPROVED", "CLOSED"])
+        self.cmb_status.setCurrentText(str(self.row.get("status", "OPEN")))
+
+        self.ed_owner = QLineEdit(str(self.row.get("owner", "Recon Analyst")))
+
+        self.cmb_root = QComboBox()
+        self.cmb_root.addItems(["UNCLASSIFIED", "TIMING", "MAPPING", "MISSING_FEED", "FX", "SIGN", "DUPLICATION", "THRESHOLD", "MANUAL_ADJ"])
+        self.cmb_root.setCurrentText(str(self.row.get("root_cause", "UNCLASSIFIED")))
+
+        self.ed_evidence = QLineEdit(str(self.row.get("evidence_ref", "")))
+        self.ed_evidence.setPlaceholderText("Evidence URI / ticket / file reference")
+
+        self.txt_notes = QTextEdit()
+        self.txt_notes.setFixedHeight(160)
+        self.txt_notes.setPlainText(str(self.row.get("notes", "")))
+
+        sla_txt = f"Aging: {int(self.row.get('age_days', 0))}d | SLA: {int(self.row.get('sla_days', 2))}d | {self.row.get('sla_status', 'ON_TRACK')}"
+        self.lbl_sla = QLabel(sla_txt)
+        self.lbl_sla.setStyleSheet("color:#A0A7B4;")
+
+        form.addRow("Break ID", self.lbl_id)
+        form.addRow("Status", self.cmb_status)
+        form.addRow("Owner", self.ed_owner)
+        form.addRow("Root Cause", self.cmb_root)
+        form.addRow("Evidence Ref", self.ed_evidence)
+        form.addRow("SLA", self.lbl_sla)
+        form.addRow("Notes / Narrative", self.txt_notes)
+        layout.addLayout(form)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_close = QPushButton("Close")
+        self.btn_save = QPushButton("Save")
+        self.btn_save.setDefault(True)
+        btns.addWidget(self.btn_close)
+        btns.addWidget(self.btn_save)
+        layout.addLayout(btns)
+
+        if read_only:
+            for w in [self.cmb_status, self.ed_owner, self.cmb_root, self.ed_evidence, self.txt_notes, self.btn_save]:
+                w.setEnabled(False)
+
+        self.btn_close.clicked.connect(self.reject)
+        self.btn_save.clicked.connect(self._save)
+
+    def _save(self):
+        self.row["status"] = self.cmb_status.currentText()
+        self.row["owner"] = (self.ed_owner.text() or "").strip() or "Recon Analyst"
+        self.row["root_cause"] = self.cmb_root.currentText()
+        self.row["evidence_ref"] = (self.ed_evidence.text() or "").strip()
+        self.row["notes"] = (self.txt_notes.toPlainText() or "").strip()
+        self.accept()
+
+class ImpactPreview(QDialog):
+    def __init__(self, report: str, line: str, accs: List[str], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Impact Preview")
+        self.setMinimumWidth(620)
+        self.proposed = False
+        self.justification = ""
+
+        layout = QVBoxLayout(self)
+        lbl = QLabel(
+            f"Impact Preview (Read-only)\n\n"
+            f"Report: {report}\nLine: {line}\n\n"
+            f"Impacted accounts ({len(accs)}): {', '.join(accs) if accs else '—'}\n\n"
+            "Governance:\n"
+            "- Requires justification\n"
+            "- Maker-checker approval\n"
+            "- Audit logged"
+        )
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color:#A0A7B4;")
+        layout.addWidget(lbl)
+
+        form = QFormLayout()
+        self.ed_just = QLineEdit()
+        self.ed_just.setPlaceholderText("Justification (required to propose)")
+        form.addRow("Justification", self.ed_just)
+        layout.addLayout(form)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_prop = QPushButton("Propose Change")
+        btns.addWidget(self.btn_cancel)
+        btns.addWidget(self.btn_prop)
+        layout.addLayout(btns)
+
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_prop.clicked.connect(self._propose)
+
+    def _propose(self):
+        j = (self.ed_just.text() or "").strip()
+        if not j:
+            QMessageBox.warning(self, "Justification Required", "Enter a justification to propose.")
+            return
+        self.proposed = True
+        self.justification = j
+        self.accept()
+
+# ----------------------------
+# Main window
+# ----------------------------
+
+@dataclass
+class GlobalFilters:
+    as_of: date
+    legal_entity: str
+    book: str
+    ccy: str
+    materiality: float
+
+
+class EnterpriseDimTree(QWidget):
+    """Reusable enterprise-wide dimension navigator.
+
+    One consistent drill path across report tabs:
+    A-Node → Booking Entity → Counterparty hierarchy → Exposure/Product → Instrument/Trade → Netting/Collateral.
+
+    Updates MainWindow global filters (LE/Book/CCY) + SCCL filters (FR2590) without forcing a specific report.
+    """
+
+    def __init__(self, data: Dict[str, Any], on_change):
+        super().__init__()
+        self.data = data
+        self.on_change = on_change  # callback(dim:str, value:str)
+        self._building = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+
+        hdr = QLabel("Enterprise Dim Tree")
+        hdr.setStyleSheet("font-weight:900; font-size:14px;")
+        lay.addWidget(hdr)
+
+        self.ed_search = QLineEdit()
+        self.ed_search.setPlaceholderText("Search (node/counterparty/instrument)…")
+        self.ed_search.textChanged.connect(self._apply_search)
+        lay.addWidget(self.ed_search)
+
+        self.lbl_state = QLabel("—")
+        self.lbl_state.setWordWrap(True)
+        self.lbl_state.setStyleSheet("color:#A0A7B4;")
+        lay.addWidget(self.lbl_state)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.itemClicked.connect(self._on_item_clicked)
+        self.tree.setStyleSheet("QTreeWidget { background:#0F1115; border: 1px solid #22283A; border-radius: 12px; }")
+        lay.addWidget(self.tree, 1)
+
+        hint = QLabel("Tip: Ctrl+Shift+D toggles this panel.")
+        hint.setStyleSheet("color:#6F7787; font-size:11px;")
+        lay.addWidget(hint)
+
+        self.rebuild(global_filters=None, sccl_filters=None)
+
+    def rebuild(self, global_filters: Optional[Any], sccl_filters: Optional[Dict[str, str]]):
+        """Rebuild tree from current state; safe to call often (demo data sizes are small)."""
+        self._building = True
+        try:
+            self.tree.clear()
+
+            # --- Root sections
+            sec_org = QTreeWidgetItem(["Org / Reporting Perimeter"])
+            sec_org.setExpanded(True)
+            self.tree.addTopLevelItem(sec_org)
+
+            sec_book = QTreeWidgetItem(["Book / Currency"])
+            sec_book.setExpanded(True)
+            self.tree.addTopLevelItem(sec_book)
+
+            sec_cp = QTreeWidgetItem(["Counterparty Hierarchy"])
+            sec_cp.setExpanded(True)
+            self.tree.addTopLevelItem(sec_cp)
+
+            sec_exp = QTreeWidgetItem(["Exposure / Product"])
+            sec_exp.setExpanded(True)
+            self.tree.addTopLevelItem(sec_exp)
+
+            sec_instr = QTreeWidgetItem(["Instrument / Netting / Collateral"])
+            sec_instr.setExpanded(False)
+            self.tree.addTopLevelItem(sec_instr)
+
+            # --- Org hierarchy
+            org = self.data.get("org_hier", pd.DataFrame())
+            if org.empty:
+                a_nodes = ["A_US_CONSOL"]
+            else:
+                a_nodes = org[org["node_type"] == "A_NODE"]["node_id"].drop_duplicates().tolist()
+
+            atomic = self.data.get("sccl_atomic", pd.DataFrame())
+            gl = self.data.get("gl", pd.DataFrame())
+
+            for a in a_nodes:
+                it_a = QTreeWidgetItem([a])
+                it_a.setData(0, Qt.ItemDataRole.UserRole, {"dim": "a_node_id", "value": a})
+                sec_org.addChild(it_a)
+
+                bes = []
+                if not atomic.empty and "a_node_id" in atomic.columns:
+                    bes = sorted(atomic.loc[atomic["a_node_id"] == a, "booking_entity"].dropna().unique().tolist())
+                if not bes and not gl.empty and "legal_entity" in gl.columns:
+                    bes = sorted(gl["legal_entity"].dropna().unique().tolist())
+                if not bes:
+                    bes = ["US_HOLDCO"]
+                for be in bes:
+                    it_be = QTreeWidgetItem([be])
+                    it_be.setData(0, Qt.ItemDataRole.UserRole, {"dim": "booking_entity", "value": be})
+                    it_a.addChild(it_be)
+
+            # --- Book / CCY
+            books = sorted(gl["book"].drop_duplicates().tolist()) if not gl.empty and "book" in gl.columns else ["GAAP"]
+            ccys = sorted(gl["ccy"].drop_duplicates().tolist()) if not gl.empty and "ccy" in gl.columns else ["USD"]
+
+            it_books = QTreeWidgetItem(["Book"])
+            it_ccy = QTreeWidgetItem(["Currency"])
+            sec_book.addChild(it_books)
+            sec_book.addChild(it_ccy)
+
+            for b in books:
+                it = QTreeWidgetItem([b])
+                it.setData(0, Qt.ItemDataRole.UserRole, {"dim": "book", "value": b})
+                it_books.addChild(it)
+
+            for c in ccys:
+                it = QTreeWidgetItem([c])
+                it.setData(0, Qt.ItemDataRole.UserRole, {"dim": "ccy", "value": c})
+                it_ccy.addChild(it)
+
+            # --- Counterparty hierarchy
+            cps = self.data.get("counterparty", pd.DataFrame())
+            if cps.empty:
+                sec_cp.addChild(QTreeWidgetItem(["(No counterparty data)"]))
+            else:
+                for cg_id, cg_df in cps.groupby("connected_group_id"):
+                    cg_name = cg_df["connected_group_name"].iloc[0] if "connected_group_name" in cg_df.columns else ""
+                    it_cg = QTreeWidgetItem([f"{cg_id}  {cg_name}".strip()])
+                    it_cg.setData(0, Qt.ItemDataRole.UserRole, {"dim": "connected_group_id", "value": cg_id})
+                    sec_cp.addChild(it_cg)
+
+                    for up_id, up_df in cg_df.groupby("ultimate_parent_id"):
+                        up_name = up_df["ultimate_parent_name"].iloc[0] if "ultimate_parent_name" in up_df.columns else ""
+                        it_up = QTreeWidgetItem([f"{up_id}  {up_name}".strip()])
+                        it_up.setData(0, Qt.ItemDataRole.UserRole, {"dim": "ultimate_parent_id", "value": up_id})
+                        it_cg.addChild(it_up)
+
+                        for _, row in up_df.drop_duplicates(subset=["counterparty_id"]).iterrows():
+                            cp_id = str(row.get("counterparty_id", ""))
+                            cp_name = str(row.get("counterparty_name", ""))
+                            it_cp = QTreeWidgetItem([f"{cp_id}  {cp_name}".strip()])
+                            it_cp.setData(0, Qt.ItemDataRole.UserRole, {"dim": "counterparty_id", "value": cp_id})
+                            it_up.addChild(it_cp)
+
+            # --- Exposure categories
+            cats = sorted(atomic["exposure_category"].drop_duplicates().tolist()) if not atomic.empty and "exposure_category" in atomic.columns else []
+            if not cats:
+                cats = ["Loans", "Securities", "Derivatives", "SFT", "Commitments"]
+            for cat in cats:
+                it = QTreeWidgetItem([cat])
+                it.setData(0, Qt.ItemDataRole.UserRole, {"dim": "exposure_category", "value": cat})
+                sec_exp.addChild(it)
+
+            # --- Instruments / mitigants (lightweight sample)
+            if not atomic.empty:
+                sample = atomic.head(120).copy()
+                if "counterparty_id" in sample.columns:
+                    for cp_id, sdf in sample.groupby("counterparty_id"):
+                        it_cp_root = QTreeWidgetItem([f"{cp_id} • instruments"])
+                        it_cp_root.setData(0, Qt.ItemDataRole.UserRole, {"dim": "counterparty_id", "value": str(cp_id)})
+                        sec_instr.addChild(it_cp_root)
+
+                        if "instrument_id" in sdf.columns:
+                            for instr in sdf["instrument_id"].dropna().unique().tolist()[:10]:
+                                it_instr = QTreeWidgetItem([str(instr)])
+                                it_instr.setData(0, Qt.ItemDataRole.UserRole, {"dim": "instrument_id", "value": str(instr)})
+                                it_cp_root.addChild(it_instr)
+
+                                if "netting_set_id" in sdf.columns:
+                                    nets = [n for n in sdf.loc[sdf["instrument_id"] == instr, "netting_set_id"].dropna().unique().tolist()][:3]
+                                else:
+                                    nets = []
+                                if "collateral_id" in sdf.columns:
+                                    cols = [c for c in sdf.loc[sdf["instrument_id"] == instr, "collateral_id"].dropna().unique().tolist()][:3]
+                                else:
+                                    cols = []
+
+                                if nets:
+                                    it_nroot = QTreeWidgetItem(["Netting"])
+                                    it_instr.addChild(it_nroot)
+                                    for n in nets:
+                                        itn = QTreeWidgetItem([str(n)])
+                                        itn.setData(0, Qt.ItemDataRole.UserRole, {"dim": "netting_set_id", "value": str(n)})
+                                        it_nroot.addChild(itn)
+
+                                if cols:
+                                    it_croot = QTreeWidgetItem(["Collateral"])
+                                    it_instr.addChild(it_croot)
+                                    for c in cols:
+                                        itc = QTreeWidgetItem([str(c)])
+                                        itc.setData(0, Qt.ItemDataRole.UserRole, {"dim": "collateral_id", "value": str(c)})
+                                        it_croot.addChild(itc)
+
+            # --- State label
+            gf_txt = ""
+            if global_filters is not None:
+                gf_txt = (
+                    f"GL: LE={getattr(global_filters, 'legal_entity', '—')} | "
+                    f"Book={getattr(global_filters, 'book', '—')} | CCY={getattr(global_filters, 'ccy', '—')}"
+                )
+            sf_txt = ""
+            if sccl_filters:
+                sf_txt = (
+                    f"SCCL: A={sccl_filters.get('a_node_id', '(All)')} | "
+                    f"BE={sccl_filters.get('booking_entity', '(All)')} | "
+                    f"CG={sccl_filters.get('connected_group_id', '(All)')} | "
+                    f"UP={sccl_filters.get('ultimate_parent_id', '(All)')} | "
+                    f"CP={sccl_filters.get('counterparty_id', '(All)')} | "
+                    f"Cat={sccl_filters.get('exposure_category', '(All)')}"
+                )
+            self.lbl_state.setText((gf_txt + ("\n" if gf_txt and sf_txt else "") + sf_txt) or "—")
+
+            self.tree.expandToDepth(1)
+            self._apply_search(self.ed_search.text())
+        finally:
+            self._building = False
+
+    def _apply_search(self, text: str):
+        t = (text or "").strip().lower()
+        if not t:
+            def show_all(item: QTreeWidgetItem):
+                item.setHidden(False)
+                for i in range(item.childCount()):
+                    show_all(item.child(i))
+            for i in range(self.tree.topLevelItemCount()):
+                show_all(self.tree.topLevelItem(i))
+            return
+
+        def match_or_desc(item: QTreeWidgetItem) -> bool:
+            me = (item.text(0) or "").lower()
+            ok = t in me
+            child_ok = False
+            for i in range(item.childCount()):
+                if match_or_desc(item.child(i)):
+                    child_ok = True
+            item.setHidden(not (ok or child_ok))
+            if child_ok:
+                item.setExpanded(True)
+            return ok or child_ok
+
+        for i in range(self.tree.topLevelItemCount()):
+            match_or_desc(self.tree.topLevelItem(i))
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, _col: int):
+        if self._building:
+            return
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        if not payload or not isinstance(payload, dict):
+            return
+        dim = payload.get("dim")
+        val = payload.get("value")
+        if dim and val is not None:
+            self.on_change(str(dim), str(val))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.resize(1600, 940)
+
+        self.data = seed_data()
+        self.current_user = "Maker"
+        self.mode = "Maker"  # Maker, Checker, Executive, Auditor
+
+        self.filters = GlobalFilters(
+            as_of=self.data["asof"],
+            legal_entity="US_HOLDCO",
+            book="GAAP",
+            ccy="USD",
+            materiality=1_000_000.0
+        )
+
+        # SCCL (FR2590) drilldown filters (kept separate from GL filters)
+        self.sccl_filters: Dict[str, str] = {
+            "a_node_id": "A_US_CONSOL",
+            "booking_entity": "(All)",
+            "connected_group_id": "(All)",
+            "ultimate_parent_id": "(All)",
+            "counterparty_id": "(All)",
+            "exposure_category": "(All)",
+            "instrument_id": "(All)",
+            "netting_set_id": "(All)",
+            "collateral_id": "(All)",
+        }
+
+        self.breaks = pd.DataFrame(columns=[
+            "break_id","created_ts","as_of","recon_type","legal_entity","book","ccy",
+            "account","account_name","product","gl_amount","other_amount","variance","abs_var",
+            "severity","root_cause","owner","status","sla_days","age_days","sla_status",
+            "notes","evidence_ref"
+        ])
+        self.audit = pd.DataFrame(columns=["ts","user","action","object_type","object_id","details"])
+        self.variance_expl = pd.DataFrame(columns=["key","as_of","legal_entity","book","ccy","reason","narrative","carry_forward","status","maker","ts_created","ts_updated","submitted_ts","checker","approved_ts","decision_notes"])
+
+        # SCCL (FR2590) explainability (Connected Group / Counterparty level)
+        self.sccl_expl = pd.DataFrame(columns=[
+            "key","as_of","a_node_id","booking_entity","connected_group_id","ultimate_parent_id","counterparty_id","exposure_category",
+            "reason","narrative","carry_forward","status","maker","ts_created","ts_updated","submitted_ts","checker","approved_ts","decision_notes"
+        ])
+        self._selected_sccl_key: Optional[str] = None
+
+        self._accs_by_line: Dict[str, List[str]] = {}
+        self._selected_variance_key: Optional[str] = None
+
+        # Persisted state (enterprise-like user context)
+        self._state_path = self._state_file()
+        self._loaded_state = self._load_state_raw()
+        self._apply_state_to_models(self._loaded_state)
+
+        self._build_menu()
+        self._build_ui()
+        self._apply_theme()
+
+        # Apply persisted state to widgets after UI is constructed
+        self._apply_state_to_widgets(self._loaded_state)
+        self.apply_mode_rules()
+        self.refresh_all()
+
+    # ---------- menu
+    def _build_menu(self):
+        mb = self.menuBar()
+        file_menu = mb.addMenu("&File")
+
+        act_reset = QAction("Reset Demo", self)
+        act_reset.triggered.connect(self.reset_demo)
+        file_menu.addAction(act_reset)
+
+        act_export = QAction("Export Current Table (CSV)...", self)
+        act_export.triggered.connect(self.export_current_table)
+        file_menu.addAction(act_export)
+
+        act_copy = QAction("Copy Executive Summary", self)
+        act_copy.triggered.connect(self.copy_exec_summary)
+        file_menu.addAction(act_copy)
+
+        file_menu.addSeparator()
+        act_exit = QAction("Exit", self)
+        act_exit.triggered.connect(self.close)
+        file_menu.addAction(act_exit)
+
+        sim_menu = mb.addMenu("&Simulate")
+        act_day = QAction("Advance Aging +1 day", self)
+        act_day.triggered.connect(self.advance_aging)
+        sim_menu.addAction(act_day)
+
+        help_menu = mb.addMenu("&Help")
+        act_about = QAction("About", self)
+        act_about.triggered.connect(self.about)
+        help_menu.addAction(act_about)
+
+    def about(self):
+        QMessageBox.information(
+            self, "About",
+            f"{APP_NAME}\n{APP_VERSION}\n\n"
+            "What’s covered:\n"
+            "- Landing dashboard + confidence scoring\n"
+            "- Feed health & ingestion controls (BCBS239)\n"
+            "- GL explorer + explain-this-number\n"
+            "- Recon workspace (GL↔SOR, CRRT↔CR360)\n"
+            "- Break lifecycle with SLA + audit timeline\n"
+            "- Variance management + narrative builder\n"
+            "- Regulatory reporting workspace (FR2590, Y-9C, FR-Y, CCAR, CECL/ACL, STARE, ERA)\n"
+            "- Lineage + mapping governance + impact preview\n"
+            "- Audit & evidence vault + admin governance"
+        )
+
+    # ---------- Persisted context (user-controlled)
+    def _state_file(self) -> Path:
+        # Per-user state file (local, lightweight)
+        return Path.home() / ".orix_enterprise_gl_state.json"
+
+    def _load_state_raw(self) -> Dict[str, Any]:
+        try:
+            p = self._state_file()
+            if not p.exists():
+                return {}
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _apply_state_to_models(self, st: Dict[str, Any]):
+        """Apply persisted state to in-memory model objects (safe defaults if invalid)."""
+        if not st:
+            return
+
+        # Mode
+        mode = str(st.get("mode", "") or "").strip()
+        if mode in ["Maker", "Checker", "Executive", "Auditor"]:
+            self.mode = mode
+            self.current_user = mode
+
+        # Global filters
+        gf = st.get("global_filters", {}) if isinstance(st.get("global_filters", {}), dict) else {}
+        try:
+            if "as_of" in gf:
+                self.filters.as_of = date.fromisoformat(str(gf["as_of"]))
+        except Exception:
+            pass
+
+        le = str(gf.get("legal_entity", "") or "")
+        if le and le in set(self.data["gl"]["legal_entity"].unique()):
+            self.filters.legal_entity = le
+
+        book = str(gf.get("book", "") or "")
+        if book and book in set(self.data["gl"]["book"].unique()):
+            self.filters.book = book
+
+        ccy = str(gf.get("ccy", "") or "")
+        if ccy and ccy in set(self.data["gl"]["ccy"].unique()):
+            self.filters.ccy = ccy
+
+        try:
+            mat = float(gf.get("materiality", self.filters.materiality))
+            if 100_000 <= mat <= 25_000_000:
+                self.filters.materiality = mat
+        except Exception:
+            pass
+
+        # SCCL filters
+        sf = st.get("sccl_filters", {}) if isinstance(st.get("sccl_filters", {}), dict) else {}
+        for k in list(self.sccl_filters.keys()):
+            if k in sf:
+                self.sccl_filters[k] = str(sf.get(k))
+
+    def _apply_state_to_widgets(self, st: Dict[str, Any]):
+        if not st:
+            return
+
+        # Mode dropdown
+        mode = str(st.get("mode", "") or "").strip()
+        if mode:
+            self.cmb_mode.blockSignals(True)
+            if mode == "Auditor":
+                self.cmb_mode.setCurrentText("Auditor (Read-only)")
+            elif mode in ["Maker", "Checker", "Executive"]:
+                self.cmb_mode.setCurrentText(mode)
+            self.cmb_mode.blockSignals(False)
+
+        # Global filter widgets
+        def _set_combo_by_data(cmb: QComboBox, target):
+            for i in range(cmb.count()):
+                if cmb.itemData(i) == target:
+                    cmb.setCurrentIndex(i)
+                    return True
+            return False
+
+        self.cmb_asof.blockSignals(True)
+        _set_combo_by_data(self.cmb_asof, self.filters.as_of)
+        self.cmb_asof.blockSignals(False)
+
+        for cmb, val in [(self.cmb_le, self.filters.legal_entity), (self.cmb_book, self.filters.book), (self.cmb_ccy, self.filters.ccy)]:
+            cmb.blockSignals(True)
+            cmb.setCurrentText(val)
+            cmb.blockSignals(False)
+
+        self.spn_mat.blockSignals(True)
+        self.spn_mat.setValue(int(self.filters.materiality))
+        self.spn_mat.blockSignals(False)
+
+        # Dim dock visibility (optional)
+        vis = st.get("dim_dock_visible")
+        if isinstance(vis, bool) and hasattr(self, "dim_dock"):
+            self.dim_dock.setVisible(vis)
+
+        # Ensure dim tree reflects the loaded state
+        if hasattr(self, "dim_tree"):
+            self.dim_tree.rebuild(self.filters, self.sccl_filters)
+
+    def _save_state(self):
+        """Persist context (filters + SCCL filters + mode + dim panel) locally."""
+        try:
+            p = self._state_file()
+            payload = {
+                "version": APP_VERSION,
+                "saved_ts": now_str(),
+                "mode": self.mode,
+                "dim_dock_visible": bool(self.dim_dock.isVisible()) if hasattr(self, "dim_dock") else True,
+                "global_filters": {
+                    "as_of": str(self.filters.as_of),
+                    "legal_entity": self.filters.legal_entity,
+                    "book": self.filters.book,
+                    "ccy": self.filters.ccy,
+                    "materiality": float(self.filters.materiality),
+                },
+                "sccl_filters": dict(self.sccl_filters),
+            }
+            p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            # State persistence should never break the app
+            pass
+
+    def _breadcrumbs(self) -> str:
+        a = self.sccl_filters.get("a_node_id", "(All)")
+        be = self.sccl_filters.get("booking_entity", "(All)")
+        cg = self.sccl_filters.get("connected_group_id", "(All)")
+        up = self.sccl_filters.get("ultimate_parent_id", "(All)")
+        cp = self.sccl_filters.get("counterparty_id", "(All)")
+        cat = self.sccl_filters.get("exposure_category", "(All)")
+        return (
+            f"A={a} → BE={be} → CG={cg} → UP={up} → CP={cp} → Cat={cat}"
+        )
+
+    # ---------- UI
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(12)
+
+        # Left nav
+        nav = QFrame()
+        nav.setObjectName("Nav")
+        nav.setFixedWidth(320)
+        nav_l = QVBoxLayout(nav)
+        nav_l.setSpacing(10)
+
+        title = QLabel("ORIX")
+        title.setObjectName("AppTitle")
+        nav_l.addWidget(title)
+
+        sub = QLabel("Enterprise GL • Recon • Reg Reporting")
+        sub.setStyleSheet("color:#A0A7B4;")
+        nav_l.addWidget(sub)
+
+        ws = QGroupBox("Workspace")
+        wsl = QFormLayout(ws)
+
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItems(["Maker", "Checker", "Executive", "Auditor (Read-only)"])
+        self.cmb_mode.currentIndexChanged.connect(self.on_mode_changed)
+        wsl.addRow("Mode", self.cmb_mode)
+
+        self.cmb_preset = QComboBox()
+        for p in self.data["presets"]["preset"].tolist():
+            self.cmb_preset.addItem(p)
+        self.cmb_preset.currentIndexChanged.connect(self.apply_preset)
+        wsl.addRow("Presets", self.cmb_preset)
+
+        self.chk_changes = QCheckBox("Show changes since last close")
+        self.chk_changes.stateChanged.connect(self.refresh_all)
+        wsl.addRow("", self.chk_changes)
+        nav_l.addWidget(ws)
+
+        self.nav_list = QListWidget()
+        for p in [
+            "1. Landing Dashboard",
+            "2. Feed Health & Ingestion",
+            "3. GL Explorer",
+            "4. Reconciliation Workspace",
+            "5. Variance Management",
+            "6. Regulatory Reporting",
+            "7. Lineage & BCBS239",
+            "8. Audit & Evidence Vault",
+            "9. Admin & Governance",
+        ]:
+            self.nav_list.addItem(QListWidgetItem(p))
+        self.nav_list.setCurrentRow(0)
+        self.nav_list.currentRowChanged.connect(self.on_nav)
+        nav_l.addWidget(self.nav_list, 1)
+
+        # Filters
+        filters = QGroupBox("Global Filters")
+        fl = QFormLayout(filters)
+
+        self.cmb_asof = QComboBox()
+        dates = sorted(self.data["gl"]["as_of"].unique())
+        for d in dates:
+            self.cmb_asof.addItem(str(d), d)
+        self.cmb_asof.setCurrentIndex(len(dates) - 1)
+        self.cmb_asof.currentIndexChanged.connect(self.update_filters)
+        fl.addRow("As-of", self.cmb_asof)
+
+        self.cmb_le = QComboBox()
+        for le in sorted(self.data["gl"]["legal_entity"].unique()):
+            self.cmb_le.addItem(le)
+        self.cmb_le.setCurrentText(self.filters.legal_entity)
+        self.cmb_le.currentTextChanged.connect(self.update_filters)
+        fl.addRow("Legal Entity", self.cmb_le)
+
+        self.cmb_book = QComboBox()
+        for b in sorted(self.data["gl"]["book"].unique()):
+            self.cmb_book.addItem(b)
+        self.cmb_book.setCurrentText(self.filters.book)
+        self.cmb_book.currentTextChanged.connect(self.update_filters)
+        self.cmb_book.setToolTip("GAAP = external reporting basis; STAT = statutory/local basis.")
+        fl.addRow("Book", self.cmb_book)
+
+        self.cmb_ccy = QComboBox()
+        for c in sorted(self.data["gl"]["ccy"].unique()):
+            self.cmb_ccy.addItem(c)
+        self.cmb_ccy.setCurrentText(self.filters.ccy)
+        self.cmb_ccy.currentTextChanged.connect(self.update_filters)
+        fl.addRow("CCY", self.cmb_ccy)
+
+        self.spn_mat = QSpinBox()
+        self.spn_mat.setRange(100_000, 25_000_000)
+        self.spn_mat.setSingleStep(100_000)
+        self.spn_mat.setValue(int(self.filters.materiality))
+        self.spn_mat.valueChanged.connect(self.update_filters)
+        fl.addRow("Materiality", self.spn_mat)
+
+        self.ed_user = QLineEdit(self.current_user)
+        self.ed_user.textChanged.connect(lambda t: setattr(self, "current_user", (t or "").strip() or "User"))
+        fl.addRow("User", self.ed_user)
+
+        nav_l.addWidget(filters)
+
+        # Main stack
+        self.stack = QStackedWidget()
+        self.p_dashboard = self._page_dashboard()
+        self.p_feed = self._page_feed()
+        self.p_gl = self._page_gl()
+        self.p_recon = self._page_recon()
+        self.p_var = self._page_var()
+        self.p_report = self._page_report()
+        self.p_lineage = self._page_lineage()
+        self.p_audit = self._page_audit()
+        self.p_admin = self._page_admin()
+
+        for p in [self.p_dashboard, self.p_feed, self.p_gl, self.p_recon, self.p_var, self.p_report, self.p_lineage, self.p_audit, self.p_admin]:
+            self.stack.addWidget(p)
+
+
+        # Enterprise dimension tree (dock) — shared drill-path across workspaces
+        self.dim_dock = QDockWidget("Enterprise Dim Tree", self)
+        self.dim_dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        self.dim_tree = EnterpriseDimTree(self.data, self.on_dim_tree_changed)
+        self.dim_dock.setWidget(self.dim_tree)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dim_dock)
+
+        act_toggle_dims = QAction("Toggle Enterprise Dim Tree", self)
+        act_toggle_dims.setShortcut("Ctrl+Shift+D")
+        act_toggle_dims.triggered.connect(lambda: (self.dim_dock.setVisible(not self.dim_dock.isVisible()), self._save_state()))
+        self.addAction(act_toggle_dims)
+
+        root.addWidget(nav)
+        root.addWidget(self.stack, 1)
+
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+
+    # ---------- theme
+    def _apply_theme(self):
+        self.setFont(QFont("Arial", 10))
+        self.setStyleSheet("""
+        QMainWindow { background: #0F1115; color: #E6EAF2; }
+        QLabel { color: #E6EAF2; }
+        QFrame#Nav { background: #0F1115; border-right: 1px solid #22283A; border-radius: 14px; }
+        QLabel#AppTitle { font-size: 22px; font-weight: 900; padding: 6px 0; letter-spacing: 0.5px; }
+        QGroupBox {
+            border: 1px solid #2A3040;
+            border-radius: 12px;
+            margin-top: 8px;
+            padding: 10px;
+            background: #171A21;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 6px; color: #A0A7B4; }
+        QListWidget { background: #121622; border: 1px solid #22283A; border-radius: 12px; padding: 6px; }
+        QListWidget::item { padding: 10px; color: #E6EAF2; }
+        QListWidget::item:selected { background: #1F2A3A; border-radius: 10px; }
+        QTableView {
+            background: #121622;
+            alternate-background-color: #151A2A;
+            gridline-color: #2A3040;
+            border: 1px solid #22283A;
+            border-radius: 12px;
+        }
+        QHeaderView::section { background: #171A21; color: #A0A7B4; padding: 8px; border: 0px; border-bottom: 1px solid #22283A; }
+        QLineEdit, QComboBox, QSpinBox, QTextEdit {
+            background: #121622;
+            border: 1px solid #22283A;
+            border-radius: 10px;
+            padding: 7px;
+            color: #E6EAF2;
+        }
+        QPushButton {
+            background: #1F2A3A;
+            border: 1px solid #2A3040;
+            border-radius: 12px;
+            padding: 9px 12px;
+            color: #E6EAF2;
+            font-weight: 600;
+        }
+        QPushButton:hover { background: #24324A; }
+        QPushButton:disabled { background: #161A24; color: #6F7787; border: 1px solid #20263A; }
+        QTabWidget::pane { border: 1px solid #22283A; border-radius: 12px; background: #121622; }
+        QTabBar::tab { background: #171A21; color: #A0A7B4; padding: 10px 14px; border-top-left-radius: 12px; border-top-right-radius: 12px; }
+        QTabBar::tab:selected { background: #1F2A3A; color: #E6EAF2; }
+        """)
+
+    # ---------- Widgets helpers
+    def _table(self) -> Tuple[QTableView, DataFrameModel]:
+        tbl = QTableView()
+        tbl.setAlternatingRowColors(True)
+        tbl.setSortingEnabled(True)
+        tbl.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        tbl.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        model = DataFrameModel(pd.DataFrame())
+        tbl.setModel(model)
+        tbl.setItemDelegate(BadgeDelegate(tbl))
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.verticalHeader().setVisible(False)
+        return tbl, model
+
+    def _kpi(self, title: str, tooltip: str) -> Tuple[QGroupBox, QLabel, QLabel]:
+        g = QGroupBox(title)
+        v = QVBoxLayout(g)
+        v.setSpacing(3)
+        val = QLabel("0")
+        val.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+        sub = QLabel("")
+        sub.setStyleSheet("color:#A0A7B4;")
+        g.setToolTip(tooltip)
+        v.addWidget(val)
+        v.addWidget(sub)
+        return g, val, sub
+
+    # ---------- Pages
+    def _page_dashboard(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        h = QLabel("Landing Dashboard")
+        h.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        layout.addWidget(h)
+
+        self.lbl_ctx_banner = QLabel("")
+        self.lbl_ctx_banner.setStyleSheet("color:#A0A7B4;")
+        layout.addWidget(self.lbl_ctx_banner)
+
+        row = QHBoxLayout()
+        b1, self.k_material, self.k_material_sub = self._kpi("Material Breaks", "abs(variance) >= materiality")
+        b2, self.k_open, self.k_open_sub = self._kpi("Open Breaks", "Open + In Review")
+        b3, self.k_feeds, self.k_feeds_sub = self._kpi("Feeds Late/Failed", "Timeliness control exceptions")
+        b4, self.k_recon, self.k_recon_sub = self._kpi("Recon Completion", "1 - (#break rows / total)")
+        b5, self.k_conf, self.k_conf_sub = self._kpi("Confidence Score", "Composite score: breaks, SLA, feeds, rejects")
+        for b in [b1, b2, b3, b4, b5]:
+            row.addWidget(b)
+        layout.addLayout(row)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+
+        self.lbl_dash_left = QLabel("Top Breaks (GL↔SOR)")
+        ll.addWidget(self.lbl_dash_left)
+
+        self.tbl_top, self.m_top = self._table()
+        ll.addWidget(self.tbl_top, 1)
+
+        btns = QHBoxLayout()
+        self.btn_create_largest = QPushButton("Create Break for Largest Variance")
+        self.btn_create_largest.clicked.connect(self.create_largest_break)
+        self.btn_copy_exec = QPushButton("Copy Executive Summary")
+        self.btn_copy_exec.clicked.connect(self.copy_exec_summary)
+        btns.addWidget(self.btn_create_largest)
+        btns.addWidget(self.btn_copy_exec)
+        btns.addStretch(1)
+        ll.addLayout(btns)
+
+        self.grp_intel = QGroupBox("Break Intelligence")
+        il = QHBoxLayout(self.grp_intel)
+        self.lbl_root = QLabel("Top Root Cause: —"); self.lbl_root.setStyleSheet("color:#A0A7B4;")
+        self.lbl_repeat = QLabel("Repeat Offenders: —"); self.lbl_repeat.setStyleSheet("color:#A0A7B4;")
+        self.lbl_sla = QLabel("SLA Risk: —"); self.lbl_sla.setStyleSheet("color:#A0A7B4;")
+        il.addWidget(self.lbl_root); il.addWidget(self.lbl_repeat); il.addWidget(self.lbl_sla)
+        ll.addWidget(self.grp_intel)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+
+        rl.addWidget(QLabel("Feed Health Snapshot"))
+        self.tbl_feed_snap, self.m_feed_snap = self._table()
+        rl.addWidget(self.tbl_feed_snap, 1)
+
+        rl.addWidget(QLabel("Report Readiness"))
+        self.tbl_ready, self.m_ready = self._table()
+        self.tbl_ready.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        rl.addWidget(self.tbl_ready)
+
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([980, 600])
+        layout.addWidget(split, 1)
+        return w
+
+    def _page_feed(self) -> QWidget:
+        w = QWidget()
+        layout = QHBoxLayout(w)
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        hdr = QLabel("Feed Health & Ingestion Control")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        ll.addWidget(hdr)
+
+        self.tbl_feed, self.m_feed = self._table()
+        ll.addWidget(self.tbl_feed, 1)
+
+        ll.addWidget(QLabel("Reject Samples (Illustrative)"))
+        self.tbl_rej, self.m_rej = self._table()
+        ll.addWidget(self.tbl_rej)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Actions"))
+        self.cmb_feed = QComboBox()
+        rl.addWidget(self.cmb_feed)
+
+        self.btn_rerun = QPushButton("Re-run Ingestion (log)")
+        self.btn_rerun.clicked.connect(self.rerun_feed)
+        rl.addWidget(self.btn_rerun)
+
+        self.btn_inc = QPushButton("Create Incident (log)")
+        self.btn_inc.clicked.connect(self.create_incident)
+        rl.addWidget(self.btn_inc)
+
+        rl.addWidget(QLabel("BCBS239 Controls / Rules"))
+        self.tbl_rules, self.m_rules = self._table()
+        self.tbl_rules.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        rl.addWidget(self.tbl_rules, 1)
+
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([1080, 480])
+        layout.addWidget(split)
+        return w
+
+    def _page_gl(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        hdr = QLabel("GL Explorer")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(hdr)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Search account/name:"))
+        self.ed_gl = QLineEdit("120200")
+        self.ed_gl.textChanged.connect(self.refresh_gl)
+        top.addWidget(self.ed_gl, 1)
+        layout.addLayout(top)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Balances (Account × Product)"))
+        self.tbl_gl, self.m_gl = self._table()
+        self.tbl_gl.clicked.connect(self.on_gl_selected)
+        ll.addWidget(self.tbl_gl, 1)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Explain This Number"))
+        self.lbl_explain = QLabel("Select a row to see mapping, lineage, and risk drivers.")
+        self.lbl_explain.setWordWrap(True)
+        self.lbl_explain.setStyleSheet("color:#A0A7B4;")
+        rl.addWidget(self.lbl_explain)
+
+        rl.addWidget(QLabel("Report Mappings"))
+        self.tbl_map_acc, self.m_map_acc = self._table()
+        self.tbl_map_acc.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        rl.addWidget(self.tbl_map_acc, 1)
+
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([980, 560])
+        layout.addWidget(split, 1)
+        return w
+
+    def _page_recon(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        hdr = QLabel("Reconciliation Workspace")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(hdr)
+
+        self.tabs = QTabWidget()
+
+        # GL vs SOR
+        t1w = QWidget()
+        t1 = QVBoxLayout(t1w)
+        c1 = QHBoxLayout()
+        c1.addWidget(QLabel("Tolerance (abs):"))
+        self.spn_tol = QSpinBox()
+        self.spn_tol.setRange(0, 100_000_000)
+        self.spn_tol.setSingleStep(10_000)
+        self.spn_tol.valueChanged.connect(self.refresh_recon)
+        c1.addWidget(self.spn_tol)
+        c1.addStretch(1)
+        self.btn_create_breaks = QPushButton("Create Break(s) for Selected Rows")
+        self.btn_create_breaks.clicked.connect(self.create_breaks_from_selected)
+        c1.addWidget(self.btn_create_breaks)
+        t1.addLayout(c1)
+
+        self.tbl_recon, self.m_recon = self._table()
+        self.tbl_recon.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
+        t1.addWidget(self.tbl_recon, 1)
+
+        # CRRT vs CR360
+        t2w = QWidget()
+        t2 = QVBoxLayout(t2w)
+        c2 = QHBoxLayout()
+        c2.addWidget(QLabel("Tolerance (CRRT↔CR360):"))
+        self.spn_tol2 = QSpinBox()
+        self.spn_tol2.setRange(0, 100_000_000)
+        self.spn_tol2.setSingleStep(10_000)
+        self.spn_tol2.valueChanged.connect(self.refresh_recon)
+        c2.addWidget(self.spn_tol2)
+        c2.addStretch(1)
+        t2.addLayout(c2)
+
+        self.tbl_recon2, self.m_recon2 = self._table()
+        t2.addWidget(self.tbl_recon2, 1)
+
+        # Breaks (work items) + timeline
+        t3w = QWidget()
+        t3 = QVBoxLayout(t3w)
+
+        top = QHBoxLayout()
+        self.ed_break_search = QLineEdit()
+        self.ed_break_search.setPlaceholderText("Search breaks (account, product, root cause, id)...")
+        self.ed_break_search.textChanged.connect(self.refresh_breaks)
+        top.addWidget(self.ed_break_search, 1)
+
+        self.cmb_break_status = QComboBox()
+        self.cmb_break_status.addItems(["(All)", "OPEN", "IN REVIEW", "APPROVED", "CLOSED"])
+        self.cmb_break_status.currentIndexChanged.connect(self.refresh_breaks)
+        top.addWidget(QLabel("Status:"))
+        top.addWidget(self.cmb_break_status)
+
+        self.btn_open_break = QPushButton("Open Break Detail")
+        self.btn_open_break.clicked.connect(self.open_break)
+        top.addWidget(self.btn_open_break)
+        t3.addLayout(top)
+
+        split = QSplitter(Qt.Orientation.Vertical)
+
+        p1 = QWidget(); p1l = QVBoxLayout(p1)
+        self.tbl_breaks, self.m_breaks = self._table()
+        self.tbl_breaks.clicked.connect(self.refresh_timeline)
+        p1l.addWidget(self.tbl_breaks, 1)
+
+        p2 = QWidget(); p2l = QVBoxLayout(p2)
+        p2l.addWidget(QLabel("Change History Timeline"))
+        self.tbl_timeline, self.m_timeline = self._table()
+        self.tbl_timeline.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        p2l.addWidget(self.tbl_timeline, 1)
+
+        split.addWidget(p1)
+        split.addWidget(p2)
+        split.setSizes([560, 260])
+
+        t3.addWidget(split, 1)
+
+        self.tabs.addTab(t1w, "GL ↔ SOR")
+        self.tabs.addTab(t2w, "CRRT ↔ CR360")
+        self.tabs.addTab(t3w, "Breaks (Work Items)")
+        layout.addWidget(self.tabs, 1)
+        return w
+
+    def _page_var(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        hdr = QLabel("Variance Management")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(hdr)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Variance Population (Current vs Prior Close)"))
+        self.tbl_var, self.m_var = self._table()
+        self.tbl_var.clicked.connect(self.on_var_selected)
+        ll.addWidget(self.tbl_var, 1)
+
+        right = QWidget()
+        rl = QVBoxLayout(right)
+
+        
+        box = QGroupBox("Explainability Capture — Workflow (Maker/Checker) + Carry-Forward")
+        form = QFormLayout(box)
+
+        self.lbl_var = QLabel("(Select a variance row)")
+        self.lbl_var.setStyleSheet("color:#A0A7B4;")
+
+        self.lbl_var_status = QLabel("Status: —")
+        self.lbl_var_status.setStyleSheet("color:#A0A7B4;")
+
+        self.cmb_reason = QComboBox()
+        self.cmb_reason.addItems([
+            "Volume change", "Rate/Spread change", "Mix change", "Reclass/Mapping change", "Timing/Accrual",
+            "FX impact", "One-time event", "Model/Forecast update (STARE)", "Credit loss update (CECL/ACL)"
+        ])
+
+        self.txt_var = QTextEdit()
+        self.txt_var.setFixedHeight(120)
+
+        self.chk_var_carry = QCheckBox("Carry-forward to next close (user controlled)")
+        self.chk_var_carry.setChecked(True)
+
+        # Actions
+        btn_row1 = QHBoxLayout()
+        self.btn_save_var = QPushButton("Save Draft")
+        self.btn_save_var.clicked.connect(self.save_var_expl)
+        self.btn_var_submit = QPushButton("Submit for Approval")
+        self.btn_var_submit.clicked.connect(self.submit_var_expl)
+        btn_row1.addWidget(self.btn_save_var)
+        btn_row1.addWidget(self.btn_var_submit)
+
+        btn_row2 = QHBoxLayout()
+        self.btn_var_approve = QPushButton("Approve (Checker)")
+        self.btn_var_approve.clicked.connect(self.approve_var_expl)
+        self.btn_var_reject = QPushButton("Reject (Checker)")
+        self.btn_var_reject.clicked.connect(self.reject_var_expl)
+        btn_row2.addWidget(self.btn_var_approve)
+        btn_row2.addWidget(self.btn_var_reject)
+
+        # Rollover: pull prior-close explanation for same slice (preview) + bulk carry-forward
+        self.chk_var_autofill = QCheckBox("Auto-fill from prior close if available")
+        self.chk_var_autofill.setChecked(True)
+        self.btn_var_roll = QPushButton("Rollover Prior Explanation → Current (Preview)")
+        self.btn_var_roll.clicked.connect(self.rollover_var_expl)
+        self.btn_var_bulk_roll = QPushButton("Bulk Carry-Forward Rollover (Approved → Drafts)")
+        self.btn_var_bulk_roll.clicked.connect(self.bulk_rollover_var)
+
+        form.addRow("Selected", self.lbl_var)
+        form.addRow("Workflow", self.lbl_var_status)
+        form.addRow("Reason", self.cmb_reason)
+        form.addRow("Narrative", self.txt_var)
+        form.addRow("", self.chk_var_carry)
+        form.addRow("", btn_row1)
+        form.addRow("", btn_row2)
+        form.addRow("", self.chk_var_autofill)
+        form.addRow("", self.btn_var_roll)
+        form.addRow("", self.btn_var_bulk_roll)
+
+        rl.addWidget(box)
+
+        nb = QGroupBox("Narrative Builder (Regulator-ready Draft)")
+        nbl = QVBoxLayout(nb)
+        self.txt_narr = QTextEdit()
+        self.txt_narr.setFixedHeight(240)
+        nbl.addWidget(self.txt_narr)
+        nb_btn = QHBoxLayout()
+        self.btn_build = QPushButton("Build Narrative")
+        self.btn_build.clicked.connect(self.build_narrative)
+        self.btn_copy_narr = QPushButton("Copy to Clipboard")
+        self.btn_copy_narr.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.txt_narr.toPlainText()))
+        nb_btn.addWidget(self.btn_build); nb_btn.addWidget(self.btn_copy_narr); nb_btn.addStretch(1)
+        nbl.addLayout(nb_btn)
+        rl.addWidget(nb)
+
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([920, 640])
+        layout.addWidget(split, 1)
+        return w
+
+    def _page_report(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        hdr = QLabel("Regulatory Reporting Workspace")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(hdr)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Report:"))
+        self.cmb_report = QComboBox()
+        self.cmb_report.addItems(["FR2590", "Y-9C", "FR Y-15", "FR 2052a (LCR)", "NSFR", "Call Report", "FR Y (Other)", "CCAR", "CECL/ACL", "STARE", "ERA"])
+        self.cmb_report.currentTextChanged.connect(self.refresh_reporting)
+        top.addWidget(self.cmb_report)
+
+        self.lbl_report = QLabel("")
+        self.lbl_report.setStyleSheet("color:#A0A7B4;")
+        top.addWidget(self.lbl_report, 1)
+
+        self.btn_cert = QPushButton("Certify Selected Line (log)")
+        self.btn_cert.clicked.connect(self.certify_line)
+        top.addWidget(self.btn_cert)
+
+        self.btn_lock = QPushButton("Lock Report Cycle (log)")
+        self.btn_lock.clicked.connect(self.lock_report)
+        top.addWidget(self.btn_lock)
+
+        layout.addLayout(top)
+
+        self.report_tabs = QTabWidget()
+
+        # -------------------------
+        # Tab 1: Classic report lines (mapping → drilldown)
+        # -------------------------
+        t_lines = QWidget()
+        t1 = QVBoxLayout(t_lines)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget(); ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Report Lines"))
+        self.tbl_lines, self.m_lines = self._table()
+        self.tbl_lines.clicked.connect(self.on_line_selected)
+        ll.addWidget(self.tbl_lines, 1)
+
+        self.btn_impact = QPushButton("Impact Preview for Selected Line (Mapping)")
+        self.btn_impact.clicked.connect(self.impact_preview)
+        ll.addWidget(self.btn_impact)
+
+        right = QWidget(); rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Line Drilldown (GL by mapped accounts)"))
+        self.tbl_drill, self.m_drill = self._table()
+        self.tbl_drill.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        rl.addWidget(self.tbl_drill, 1)
+
+        split.addWidget(left); split.addWidget(right)
+        split.setSizes([940, 600])
+        t1.addWidget(split, 1)
+
+        # -------------------------
+        # Tab 2: SCCL / FR2590 exposure drilldown (enterprise hierarchy)
+        # -------------------------
+        t_sccl = QWidget()
+        t2 = QVBoxLayout(t_sccl)
+
+        filt = QGroupBox("SCCL Hierarchy Filters (A-Node → Booking Entity → Connected Group → Ultimate Parent → Counterparty → Exposure Category)")
+        fl = QHBoxLayout(filt)
+
+        fl.addWidget(QLabel("A-Node:"))
+        self.cmb_sccl_anode = QComboBox()
+        self.cmb_sccl_anode.currentIndexChanged.connect(self.on_sccl_filter_changed)
+        fl.addWidget(self.cmb_sccl_anode)
+
+        fl.addWidget(QLabel("Booking Entity:"))
+        self.cmb_sccl_be = QComboBox()
+        self.cmb_sccl_be.currentIndexChanged.connect(self.on_sccl_filter_changed)
+        fl.addWidget(self.cmb_sccl_be)
+
+        fl.addWidget(QLabel("Connected Group:"))
+        self.cmb_sccl_cg = QComboBox()
+        self.cmb_sccl_cg.currentIndexChanged.connect(self.on_sccl_filter_changed)
+        fl.addWidget(self.cmb_sccl_cg)
+
+        fl.addWidget(QLabel("Ultimate Parent:"))
+        self.cmb_sccl_up = QComboBox()
+        self.cmb_sccl_up.currentIndexChanged.connect(self.on_sccl_filter_changed)
+        fl.addWidget(self.cmb_sccl_up)
+
+        fl.addWidget(QLabel("Counterparty:"))
+        self.cmb_sccl_cp = QComboBox()
+        self.cmb_sccl_cp.currentIndexChanged.connect(self.on_sccl_filter_changed)
+        fl.addWidget(self.cmb_sccl_cp)
+
+        fl.addWidget(QLabel("Category:"))
+        self.cmb_sccl_cat = QComboBox()
+        self.cmb_sccl_cat.currentIndexChanged.connect(self.on_sccl_filter_changed)
+        fl.addWidget(self.cmb_sccl_cat)
+
+        fl.addStretch(1)
+        t2.addWidget(filt)
+
+        split2 = QSplitter(Qt.Orientation.Horizontal)
+
+        left2 = QWidget(); l2 = QVBoxLayout(left2)
+        l2.addWidget(QLabel("SCCL Variance (Current vs Prior Close) — aggregated view"))
+        self.tbl_sccl, self.m_sccl = self._table()
+        self.tbl_sccl.clicked.connect(self.on_sccl_selected)
+        l2.addWidget(self.tbl_sccl, 1)
+
+        right2 = QWidget(); r2 = QVBoxLayout(right2)
+
+        box_sel = QGroupBox("Selected Slice")
+        bsl = QVBoxLayout(box_sel)
+        self.lbl_sccl_selected = QLabel("(Select a row)")
+        self.lbl_sccl_selected.setWordWrap(True)
+        self.lbl_sccl_selected.setStyleSheet("color:#A0A7B4;")
+        bsl.addWidget(self.lbl_sccl_selected)
+        r2.addWidget(box_sel)
+
+        self.lbl_sccl_explain = QLabel("")
+        self.lbl_sccl_explain.setWordWrap(True)
+        self.lbl_sccl_explain.setStyleSheet("color:#A0A7B4;")
+        r2.addWidget(self.lbl_sccl_explain)
+
+        r2.addWidget(QLabel("Instrument / Trade Drilldown (Atomic)"))
+        self.tbl_sccl_trades, self.m_sccl_trades = self._table()
+        self.tbl_sccl_trades.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        r2.addWidget(self.tbl_sccl_trades, 1)
+
+        r2.addWidget(QLabel("Netting / Collateral Context (Mitigation)"))
+        self.tbl_sccl_mitig, self.m_sccl_mitig = self._table()
+        self.tbl_sccl_mitig.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        r2.addWidget(self.tbl_sccl_mitig)
+
+        
+        box_ex = QGroupBox("Explained Variance (SCCL) — Workflow (Maker/Checker) + Carry-Forward")
+        exf = QFormLayout(box_ex)
+
+        self.lbl_sccl_status = QLabel("Status: —")
+        self.lbl_sccl_status.setStyleSheet("color:#A0A7B4;")
+
+        self.cmb_sccl_reason = QComboBox()
+        self.cmb_sccl_reason.addItems([
+            "Volume change (drawdown/repayment)", "New trades / positions", "Maturity / runoff",
+            "Netting set change", "Collateral / margin change", "Guarantee / credit protection",
+            "Connected group change (governance)", "Reclass / taxonomy change", "FX impact", "One-time event"
+        ])
+
+        self.txt_sccl_var = QTextEdit()
+        self.txt_sccl_var.setFixedHeight(110)
+
+        self.chk_sccl_carry = QCheckBox("Carry-forward to next close (user controlled)")
+        self.chk_sccl_carry.setChecked(True)
+
+        self.chk_sccl_autofill = QCheckBox("Auto-fill from prior close if available")
+        self.chk_sccl_autofill.setChecked(True)
+
+        self.btn_sccl_roll = QPushButton("Rollover Prior Explanation → Current (Preview)")
+        self.btn_sccl_roll.clicked.connect(self.rollover_sccl_expl)
+
+        # Workflow buttons
+        btn_sc1 = QHBoxLayout()
+        self.btn_sccl_save = QPushButton("Save Draft")
+        self.btn_sccl_save.clicked.connect(self.save_sccl_expl)
+        self.btn_sccl_submit = QPushButton("Submit for Approval")
+        self.btn_sccl_submit.clicked.connect(self.submit_sccl_expl)
+        btn_sc1.addWidget(self.btn_sccl_save)
+        btn_sc1.addWidget(self.btn_sccl_submit)
+
+        btn_sc2 = QHBoxLayout()
+        self.btn_sccl_approve = QPushButton("Approve (Checker)")
+        self.btn_sccl_approve.clicked.connect(self.approve_sccl_expl)
+        self.btn_sccl_reject = QPushButton("Reject (Checker)")
+        self.btn_sccl_reject.clicked.connect(self.reject_sccl_expl)
+        btn_sc2.addWidget(self.btn_sccl_approve)
+        btn_sc2.addWidget(self.btn_sccl_reject)
+
+        self.btn_sccl_bulk_roll = QPushButton("Bulk Carry-Forward Rollover (Approved → Drafts)")
+        self.btn_sccl_bulk_roll.clicked.connect(self.bulk_rollover_sccl)
+
+        exf.addRow("Workflow", self.lbl_sccl_status)
+        exf.addRow("Reason", self.cmb_sccl_reason)
+        exf.addRow("Narrative", self.txt_sccl_var)
+        exf.addRow("", self.chk_sccl_carry)
+        exf.addRow("", btn_sc1)
+        exf.addRow("", btn_sc2)
+        exf.addRow("", self.chk_sccl_autofill)
+        exf.addRow("", self.btn_sccl_roll)
+        exf.addRow("", self.btn_sccl_bulk_roll)
+
+        r2.addWidget(box_ex)
+
+        split2.addWidget(left2)
+        split2.addWidget(right2)
+        split2.setSizes([960, 580])
+        t2.addWidget(split2, 1)
+
+        self.report_tabs.addTab(t_lines, "Report Lines")
+        self.report_tabs.addTab(t_sccl, "SCCL (FR2590) Drilldown")
+
+        # -------------------------
+        # Tab 3: Report Catalog (enterprise-wide)
+        # -------------------------
+        t_cat = QWidget()
+        t3 = QVBoxLayout(t_cat)
+        t3.addWidget(QLabel("Reg Report Catalog — grain, hierarchy, controls"))
+
+        catalog = pd.DataFrame([
+            {"report":"FR2590 (SCCL)","primary_grain":"Instrument/Trade/Facility (atomic exposure)","hierarchy":"A-Node → Booking Entity → Connected Group → Ultimate Parent → Counterparty → Category → Instrument → Netting/Collateral","key_controls":"Maker/Checker explanations, connected-group governance, lineage to SORs"},
+            {"report":"Y-9C","primary_grain":"GL Account/Balance (legal entity/book/ccy)","hierarchy":"Reporting Entity → Legal Entity → Account → Product","key_controls":"Mapping governance, certification, audit evidence"},
+            {"report":"FR Y-15","primary_grain":"Aggregates derived from risk+GL (proxy)","hierarchy":"Reporting Entity → Measure families → Sub-measures","key_controls":"Methodology sign-off, data-quality thresholds"},
+            {"report":"FR 2052a (LCR)","primary_grain":"Position/flow + HQLA buckets (proxy)","hierarchy":"Entity → HQLA level → Product/Flow","key_controls":"Time-bucket controls, intraday completeness"},
+            {"report":"NSFR","primary_grain":"Balance-sheet + funding factors (proxy)","hierarchy":"Entity → ASF/RSF buckets → Product","key_controls":"Factor tables versioning, approvals"},
+            {"report":"Call Report","primary_grain":"GL account to schedule line (proxy)","hierarchy":"Bank entity → Schedule → Line → Account mapping","key_controls":"Schedule mapping governance"},
+            {"report":"CCAR","primary_grain":"Scenario projections + P&L components","hierarchy":"Scenario → Entity → Portfolio → Measure","key_controls":"Model run controls, approvals"},
+            {"report":"CECL/ACL","primary_grain":"Portfolio/segment + allowance","hierarchy":"Entity → Portfolio → Segment → Measure","key_controls":"Model + overlay governance"},
+            {"report":"STARE","primary_grain":"Forecast balances + assumptions","hierarchy":"Scenario → Entity → Driver → Measure","key_controls":"Assumption governance"},
+            {"report":"ERA","primary_grain":"GL recon + SCCL accountability scope","hierarchy":"Entity → Source system → Account/Product","key_controls":"Accountability + SLA enforcement"},
+        ])
+
+        self.tbl_catalog, self.m_catalog = self._table()
+        self.tbl_catalog.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        self.m_catalog.set_df(catalog)
+        t3.addWidget(self.tbl_catalog, 1)
+
+        self.report_tabs.addTab(t_cat, "Report Catalog")
+
+        layout.addWidget(self.report_tabs, 1)
+        return w
+
+
+    def _page_lineage(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        hdr = QLabel("Lineage & Mapping (BCBS239)")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(hdr)
+
+        hint = QLabel("Traceability and governance. Mapping changes require justification; all actions are audit logged.")
+        hint.setStyleSheet("color:#A0A7B4;")
+        layout.addWidget(hint)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget(); ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("Mapping Repository"))
+        self.tbl_map, self.m_map = self._table()
+        self.tbl_map.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        ll.addWidget(self.tbl_map, 1)
+
+        right = QWidget(); rl = QVBoxLayout(right)
+        hl = QHBoxLayout()
+        hl.addWidget(QLabel("Account:"))
+        self.cmb_acc = QComboBox()
+        self.cmb_acc.currentTextChanged.connect(self.refresh_lineage_side)
+        hl.addWidget(self.cmb_acc, 1)
+        rl.addLayout(hl)
+
+        self.lbl_lineage = QLabel("")
+        self.lbl_lineage.setWordWrap(True)
+        self.lbl_lineage.setStyleSheet("color:#A0A7B4;")
+        rl.addWidget(self.lbl_lineage)
+
+        rl.addWidget(QLabel("Related Report Lines"))
+        self.tbl_rel, self.m_rel = self._table()
+        self.tbl_rel.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        rl.addWidget(self.tbl_rel, 1)
+
+        split.addWidget(left); split.addWidget(right)
+        split.setSizes([920, 640])
+        layout.addWidget(split, 1)
+        return w
+
+    def _page_audit(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        hdr = QLabel("Audit & Evidence Vault")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(hdr)
+
+        self.tbl_audit, self.m_audit = self._table()
+        self.tbl_audit.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        layout.addWidget(self.tbl_audit, 1)
+
+        layout.addWidget(QLabel("Evidence Index (from Breaks)"))
+        self.tbl_evid, self.m_evid = self._table()
+        self.tbl_evid.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        layout.addWidget(self.tbl_evid)
+        return w
+
+    def _page_admin(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        hdr = QLabel("Admin & Governance")
+        hdr.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        layout.addWidget(hdr)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        rbac = pd.DataFrame([
+            {"role":"Maker","can_create_break":"Y","can_close_break":"N","can_submit_expl":"Y","can_approve_expl":"N","can_certify":"N","data_export":"Limited"},
+            {"role":"Checker","can_create_break":"N","can_close_break":"Y","can_submit_expl":"N","can_approve_expl":"Y","can_certify":"N","data_export":"Controlled"},
+            {"role":"Executive","can_create_break":"N","can_close_break":"N","can_submit_expl":"N","can_approve_expl":"N","can_certify":"Y","data_export":"Controlled"},
+            {"role":"Auditor","can_create_break":"N","can_close_break":"N","can_submit_expl":"N","can_approve_expl":"N","can_certify":"N","data_export":"Read-only"},
+            {"role":"Admin","can_create_break":"Y","can_close_break":"Y","can_submit_expl":"Y","can_approve_expl":"Y","can_certify":"Y","data_export":"Admin"},
+        ])
+        cal = pd.DataFrame([
+            {"cycle":"Month-End Close","cutoff":"T+1 18:00","recon_due":"T+2 12:00","certify_due":"T+3 17:00"},
+            {"cycle":"FR2590","cutoff":"T+1 20:00","recon_due":"T+2 14:00","certify_due":"T+3 12:00"},
+            {"cycle":"Y-9C","cutoff":"T+2 18:00","recon_due":"T+4 12:00","certify_due":"T+5 17:00"},
+            {"cycle":"CCAR/STARE","cutoff":"Scenario freeze","recon_due":"Model run+1d","certify_due":"Review+2d"},
+            {"cycle":"CECL/ACL","cutoff":"Quarter-end","recon_due":"T+3 12:00","certify_due":"T+5 17:00"},
+        ])
+
+        left = QWidget(); ll = QVBoxLayout(left)
+        ll.addWidget(QLabel("RBAC Matrix"))
+        tbl1, _ = self._table()
+        tbl1.setModel(DataFrameModel(rbac))
+        tbl1.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        ll.addWidget(tbl1, 1)
+
+        right = QWidget(); rl = QVBoxLayout(right)
+        rl.addWidget(QLabel("Close Calendar"))
+        tbl2, _ = self._table()
+        tbl2.setModel(DataFrameModel(cal))
+        tbl2.setSelectionMode(QTableView.SelectionMode.NoSelection)
+        rl.addWidget(tbl2, 1)
+
+        split.addWidget(left); split.addWidget(right)
+        split.setSizes([760, 760])
+        layout.addWidget(split, 1)
+        return w
+
+    # ---------- Navigation / mode / preset / filters
+    def on_nav(self, idx: int):
+        self.stack.setCurrentIndex(max(0, min(idx, self.stack.count() - 1)))
+        item = self.nav_list.currentItem().text() if self.nav_list.currentItem() else ""
+        if hasattr(self, "dim_tree"):
+            self.dim_tree.rebuild(self.filters, self.sccl_filters)
+
+        self.status.showMessage(f"Viewing: {item}", 2500)
+
+
+    def on_dim_tree_changed(self, dim: str, value: str):
+        """Callback from EnterpriseDimTree. Applies selection to the right filter set and refreshes."""
+        try:
+            if dim == "booking_entity":
+                self.filters.legal_entity = value
+                if hasattr(self, "cmb_le"):
+                    self.cmb_le.blockSignals(True)
+                    self.cmb_le.setCurrentText(value)
+                    self.cmb_le.blockSignals(False)
+
+                # also sync SCCL booking entity when present
+                if hasattr(self, "cmb_sccl_be"):
+                    self.sccl_filters["booking_entity"] = value
+                    self.cmb_sccl_be.blockSignals(True)
+                    self.cmb_sccl_be.setCurrentText(value)
+                    self.cmb_sccl_be.blockSignals(False)
+
+            elif dim == "book":
+                self.filters.book = value
+                if hasattr(self, "cmb_book"):
+                    self.cmb_book.blockSignals(True)
+                    self.cmb_book.setCurrentText(value)
+                    self.cmb_book.blockSignals(False)
+
+            elif dim == "ccy":
+                self.filters.ccy = value
+                if hasattr(self, "cmb_ccy"):
+                    self.cmb_ccy.blockSignals(True)
+                    self.cmb_ccy.setCurrentText(value)
+                    self.cmb_ccy.blockSignals(False)
+
+            elif dim in {
+                "a_node_id", "connected_group_id", "ultimate_parent_id", "counterparty_id", "exposure_category",
+                "instrument_id", "netting_set_id", "collateral_id"
+            }:
+                self.sccl_filters[dim] = value
+
+                # push into SCCL filter dropdowns if present
+                if dim == "a_node_id" and hasattr(self, "cmb_sccl_anode"):
+                    self.cmb_sccl_anode.blockSignals(True)
+                    self.cmb_sccl_anode.setCurrentText(value)
+                    self.cmb_sccl_anode.blockSignals(False)
+                if dim == "connected_group_id" and hasattr(self, "cmb_sccl_cg"):
+                    self.cmb_sccl_cg.blockSignals(True)
+                    self.cmb_sccl_cg.setCurrentText(value)
+                    self.cmb_sccl_cg.blockSignals(False)
+                if dim == "ultimate_parent_id" and hasattr(self, "cmb_sccl_up"):
+                    self.cmb_sccl_up.blockSignals(True)
+                    self.cmb_sccl_up.setCurrentText(value)
+                    self.cmb_sccl_up.blockSignals(False)
+                if dim == "counterparty_id" and hasattr(self, "cmb_sccl_cp"):
+                    self.cmb_sccl_cp.blockSignals(True)
+                    self.cmb_sccl_cp.setCurrentText(value)
+                    self.cmb_sccl_cp.blockSignals(False)
+                if dim == "exposure_category" and hasattr(self, "cmb_sccl_cat"):
+                    self.cmb_sccl_cat.blockSignals(True)
+                    self.cmb_sccl_cat.setCurrentText(value)
+                    self.cmb_sccl_cat.blockSignals(False)
+
+            self.refresh_all()
+        except Exception as e:
+            if hasattr(self, "status"):
+                self.status.showMessage(f"Dim tree update failed: {e}", 8000)
+
+
+    def on_mode_changed(self):
+        txt = self.cmb_mode.currentText()
+        self.mode = "Auditor" if "Auditor" in txt else ("Executive" if "Executive" in txt else ("Checker" if "Checker" in txt else "Maker"))
+        self.current_user = self.mode
+        self.apply_mode_rules()
+        self.refresh_all()
+
+    def apply_preset(self):
+        name = self.cmb_preset.currentText()
+        row = self.data["presets"][self.data["presets"]["preset"] == name]
+        if row.empty:
+            return
+        r = row.iloc[0].to_dict()
+
+        self.cmb_le.blockSignals(True)
+        self.cmb_book.blockSignals(True)
+        self.cmb_ccy.blockSignals(True)
+        self.spn_mat.blockSignals(True)
+
+        self.cmb_le.setCurrentText(r["legal_entity"])
+        self.cmb_book.setCurrentText(r["book"])
+        self.cmb_ccy.setCurrentText(r["ccy"])
+        self.spn_mat.setValue(int(r["materiality"]))
+
+        self.cmb_le.blockSignals(False)
+        self.cmb_book.blockSignals(False)
+        self.cmb_ccy.blockSignals(False)
+        self.spn_mat.blockSignals(False)
+
+        self.update_filters()
+
+    def update_filters(self):
+        self.filters.as_of = self.cmb_asof.currentData()
+        self.filters.legal_entity = self.cmb_le.currentText()
+        self.filters.book = self.cmb_book.currentText()
+        self.filters.ccy = self.cmb_ccy.currentText()
+        self.filters.materiality = float(self.spn_mat.value())
+        self.refresh_all()
+
+    def apply_mode_rules(self):
+        """
+        Enterprise RBAC controls:
+          - Maker: create/edit explanations, submit, rollover, create breaks
+          - Checker: approve/reject submitted items (no narrative edits)
+          - Executive: certify/lock, read-only for narratives
+          - Auditor: fully read-only
+        """
+        is_auditor = (self.mode == "Auditor")
+        is_exec = (self.mode == "Executive")
+        is_checker = (self.mode == "Checker")
+        is_maker = (self.mode == "Maker")
+
+        # Button enablement
+        def _set_enabled(name: str, enabled: bool):
+            if hasattr(self, name):
+                getattr(self, name).setEnabled(bool(enabled))
+
+        # Break lifecycle / recon actions: Maker+Checker+Exec (Auditor no)
+        for b in ["btn_create_largest","btn_create_breaks","btn_open_break","btn_rerun","btn_inc"]:
+            _set_enabled(b, not is_auditor)
+
+        # Narrative editing: Maker only
+        if hasattr(self, "txt_var"): self.txt_var.setReadOnly(not is_maker)
+        if hasattr(self, "txt_sccl_var"): self.txt_sccl_var.setReadOnly(not is_maker)
+
+        # Variance workflow buttons
+        _set_enabled("btn_save_var", is_maker and not is_auditor and not is_exec)
+        _set_enabled("btn_var_submit", is_maker and not is_auditor and not is_exec)
+        _set_enabled("btn_var_roll", (is_maker or is_checker) and not is_auditor and not is_exec)  # preview ok
+        _set_enabled("btn_var_bulk_roll", is_maker and not is_auditor and not is_exec)
+        _set_enabled("btn_var_approve", is_checker and not is_auditor)
+        _set_enabled("btn_var_reject", is_checker and not is_auditor)
+
+        # SCCL workflow buttons
+        _set_enabled("btn_sccl_save", is_maker and not is_auditor and not is_exec)
+        _set_enabled("btn_sccl_submit", is_maker and not is_auditor and not is_exec)
+        _set_enabled("btn_sccl_roll", (is_maker or is_checker) and not is_auditor and not is_exec)
+        _set_enabled("btn_sccl_bulk_roll", is_maker and not is_auditor and not is_exec)
+        _set_enabled("btn_sccl_approve", is_checker and not is_auditor)
+        _set_enabled("btn_sccl_reject", is_checker and not is_auditor)
+
+        # Executive controls
+        _set_enabled("btn_cert", is_exec and not is_auditor)
+        _set_enabled("btn_lock", is_exec and not is_auditor)
+
+        # Hide noisy operational widgets in Executive view (keep drilldowns available)
+        if hasattr(self, "tbl_top"): self.tbl_top.setVisible(not is_exec)
+        if hasattr(self, "tbl_feed_snap"): self.tbl_feed_snap.setVisible(not is_exec)
+        if hasattr(self, "tbl_ready"): self.tbl_ready.setVisible(not is_exec)
+        if hasattr(self, "btn_create_largest"): self.btn_create_largest.setVisible(not is_exec)
+        if hasattr(self, "lbl_dash_left"): self.lbl_dash_left.setText("Executive Snapshot" if is_exec else "Top Breaks (GL↔SOR)")
+
+
+    def gl_filtered(self, d: Optional[date] = None) -> pd.DataFrame:
+        dd = d if d is not None else self.filters.as_of
+        gl = self.data["gl"]
+        return gl[
+            (gl["as_of"] == dd) &
+            (gl["legal_entity"] == self.filters.legal_entity) &
+            (gl["book"] == self.filters.book) &
+            (gl["ccy"] == self.filters.ccy)
+        ].copy()
+
+    def sor_filtered(self, d: Optional[date] = None) -> pd.DataFrame:
+        dd = d if d is not None else self.filters.as_of
+        sor = self.data["sor"]
+        return sor[
+            (sor["as_of"] == dd) &
+            (sor["legal_entity"] == self.filters.legal_entity) &
+            (sor["book"] == self.filters.book) &
+            (sor["ccy"] == self.filters.ccy)
+        ].copy()
+
+    # ---------- Core computations
+    def recon_gl_sor(self) -> pd.DataFrame:
+        gl = self.gl_filtered()
+        sor = self.sor_filtered()
+        key = ["as_of","legal_entity","book","ccy","account","account_name","product"]
+        if gl.empty:
+            return pd.DataFrame(columns=key + ["gl_amount","sor_amount","variance","abs_var","status","severity"])
+        g = gl[key + ["gl_amount"]].copy()
+        o = sor[key + ["sor_amount"]].copy() if not sor.empty else pd.DataFrame(columns=key + ["sor_amount"])
+        m = g.merge(o, on=key, how="left")
+        m["sor_amount"] = m["sor_amount"].fillna(0.0)
+        m["variance"] = m["gl_amount"] - m["sor_amount"]
+        m["abs_var"] = m["variance"].abs()
+        tol = float(self.spn_tol.value())
+        m["status"] = np.where(m["abs_var"] <= tol, "MATCH", "BREAK")
+        m["severity"] = m["variance"].apply(lambda x: severity_from_amt(x, self.filters.materiality))
+        return m
+
+    def recon_crrt_cr360(self) -> pd.DataFrame:
+        d = self.filters.as_of
+        crrt = self.data["crrt"]
+        cr360 = self.data["cr360"]
+        c1 = crrt[
+            (crrt["as_of"] == d) &
+            (crrt["legal_entity"] == self.filters.legal_entity) &
+            (crrt["book"] == self.filters.book) &
+            (crrt["ccy"] == self.filters.ccy)
+        ].copy()
+        c2 = cr360[
+            (cr360["as_of"] == d) &
+            (cr360["legal_entity"] == self.filters.legal_entity) &
+            (cr360["book"] == self.filters.book) &
+            (cr360["ccy"] == self.filters.ccy)
+        ].copy()
+        key = ["as_of","legal_entity","book","ccy","account"]
+        if c1.empty:
+            return pd.DataFrame(columns=key + ["crrt_amount","cr360_amount","variance","abs_var","status"])
+        m = c1.merge(c2[key + ["cr360_amount"]], on=key, how="left")
+        m["cr360_amount"] = m["cr360_amount"].fillna(0.0)
+        m["variance"] = m["crrt_amount"] - m["cr360_amount"]
+        m["abs_var"] = m["variance"].abs()
+        tol2 = float(self.spn_tol2.value())
+        m["status"] = np.where(m["abs_var"] <= tol2, "MATCH", "BREAK")
+        return m
+
+    def variance_pop(self) -> pd.DataFrame:
+        cur = self.gl_filtered(self.filters.as_of)
+        prior = self.gl_filtered(self.data["prior"])
+        if cur.empty:
+            return pd.DataFrame(columns=["account","account_name","product","cur","prior","variance","abs_var","severity"])
+        c = cur.groupby(["account","account_name","product"], as_index=False).agg(cur=("gl_amount","sum"))
+        p = prior.groupby(["account","account_name","product"], as_index=False).agg(prior=("gl_amount","sum")) if not prior.empty else pd.DataFrame(columns=["account","account_name","product","prior"])
+        v = c.merge(p, on=["account","account_name","product"], how="left").fillna(0.0)
+        v["variance"] = v["cur"] - v["prior"]
+        v["abs_var"] = v["variance"].abs()
+        v["severity"] = v["variance"].apply(lambda x: severity_from_amt(x, self.filters.materiality))
+        if self.chk_changes.isChecked():
+            v = v[v["abs_var"] > 0].copy()
+        return v.sort_values("abs_var", ascending=False)
+
+    def report_lines(self, report: str) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+        m = self.data["map"].copy()
+        if report == "FR Y (Other)":
+            m = m[m["report"] == "Y-9C"].copy()
+            m["report"] = report
+        else:
+            m = m[m["report"] == report].copy()
+
+        gl = self.gl_filtered()
+        cols = ["report_line","line_desc","amount","recon_abs_var","recon_status","mapped_accounts"]
+        if m.empty or gl.empty:
+            return pd.DataFrame(columns=cols), {}
+
+        joined = m.merge(gl, on="account", how="left")
+        joined["gl_amount"] = joined["gl_amount"].fillna(0.0)
+        lines = joined.groupby(["report_line","line_desc"], as_index=False).agg(
+            amount=("gl_amount","sum"),
+            mapped_accounts=("account","nunique")
+        )
+        accs_by_line = m.groupby("report_line")["account"].apply(lambda x: sorted(set(x))).to_dict()
+
+        recon = self.recon_gl_sor()
+        by_acc = recon.groupby("account", as_index=False).agg(abs_var=("abs_var","sum")) if not recon.empty else pd.DataFrame(columns=["account","abs_var"])
+
+        def risk(accs: List[str]) -> float:
+            if not accs or by_acc.empty:
+                return 0.0
+            return float(by_acc[by_acc["account"].isin(accs)]["abs_var"].sum())
+
+        lines["recon_abs_var"] = lines["report_line"].apply(lambda ln: risk(accs_by_line.get(ln, [])))
+        lines["recon_status"] = np.where(lines["recon_abs_var"] <= self.filters.materiality * 0.001, "OK", "AT_RISK")
+        return lines.sort_values("recon_abs_var", ascending=False), accs_by_line
+
+
+    # ---------- SCCL (FR2590) Exposure Drilldown (A-Node → Booking Entity → CP → Group → Category → Instrument → Netting/Collateral → Measures)
+    def sccl_atomic_filtered(self, d: Optional[date] = None) -> pd.DataFrame:
+        dd = d if d is not None else self.filters.as_of
+        df = self.data.get("sccl_atomic", pd.DataFrame()).copy()
+
+        # Always initialize optional filter variables (prevents UnboundLocalError)
+        instr = self.sccl_filters.get("instrument_id", "(All)")
+
+        # If no SCCL data at all, return immediately (nothing to filter)
+        if df.empty:
+            return df
+
+        if instr and instr != "(All)" and "instrument_id" in df.columns:
+            df = df[df["instrument_id"].astype(str) == str(instr)].copy()
+
+        net = self.sccl_filters.get("netting_set_id", "(All)")
+        if net and net != "(All)" and "netting_set_id" in df.columns:
+            df = df[df["netting_set_id"].astype(str) == str(net)].copy()
+
+        col = self.sccl_filters.get("collateral_id", "(All)")
+        if col and col != "(All)" and "collateral_id" in df.columns:
+            df = df[df["collateral_id"].astype(str) == str(col)].copy()
+
+        return df
+        df = df[df["as_of"] == dd].copy()
+
+        a_node = self.sccl_filters.get("a_node_id", "(All)")
+        if a_node and a_node != "(All)":
+            df = df[df["a_node_id"] == a_node].copy()
+
+        be = self.sccl_filters.get("booking_entity", "(All)")
+        if be and be != "(All)":
+            df = df[df["booking_entity"] == be].copy()
+
+        cg = self.sccl_filters.get("connected_group_id", "(All)")
+        if cg and cg != "(All)":
+            df = df[df["connected_group_id"] == cg].copy()
+
+        up = self.sccl_filters.get("ultimate_parent_id", "(All)")
+        if up and up != "(All)":
+            df = df[df["ultimate_parent_id"] == up].copy()
+
+        cp = self.sccl_filters.get("counterparty_id", "(All)")
+        if cp and cp != "(All)":
+            df = df[df["counterparty_id"] == cp].copy()
+
+        cat = self.sccl_filters.get("exposure_category", "(All)")
+        if cat and cat != "(All)":
+            df = df[df["exposure_category"] == cat].copy()
+
+        return df
+
+    def sccl_agg(self) -> pd.DataFrame:
+        cur = self.sccl_atomic_filtered(self.filters.as_of)
+        prior = self.sccl_atomic_filtered(self.data["prior"])
+
+        if cur.empty and prior.empty:
+            return pd.DataFrame(columns=[
+                "connected_group_id","ultimate_parent_id","counterparty_id","exposure_category","booking_entity",
+                "cur_ead","prior_ead","variance","abs_var","severity","status"
+            ])
+
+        group_cols = ["connected_group_id","ultimate_parent_id","counterparty_id","exposure_category","booking_entity"]
+        c = cur.groupby(group_cols, as_index=False).agg(cur_ead=("ead","sum"), cur_gross=("gross_exposure","sum"), cur_net=("net_exposure","sum")) if not cur.empty else pd.DataFrame(columns=group_cols+["cur_ead","cur_gross","cur_net"])
+        p = prior.groupby(group_cols, as_index=False).agg(prior_ead=("ead","sum")) if not prior.empty else pd.DataFrame(columns=group_cols+["prior_ead"])
+
+        v = c.merge(p, on=group_cols, how="outer").fillna(0.0)
+        v["variance"] = v["cur_ead"] - v["prior_ead"]
+        v["abs_var"] = v["variance"].abs()
+        v["severity"] = v["variance"].apply(lambda x: severity_from_amt(x, self.filters.materiality))
+        v["status"] = np.where(v["abs_var"] >= self.filters.materiality, "AT_RISK", "OK")
+
+        # Friendly names
+        cp = self.data.get("counterparty", pd.DataFrame())
+        if not cp.empty:
+            v = v.merge(cp[["counterparty_id","counterparty_name","ultimate_parent_id","ultimate_parent_name","connected_group_id","connected_group_name"]].drop_duplicates(),
+                        on=["counterparty_id","connected_group_id","ultimate_parent_id"], how="left")
+        v["counterparty_name"] = v.get("counterparty_name", pd.Series([""]*len(v)))
+        v["ultimate_parent_name"] = v.get("ultimate_parent_name", pd.Series([""]*len(v)))
+        v["connected_group_name"] = v.get("connected_group_name", pd.Series([""]*len(v)))
+
+        # Order
+        cols = ["connected_group_id","connected_group_name","ultimate_parent_id","ultimate_parent_name","counterparty_id","counterparty_name","booking_entity","exposure_category",
+                "cur_ead","prior_ead","variance","abs_var","status","severity"]
+        for ccol in cols:
+            if ccol not in v.columns:
+                v[ccol] = ""
+        return v[cols].sort_values("abs_var", ascending=False)
+
+    def _sccl_key_from_row(self, r: Dict[str, Any]) -> str:
+        return "|".join([
+            "SCCL",
+            str(self.filters.as_of),
+            str(self.sccl_filters.get("a_node_id","A_US_CONSOL")),
+            str(r.get("booking_entity","")),
+            str(r.get("connected_group_id","")),
+            str(r.get("ultimate_parent_id","")),
+            str(r.get("counterparty_id","")),
+            str(r.get("exposure_category","")),
+        ])
+
+    def refresh_sccl(self):
+        # Populate dropdowns safely (if tab exists)
+        if not hasattr(self, "cmb_sccl_anode"):
+            return
+
+        org = self.data.get("org_hier", pd.DataFrame())
+        cps = self.data.get("counterparty", pd.DataFrame())
+        atomic = self.data.get("sccl_atomic", pd.DataFrame())
+
+        # A-node
+        a_nodes = org[org["node_type"] == "A_NODE"]["node_id"].tolist() if not org.empty else ["A_US_CONSOL"]
+        self.cmb_sccl_anode.blockSignals(True)
+        self.cmb_sccl_anode.clear()
+        self.cmb_sccl_anode.addItem("(All)")
+        for a in a_nodes:
+            self.cmb_sccl_anode.addItem(a)
+        cur_a = self.sccl_filters.get("a_node_id","A_US_CONSOL")
+        self.cmb_sccl_anode.setCurrentText(cur_a if cur_a in [self.cmb_sccl_anode.itemText(i) for i in range(self.cmb_sccl_anode.count())] else "A_US_CONSOL")
+        self.cmb_sccl_anode.blockSignals(False)
+
+        # Booking entity
+        bes = sorted(atomic["booking_entity"].unique().tolist()) if not atomic.empty else ["US_HOLDCO","US_BANK","UK_BRANCH"]
+        self.cmb_sccl_be.blockSignals(True)
+        self.cmb_sccl_be.clear()
+        self.cmb_sccl_be.addItem("(All)")
+        for b in bes:
+            self.cmb_sccl_be.addItem(b)
+        cur_be = self.sccl_filters.get("booking_entity","(All)")
+        self.cmb_sccl_be.setCurrentText(cur_be if cur_be in [self.cmb_sccl_be.itemText(i) for i in range(self.cmb_sccl_be.count())] else "(All)")
+        self.cmb_sccl_be.blockSignals(False)
+
+        
+        # Connected group + ultimate parent + counterparty
+        self.cmb_sccl_cg.blockSignals(True)
+        self.cmb_sccl_cg.clear()
+        self.cmb_sccl_cg.addItem("(All)")
+        if not cps.empty:
+            for cg in sorted(cps["connected_group_id"].unique().tolist()):
+                self.cmb_sccl_cg.addItem(cg)
+        self.cmb_sccl_cg.setCurrentText(self.sccl_filters.get("connected_group_id","(All)"))
+        self.cmb_sccl_cg.blockSignals(False)
+
+        self.cmb_sccl_up.blockSignals(True)
+        self.cmb_sccl_up.clear()
+        self.cmb_sccl_up.addItem("(All)")
+        if not cps.empty:
+            cg = self.sccl_filters.get("connected_group_id","(All)")
+            sub_up = cps if cg == "(All)" else cps[cps["connected_group_id"] == cg]
+            for up in sorted(sub_up["ultimate_parent_id"].unique().tolist()):
+                self.cmb_sccl_up.addItem(up)
+        self.cmb_sccl_up.setCurrentText(self.sccl_filters.get("ultimate_parent_id","(All)"))
+        self.cmb_sccl_up.blockSignals(False)
+
+        self.cmb_sccl_cp.blockSignals(True)
+        self.cmb_sccl_cp.clear()
+        self.cmb_sccl_cp.addItem("(All)")
+        if not cps.empty:
+            cg = self.sccl_filters.get("connected_group_id","(All)")
+            up = self.sccl_filters.get("ultimate_parent_id","(All)")
+            sub = cps
+            if cg != "(All)":
+                sub = sub[sub["connected_group_id"] == cg]
+            if up != "(All)":
+                sub = sub[sub["ultimate_parent_id"] == up]
+            for cp in sorted(sub["counterparty_id"].unique().tolist()):
+                self.cmb_sccl_cp.addItem(cp)
+        self.cmb_sccl_cp.setCurrentText(self.sccl_filters.get("counterparty_id","(All)"))
+        self.cmb_sccl_cp.blockSignals(False)
+
+        # Exposure category
+        cats = sorted(atomic["exposure_category"].unique().tolist()) if not atomic.empty else ["Loans/Commitments","Securities","Derivatives","SFT"]
+        self.cmb_sccl_cat.blockSignals(True)
+        self.cmb_sccl_cat.clear()
+        self.cmb_sccl_cat.addItem("(All)")
+        for c in cats:
+            self.cmb_sccl_cat.addItem(c)
+        self.cmb_sccl_cat.setCurrentText(self.sccl_filters.get("exposure_category","(All)"))
+        self.cmb_sccl_cat.blockSignals(False)
+
+        # Table
+        agg = self.sccl_agg()
+        self.m_sccl.set_df(agg)
+
+        # Clear side panels
+        self.lbl_sccl_explain.setText("Select a row to see instrument-level drilldown, netting/collateral drivers, and capture an explanation.")
+        self.m_sccl_trades.set_df(pd.DataFrame(columns=["instrument_id","instrument_type","netting_set_id","collateral_id","gross_exposure","net_exposure","ead"]))
+        self.m_sccl_mitig.set_df(pd.DataFrame(columns=["netting_set_id","agreement_type","margining","threshold","collateral_id","collateral_type","ccy","haircut"]))
+        self._selected_sccl_key = None
+        self.txt_sccl_var.setPlainText("")
+        if hasattr(self, "lbl_sccl_status"): self.lbl_sccl_status.setText("Status: —")
+        if hasattr(self, "chk_sccl_carry"): self.chk_sccl_carry.setChecked(True)
+
+    def on_sccl_filter_changed(self):
+        self.sccl_filters["a_node_id"] = self.cmb_sccl_anode.currentText()
+        self.sccl_filters["booking_entity"] = self.cmb_sccl_be.currentText()
+        self.sccl_filters["connected_group_id"] = self.cmb_sccl_cg.currentText()
+        self.sccl_filters["ultimate_parent_id"] = self.cmb_sccl_up.currentText()
+        self.sccl_filters["counterparty_id"] = self.cmb_sccl_cp.currentText()
+        self.sccl_filters["exposure_category"] = self.cmb_sccl_cat.currentText()
+
+        # Re-sync dependent lists when hierarchy changes
+        if self.sender() == self.cmb_sccl_cg:
+            self.sccl_filters["ultimate_parent_id"] = "(All)"
+            self.sccl_filters["counterparty_id"] = "(All)"
+        if self.sender() == self.cmb_sccl_up:
+            self.sccl_filters["counterparty_id"] = "(All)"
+
+        self.refresh_sccl()
+
+    def on_sccl_selected(self, idx: QModelIndex):
+        row = self.m_sccl.get_row(idx.row())
+        if not row:
+            return
+        self._selected_sccl_key = self._sccl_key_from_row(row)
+
+        # Drilldown to atomic instruments for the selected row
+        cur = self.sccl_atomic_filtered(self.filters.as_of)
+        if cur.empty:
+            return
+
+        filt = (
+            (cur["booking_entity"] == row.get("booking_entity")) &
+            (cur["connected_group_id"] == row.get("connected_group_id")) &
+            (cur["ultimate_parent_id"] == row.get("ultimate_parent_id")) &
+            (cur["counterparty_id"] == row.get("counterparty_id")) &
+            (cur["exposure_category"] == row.get("exposure_category"))
+        )
+        trades = cur[filt].copy()
+        trades = trades.sort_values("ead", ascending=False)[["instrument_id","instrument_type","netting_set_id","collateral_id","gross_exposure","net_exposure","ead"]]
+        self.m_sccl_trades.set_df(trades)
+
+        # Mitigants (netting + collateral)
+        net = self.data.get("netting", pd.DataFrame())
+        col = self.data.get("collateral", pd.DataFrame())
+        ns_ids = sorted(set(trades["netting_set_id"].astype(str).tolist()))
+        col_ids = sorted(set([c for c in trades["collateral_id"].astype(str).tolist() if c]))
+
+        net_sub = net[net["netting_set_id"].isin(ns_ids)].copy() if not net.empty else pd.DataFrame()
+        col_sub = col[col["collateral_id"].isin(col_ids)].copy() if (not col.empty and col_ids) else pd.DataFrame()
+
+        blocks = []
+        if not net_sub.empty:
+            tmp = net_sub.copy()
+            tmp["collateral_id"] = ""
+            tmp["collateral_type"] = ""
+            tmp["ccy"] = ""
+            tmp["haircut"] = ""
+            blocks.append(tmp)
+
+        if not col_sub.empty:
+            tmp = col_sub.copy()
+            tmp["netting_set_id"] = ""
+            tmp["agreement_type"] = ""
+            tmp["margining"] = ""
+            tmp["threshold"] = 0
+            blocks.append(tmp)
+
+        if blocks:
+            mit = pd.concat(blocks, ignore_index=True)
+        else:
+            mit = pd.DataFrame(columns=["netting_set_id","agreement_type","margining","threshold","collateral_id","collateral_type","ccy","haircut"])
+
+        mit = mit[["netting_set_id","agreement_type","margining","threshold","collateral_id","collateral_type","ccy","haircut"]].head(25)
+        self.m_sccl_mitig.set_df(mit)
+
+        self.lbl_sccl_selected.setText(
+            f"{row.get('connected_group_id')} / {row.get('ultimate_parent_id')} / {row.get('counterparty_id')} • {row.get('exposure_category')} • {row.get('booking_entity')}\n"
+            f"Cur EAD: {fmt_money(row.get('cur_ead',0.0))} | Prior: {fmt_money(row.get('prior_ead',0.0))} | Var: {fmt_money(row.get('variance',0.0))}"
+        )
+
+        # Load existing SCCL explanation (if any)
+        ex = self.sccl_expl[self.sccl_expl["key"] == self._selected_sccl_key].copy()
+        if not ex.empty:
+            e = ex.iloc[0].to_dict()
+            self.lbl_sccl_status.setText(f"Status: {e.get('status','DRAFT')}")
+            if hasattr(self, "chk_sccl_carry"):
+                self.chk_sccl_carry.setChecked(bool(e.get("carry_forward", True)))
+
+            reason = str(e.get("reason",""))
+            if reason and reason in [self.cmb_sccl_reason.itemText(i) for i in range(self.cmb_sccl_reason.count())]:
+                self.cmb_sccl_reason.setCurrentText(reason)
+            self.txt_sccl_var.setPlainText(str(e.get("narrative","")))
+        else:
+            self.lbl_sccl_status.setText("Status: —")
+            if hasattr(self, "chk_sccl_carry"):
+                self.chk_sccl_carry.setChecked(True)
+
+            self.txt_sccl_var.setPlainText("")
+            if self.chk_sccl_autofill.isChecked():
+                # try prior close (preview)
+                prior_key = self._selected_sccl_key.replace(str(self.filters.as_of), str(self.data["prior"]))
+                prior = self.sccl_expl[self.sccl_expl["key"] == prior_key].copy()
+                if not prior.empty:
+                    e = prior.iloc[0].to_dict()
+                    reason = str(e.get("reason",""))
+                    if reason and reason in [self.cmb_sccl_reason.itemText(i) for i in range(self.cmb_sccl_reason.count())]:
+                        self.cmb_sccl_reason.setCurrentText(reason)
+                    self.txt_sccl_var.setPlainText(str(e.get("narrative","")))
+                    if hasattr(self, "chk_sccl_carry"):
+                        self.chk_sccl_carry.setChecked(bool(e.get("carry_forward", True)))
+                    self.status.showMessage("Loaded prior-close SCCL explanation for preview (not saved).", 4500)
+
+        self.lbl_sccl_explain.setText(
+            "Explain this SCCL number:\n"
+            "- Instrument/trade list supports examiner drilldown\n"
+            "- Netting + collateral show mitigation context\n"
+            "- Save narrative is audit logged (maker/checker can be extended)\n"
+        )
+
+    def rollover_sccl_expl(self):
+        if not self._selected_sccl_key:
+            QMessageBox.information(self, "Select SCCL row", "Select an SCCL row first.")
+            return
+        prior_key = self._selected_sccl_key.replace(str(self.filters.as_of), str(self.data["prior"]))
+        prior = self.sccl_expl[self.sccl_expl["key"] == prior_key].copy()
+        if prior.empty:
+            QMessageBox.information(self, "No prior explanation", "No prior-close SCCL explanation found for this row.")
+            return
+        e = prior.iloc[0].to_dict()
+        reason = str(e.get("reason",""))
+        if reason and reason in [self.cmb_sccl_reason.itemText(i) for i in range(self.cmb_sccl_reason.count())]:
+            self.cmb_sccl_reason.setCurrentText(reason)
+        self.txt_sccl_var.setPlainText(str(e.get("narrative","")))
+        if hasattr(self, "chk_sccl_carry"):
+            self.chk_sccl_carry.setChecked(bool(e.get("carry_forward", True)))
+        self.status.showMessage("Prior SCCL explanation rolled into editor (preview). Click 'Save Draft' to persist for current close.", 5500)
+
+    def save_sccl_expl(self):
+        """
+        Save Draft (Maker): SCCL explanation at Connected Group / Counterparty slice.
+        Key: SCCL|asof|a_node|booking|cg|up|cp|cat
+        """
+        if self.mode != "Maker":
+            QMessageBox.information(self, "Not permitted", "Only Maker can save/edit narratives.")
+            return
+        if not self._selected_sccl_key:
+            QMessageBox.information(self, "Select SCCL row", "Select an SCCL row first.")
+            return
+        narrative = (self.txt_sccl_var.toPlainText() or "").strip()
+        if not narrative:
+            QMessageBox.warning(self, "Narrative required", "Enter an SCCL explanation narrative.")
+            return
+
+        existing = self.sccl_expl[self.sccl_expl["key"] == self._selected_sccl_key].copy()
+        if not existing.empty:
+            st = str(existing.iloc[0].get("status","DRAFT"))
+            if st in ("SUBMITTED","APPROVED"):
+                QMessageBox.warning(self, "Locked", f"Item is {st}. Maker cannot edit unless it is rejected or recalled.")
+                return
+
+        parts = self._selected_sccl_key.split("|")
+        # SCCL|asof|a_node|booking|cg|up|cp|cat
+        _, _, a_node, booking, cg, up, cp, cat = (parts + [""]*8)[:8]
+
+        now = now_str()
+        row = {
+            "key": self._selected_sccl_key,
+            "as_of": self.filters.as_of,
+            "a_node_id": a_node,
+            "booking_entity": booking,
+            "connected_group_id": cg,
+            "ultimate_parent_id": up,
+            "counterparty_id": cp,
+            "exposure_category": cat,
+            "reason": self.cmb_sccl_reason.currentText(),
+            "narrative": narrative,
+            "carry_forward": bool(self.chk_sccl_carry.isChecked()) if hasattr(self, "chk_sccl_carry") else True,
+            "status": "DRAFT",
+            "maker": self.current_user,
+            "ts_created": (existing.iloc[0].get("ts_created") if not existing.empty else now),
+            "ts_updated": now,
+            "submitted_ts": (existing.iloc[0].get("submitted_ts") if not existing.empty else ""),
+            "checker": (existing.iloc[0].get("checker") if not existing.empty else ""),
+            "approved_ts": (existing.iloc[0].get("approved_ts") if not existing.empty else ""),
+            "decision_notes": (existing.iloc[0].get("decision_notes") if not existing.empty else ""),
+        }
+
+        self.sccl_expl = self.sccl_expl[self.sccl_expl["key"] != self._selected_sccl_key]
+        self.sccl_expl = pd.concat([self.sccl_expl, pd.DataFrame([row])], ignore_index=True)
+        if hasattr(self, "lbl_sccl_status"): self.lbl_sccl_status.setText("Status: DRAFT")
+
+        self.log("SAVE_DRAFT", "SCCL", self._selected_sccl_key, f"reason={row['reason']}; carry={row['carry_forward']}; narrative={narrative[:200]}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Saved", "Draft saved and audit logged.")
+
+    def submit_sccl_expl(self):
+        if self.mode != "Maker":
+            QMessageBox.information(self, "Not permitted", "Only Maker can submit.")
+            return
+        if not self._selected_sccl_key:
+            QMessageBox.information(self, "Select SCCL row", "Select an SCCL row first.")
+            return
+        ex = self.sccl_expl[self.sccl_expl["key"] == self._selected_sccl_key].copy()
+        if ex.empty:
+            QMessageBox.warning(self, "No draft", "Save a draft first.")
+            return
+        st = str(ex.iloc[0].get("status","DRAFT"))
+        if st != "DRAFT":
+            QMessageBox.warning(self, "Wrong status", f"Only DRAFT can be submitted. Current: {st}")
+            return
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "status"] = "SUBMITTED"
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "submitted_ts"] = now_str()
+        if hasattr(self, "lbl_sccl_status"): self.lbl_sccl_status.setText("Status: SUBMITTED")
+        self.log("SUBMIT", "SCCL", self._selected_sccl_key, "Submitted for approval")
+        self.refresh_audit()
+        QMessageBox.information(self, "Submitted", "Submitted to Checker.")
+
+    def approve_sccl_expl(self):
+        if self.mode != "Checker":
+            QMessageBox.information(self, "Not permitted", "Only Checker can approve.")
+            return
+        if not self._selected_sccl_key:
+            QMessageBox.information(self, "Select SCCL row", "Select an SCCL row first.")
+            return
+        ex = self.sccl_expl[self.sccl_expl["key"] == self._selected_sccl_key].copy()
+        if ex.empty:
+            QMessageBox.warning(self, "No item", "No explanation found.")
+            return
+        st = str(ex.iloc[0].get("status",""))
+        if st != "SUBMITTED":
+            QMessageBox.warning(self, "Wrong status", f"Only SUBMITTED can be approved. Current: {st}")
+            return
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "status"] = "APPROVED"
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "checker"] = self.current_user
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "approved_ts"] = now_str()
+        if hasattr(self, "lbl_sccl_status"): self.lbl_sccl_status.setText("Status: APPROVED")
+        self.log("APPROVE", "SCCL", self._selected_sccl_key, f"Approved by {self.current_user}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Approved", "SCCL explanation approved.")
+
+    def reject_sccl_expl(self):
+        if self.mode != "Checker":
+            QMessageBox.information(self, "Not permitted", "Only Checker can reject.")
+            return
+        if not self._selected_sccl_key:
+            QMessageBox.information(self, "Select SCCL row", "Select an SCCL row first.")
+            return
+        ex = self.sccl_expl[self.sccl_expl["key"] == self._selected_sccl_key].copy()
+        if ex.empty:
+            QMessageBox.warning(self, "No item", "No explanation found.")
+            return
+        st = str(ex.iloc[0].get("status",""))
+        if st != "SUBMITTED":
+            QMessageBox.warning(self, "Wrong status", f"Only SUBMITTED can be rejected. Current: {st}")
+            return
+        note, ok = QInputDialog.getText(self, "Reject SCCL explanation", "Reason / notes (required):")
+        if not ok or not (note or "").strip():
+            return
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "status"] = "REJECTED"
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "checker"] = self.current_user
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "approved_ts"] = now_str()
+        self.sccl_expl.loc[self.sccl_expl["key"] == self._selected_sccl_key, "decision_notes"] = note.strip()
+        if hasattr(self, "lbl_sccl_status"): self.lbl_sccl_status.setText("Status: REJECTED")
+        self.log("REJECT", "SCCL", self._selected_sccl_key, f"{self.current_user}: {note.strip()[:200]}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Rejected", "SCCL explanation rejected and returned to Maker.")
+
+    def bulk_rollover_sccl(self):
+        if self.mode != "Maker":
+            QMessageBox.information(self, "Not permitted", "Only Maker can run bulk rollover.")
+            return
+
+        prior_asof = self.data["prior"]
+        cur_asof = self.filters.as_of
+        prior = self.sccl_expl[
+            (self.sccl_expl["as_of"] == prior_asof) &
+            (self.sccl_expl["status"] == "APPROVED") &
+            (self.sccl_expl["carry_forward"] == True)
+        ].copy()
+
+        if prior.empty:
+            QMessageBox.information(self, "Nothing to rollover", "No prior approved carry-forward SCCL explanations found.")
+            return
+
+        created = 0
+        now = now_str()
+        for _, r in prior.iterrows():
+            key = str(r["key"])
+            new_key = key.replace(str(prior_asof), str(cur_asof))
+            if not self.sccl_expl[self.sccl_expl["key"] == new_key].empty:
+                continue
+            row = r.to_dict()
+            row.update({
+                "key": new_key,
+                "as_of": cur_asof,
+                "status": "DRAFT",
+                "maker": self.current_user,
+                "ts_created": now,
+                "ts_updated": now,
+                "submitted_ts": "",
+                "checker": "",
+                "approved_ts": "",
+                "decision_notes": "",
+            })
+            self.sccl_expl = pd.concat([self.sccl_expl, pd.DataFrame([row])], ignore_index=True)
+            created += 1
+
+        self.log("BULK_ROLLOVER", "SCCL", str(cur_asof), f"Created {created} SCCL draft explanations from prior carry-forward")
+        self.refresh_audit()
+        QMessageBox.information(self, "Bulk rollover complete", f"Created {created} SCCL draft explanations for current close.")
+
+    # ---------- Confidence scoring
+    def confidence(self) -> Tuple[str, int, Dict[str, Any]]:
+        recon = self.recon_gl_sor()
+        breaks = recon[recon["status"] == "BREAK"].copy() if not recon.empty else pd.DataFrame()
+        material = breaks[breaks["abs_var"] >= self.filters.materiality].copy() if not breaks.empty else pd.DataFrame()
+
+        feeds_today = self.data["feed"][self.data["feed"]["as_of"] == self.filters.as_of].copy()
+        late = feeds_today[feeds_today["status"].isin(["LATE","FAILED"])].copy()
+        rejects = int(feeds_today["rejects"].sum()) if not feeds_today.empty else 0
+
+        open_b = self.breaks[self.breaks["status"].isin(["OPEN","IN REVIEW"])] if not self.breaks.empty else pd.DataFrame()
+        breached = open_b[open_b["sla_status"] == "BREACHED"] if not open_b.empty else pd.DataFrame()
+
+        score = 100
+        score -= min(40, len(material) * 8)
+        score -= min(20, len(late) * 8)
+        score -= 10 if rejects > 600 else (5 if rejects > 250 else 0)
+        score -= min(20, len(breached) * 10)
+        score = int(max(0, min(100, score)))
+        rating = "HIGH" if score >= 80 else ("MEDIUM" if score >= 60 else "LOW")
+        return rating, score, {"material_breaks": len(material), "late_feeds": len(late), "rejects": rejects, "sla_breaches": len(breached)}
+
+    # ---------- Audit
+    def log(self, action: str, obj_type: str, obj_id: str, details: str):
+        self.audit = pd.concat([self.audit, pd.DataFrame([{
+            "ts": now_str(), "user": self.current_user, "action": action,
+            "object_type": obj_type, "object_id": obj_id, "details": details
+        }])], ignore_index=True)
+
+    # ---------- Refresh chain
+    def refresh_all(self):
+        # smart defaults for tolerances
+        self.spn_tol.blockSignals(True)
+        self.spn_tol.setValue(max(0, int(self.filters.materiality * 0.001)))
+        self.spn_tol.blockSignals(False)
+
+        self.spn_tol2.blockSignals(True)
+        self.spn_tol2.setValue(max(0, int(self.filters.materiality * 0.0005)))
+        self.spn_tol2.blockSignals(False)
+
+        self.apply_mode_rules()
+        self.refresh_dashboard()
+        self.refresh_feed()
+        self.refresh_gl()
+        self.refresh_recon()
+        self.refresh_breaks()
+        self.refresh_variance()
+        self.refresh_reporting()
+        self.refresh_sccl()
+        self.refresh_lineage()
+        self.refresh_audit()
+
+        # Update shared dim tree and persist user context (enterprise-like experience)
+        if hasattr(self, "dim_tree"):
+            self.dim_tree.rebuild(self.filters, self.sccl_filters)
+
+        self.status.showMessage(
+            f"{self.filters.as_of} | {self.filters.legal_entity} | {self.filters.book} | {self.filters.ccy} | "
+            f"Mat={int(self.filters.materiality):,} | Mode={self.mode} | {self._breadcrumbs()}",
+            6000
+        )
+        self._save_state()
+
+    def refresh_dashboard(self):
+        self.lbl_ctx_banner.setText(f"Context: Actual (Posted Balances) • LE={self.filters.legal_entity} • Book={self.filters.book} • CCY={self.filters.ccy} • {self._breadcrumbs()}")
+
+        recon = self.recon_gl_sor()
+        breaks = recon[recon["status"] == "BREAK"].copy() if not recon.empty else pd.DataFrame()
+        material_breaks = breaks[breaks["abs_var"] >= self.filters.materiality].copy() if not breaks.empty else pd.DataFrame()
+        feeds_today = self.data["feed"][self.data["feed"]["as_of"] == self.filters.as_of].copy()
+        late = feeds_today[feeds_today["status"].isin(["LATE","FAILED"])].copy()
+
+        completion = 1.0 - (len(breaks) / max(len(recon), 1)) if not recon.empty else 1.0
+        rating, score, meta = self.confidence()
+
+        open_cnt = len(self.breaks[self.breaks["status"].isin(["OPEN","IN REVIEW"])]) if not self.breaks.empty else 0
+
+        self.k_material.setText(str(len(material_breaks)))
+        self.k_material_sub.setText(f"Threshold: {fmt_money(self.filters.materiality)}")
+
+        self.k_open.setText(str(open_cnt))
+        self.k_open_sub.setText(f"SLA breaches: {meta['sla_breaches']}")
+
+        self.k_feeds.setText(str(len(late)))
+        self.k_feeds_sub.setText(f"Rejects: {meta['rejects']}")
+
+        self.k_recon.setText(fmt_pct(completion))
+        self.k_recon_sub.setText(f"Tolerance: {fmt_money(self.spn_tol.value())}")
+
+        self.k_conf.setText(f"{rating} ({score})")
+        self.k_conf_sub.setText(f"Material={meta['material_breaks']} • Late={meta['late_feeds']}")
+
+        top = recon.sort_values("abs_var", ascending=False).head(14)[
+            ["product","account","account_name","gl_amount","sor_amount","variance","abs_var","status","severity"]
+        ].copy() if not recon.empty else pd.DataFrame()
+        if self.chk_changes.isChecked() and not top.empty:
+            top = top[top["abs_var"] > 0].copy()
+        self.m_top.set_df(top)
+
+        snap = feeds_today[["source","layer","status","latency_min","records","rejects","run_id"]].copy() if not feeds_today.empty else pd.DataFrame()
+        self.m_feed_snap.set_df(snap)
+
+        readiness = pd.DataFrame([
+            {"Report":"FR2590","Confidence":rating,"Status":"IN PROGRESS"},
+            {"Report":"Y-9C","Confidence":"MEDIUM" if rating == "HIGH" else rating,"Status":"IN PROGRESS"},
+            {"Report":"FR Y (Other)","Confidence":"LOW" if rating != "HIGH" else "MEDIUM","Status":"AT RISK"},
+            {"Report":"CCAR","Confidence":"HIGH","Status":"READY"},
+            {"Report":"CECL/ACL","Confidence":"MEDIUM","Status":"IN PROGRESS"},
+            {"Report":"STARE","Confidence":"LOW" if (feeds_today[feeds_today["source"]=="STARE_FORECAST"]["status"].astype(str).eq("LATE").any()) else "MEDIUM","Status":"AT RISK"},
+            {"Report":"ERA","Confidence":"MEDIUM","Status":"IN PROGRESS"},
+        ])
+        self.m_ready.set_df(readiness)
+
+        # break intelligence
+        b = self.breaks.copy()
+        # Enterprise context slice: Breaks list follows the same global context as other workspaces
+        if not b.empty:
+            b = b[(b["as_of"] == self.filters.as_of) &
+                  (b["legal_entity"] == self.filters.legal_entity) &
+                  (b["book"] == self.filters.book) &
+                  (b["ccy"] == self.filters.ccy)].copy()
+        open_b = b[b["status"].isin(["OPEN","IN REVIEW"])].copy() if not b.empty else pd.DataFrame()
+        if open_b.empty:
+            self.lbl_root.setText("Top Root Cause: —")
+            self.lbl_repeat.setText("Repeat Offenders: —")
+            self.lbl_sla.setText("SLA Risk: —")
+        else:
+            self.lbl_root.setText(f"Top Root Cause: {open_b['root_cause'].value_counts().index[0]}")
+            offenders = ", ".join(open_b["account"].value_counts().head(2).index.tolist())
+            self.lbl_repeat.setText(f"Repeat Offenders: {offenders}")
+            self.lbl_sla.setText(f"SLA Risk: {len(open_b[open_b['sla_status'].isin(['AT_RISK','BREACHED'])])}")
+
+    def refresh_feed(self):
+        f = self.data["feed"][self.data["feed"]["as_of"] == self.filters.as_of].copy()
+        self.m_feed.set_df(f)
+        self.cmb_feed.blockSignals(True)
+        self.cmb_feed.clear()
+        for s in f["source"].tolist():
+            self.cmb_feed.addItem(s)
+        self.cmb_feed.blockSignals(False)
+
+        if not f.empty:
+            rej = pd.DataFrame({
+                "source": np.random.choice(f["source"], 30),
+                "error_code": np.random.choice(["MISSING_DIM","INVALID_ACCOUNT","BAD_CCY","DUP_KEY","CONTROL_MISMATCH"], 30),
+                "sample_key": [f"K{np.random.randint(100000,999999)}" for _ in range(30)],
+                "detail": np.random.choice(
+                    ["Missing cost_center","Account not in COA","Currency mismatch","Duplicate reference id","Control total variance"], 30
+                ),
+            })
+        else:
+            rej = pd.DataFrame(columns=["source","error_code","sample_key","detail"])
+        self.m_rej.set_df(rej)
+        self.m_rules.set_df(self.data["rules"].copy())
+
+    def refresh_gl(self):
+        q = (self.ed_gl.text() or "").strip().lower()
+        gl = self.gl_filtered()
+        if gl.empty:
+            self.m_gl.set_df(pd.DataFrame(columns=["account","account_name","product","gl_amount"]))
+            self.m_map_acc.set_df(pd.DataFrame(columns=["report","report_line","line_desc"]))
+            self.lbl_explain.setText("No data for current filters.")
+            return
+        tb = gl.groupby(["account","account_name","product"], as_index=False).agg(gl_amount=("gl_amount","sum"))
+        if q:
+            tb = tb[
+                tb["account"].astype(str).str.contains(q, case=False) |
+                tb["account_name"].astype(str).str.lower().str.contains(q)
+            ].copy()
+        tb = tb.sort_values(["account","product"])
+        self.m_gl.set_df(tb)
+        self.m_map_acc.set_df(pd.DataFrame(columns=["report","report_line","line_desc"]))
+        self.lbl_explain.setText("Select a row to see mapping, lineage, and risk drivers.")
+
+    def on_gl_selected(self, idx: QModelIndex):
+        r = self.m_gl.get_row(idx.row())
+        acc = str(r.get("account",""))
+        prod = str(r.get("product",""))
+        amt = r.get("gl_amount", 0.0)
+
+        mm = self.data["map"][self.data["map"]["account"] == acc][["report","report_line","line_desc"]].drop_duplicates().copy()
+        self.m_map_acc.set_df(mm)
+
+        open_b = self.breaks[self.breaks["status"].isin(["OPEN","IN REVIEW"])] if not self.breaks.empty else pd.DataFrame()
+        slice_b = open_b[(open_b["account"] == acc) & (open_b["product"] == prod)] if not open_b.empty else pd.DataFrame()
+        contrib = "No open breaks for this slice." if slice_b.empty else f"Open breaks: {len(slice_b)} • SLA: {slice_b['sla_status'].value_counts().to_dict()}"
+
+        self.lbl_explain.setText(
+            f"Context: {self.filters.as_of} | LE={self.filters.legal_entity} | Book={self.filters.book} | CCY={self.filters.ccy}\n"
+            f"SCCL Path: {self._breadcrumbs()}\n\n"
+            f"Account {acc} | Product {prod}\nAmount: {fmt_money(amt)}\n\n"
+            f"Why it matters:\n- Mapped to {mm['report'].nunique()} report(s)\n- {contrib}\n\n"
+            "Lineage:\nGL_CORE + SUBLEDGER_SOR → Enterprise GL Mart → CRRT → CR360 → Reporting"
+        )
+
+    def refresh_recon(self):
+        recon = self.recon_gl_sor()
+        view = recon.sort_values("abs_var", ascending=False)[
+            ["product","account","account_name","gl_amount","sor_amount","variance","abs_var","status","severity"]
+        ].copy() if not recon.empty else pd.DataFrame(columns=["product","account","account_name","gl_amount","sor_amount","variance","abs_var","status","severity"])
+        self.m_recon.set_df(view)
+
+        recon2 = self.recon_crrt_cr360()
+        view2 = recon2.sort_values("abs_var", ascending=False)[
+            ["account","crrt_amount","cr360_amount","variance","abs_var","status"]
+        ].copy() if not recon2.empty else pd.DataFrame(columns=["account","crrt_amount","cr360_amount","variance","abs_var","status"])
+        self.m_recon2.set_df(view2)
+
+    def refresh_breaks(self):
+        b = self.breaks.copy()
+        st = self.cmb_break_status.currentText()
+        if st != "(All)" and not b.empty:
+            b = b[b["status"] == st].copy()
+
+        q = (self.ed_break_search.text() or "").strip().lower()
+        if q and not b.empty:
+            cols = ["break_id","account","product","root_cause","owner","status","severity"]
+            mask = False
+            for c in cols:
+                mask = mask | b[c].astype(str).str.lower().str.contains(q)
+            b = b[mask].copy()
+
+        # prioritize SLA risk then severity then magnitude
+        order = ["BREACHED","AT_RISK","ON_TRACK"]
+        if not b.empty:
+            b["sla_rank"] = b["sla_status"].apply(lambda x: order.index(x) if x in order else 9)
+            b = b.sort_values(["sla_rank","severity","abs_var"], ascending=[True, False, False]).drop(columns=["sla_rank"])
+        self.m_breaks.set_df(b)
+        self.refresh_timeline()
+
+    def refresh_timeline(self):
+        sel = self.tbl_breaks.selectionModel().selectedRows()
+        if not sel or self.m_breaks._df.empty:
+            self.m_timeline.set_df(pd.DataFrame(columns=["ts","user","action","details"]))
+            return
+        bid = self.m_breaks.get_row(sel[0].row()).get("break_id","")
+        a = self.audit[(self.audit["object_type"] == "BREAK") & (self.audit["object_id"] == bid)].copy()
+        self.m_timeline.set_df(a.sort_values("ts")[["ts","user","action","details"]].copy() if not a.empty else pd.DataFrame(columns=["ts","user","action","details"]))
+
+    def refresh_variance(self):
+        v = self.variance_pop()
+        view = v.head(50)[["account","account_name","product","cur","prior","variance","abs_var","severity"]].copy() if not v.empty else pd.DataFrame(columns=["account","account_name","product","cur","prior","variance","abs_var","severity"])
+        self.m_var.set_df(view)
+        self._selected_variance_key = None
+        self.lbl_var.setText("(Select a variance row)")
+        self.txt_var.setPlainText("")
+        if hasattr(self, "lbl_var_status"): self.lbl_var_status.setText("Status: —")
+        if hasattr(self, "chk_var_carry"): self.chk_var_carry.setChecked(True)
+
+    def refresh_reporting(self):
+        rep = self.cmb_report.currentText()
+        if rep == "STARE":
+            self.lbl_report.setText("Forecast / Stress Scenario view (not posted actuals)")
+        elif rep == "ERA":
+            self.lbl_report.setText("ERA (SCCL accountability) - actuals & recon governance")
+        else:
+            self.lbl_report.setText("Actual / posted balances reporting view")
+
+        lines, accs_by_line = self.report_lines(rep)
+        self._accs_by_line = accs_by_line
+        self.m_lines.set_df(lines[["report_line","line_desc","amount","recon_abs_var","recon_status","mapped_accounts"]] if not lines.empty else pd.DataFrame(columns=["report_line","line_desc","amount","recon_abs_var","recon_status","mapped_accounts"]))
+        self.m_drill.set_df(pd.DataFrame(columns=["account","account_name","product","amount"]))
+
+    def refresh_lineage(self):
+        self.m_map.set_df(self.data["map"].sort_values(["report","report_line","account"]).copy())
+        gl = self.gl_filtered()
+        accs = sorted(gl["account"].unique().tolist()) if not gl.empty else sorted(self.data["map"]["account"].unique().tolist())
+
+        self.cmb_acc.blockSignals(True)
+        self.cmb_acc.clear()
+        for a in accs:
+            self.cmb_acc.addItem(str(a))
+        self.cmb_acc.blockSignals(False)
+
+        if accs:
+            self.cmb_acc.setCurrentIndex(0)
+            self.refresh_lineage_side()
+
+    def refresh_lineage_side(self):
+        acc = (self.cmb_acc.currentText() or "").strip()
+        if not acc:
+            return
+        rel = self.data["map"][self.data["map"]["account"] == acc][["report","report_line","line_desc"]].drop_duplicates().copy()
+        self.m_rel.set_df(rel)
+
+        self.lbl_lineage.setText(
+            f"Account: {acc}\nEntity: {self.filters.legal_entity} | Book: {self.filters.book} | CCY: {self.filters.ccy} | As-of: {self.filters.as_of}\n\n"
+            "Lineage Path:\n"
+            "1) Source Systems: GL_CORE + SUBLEDGER_SOR\n"
+            "2) Enterprise GL Data Mart (governed)\n"
+            "3) CRRT (aggregation)\n"
+            "4) CR360 (consumer layer)\n"
+            "5) Outputs: FR2590, Y-9C, FR-Y, CCAR, CECL/ACL, STARE, ERA\n\n"
+            "Governance:\n"
+            "- DQ rules (completeness, timeliness, balancing)\n"
+            "- Maker/Checker for mapping changes\n"
+            "- Immutable audit trail"
+        )
+
+    def refresh_audit(self):
+        self.m_audit.set_df(self.audit.sort_values("ts", ascending=False).copy() if not self.audit.empty else pd.DataFrame(columns=["ts","user","action","object_type","object_id","details"]))
+        b = self.breaks.copy()
+        evid = b[b["evidence_ref"].astype(str).str.len() > 0][["break_id","as_of","recon_type","severity","status","evidence_ref","notes"]].copy() if not b.empty else pd.DataFrame(columns=["break_id","as_of","recon_type","severity","status","evidence_ref","notes"])
+        self.m_evid.set_df(evid)
+
+    # ---------- Actions
+    def create_largest_break(self):
+        if self.mode == "Auditor":
+            QMessageBox.information(self, "Read-only", "Auditor mode is read-only.")
+            return
+        recon = self.recon_gl_sor()
+        if recon.empty:
+            QMessageBox.warning(self, "No data", "No reconciliation data.")
+            return
+        row = recon.sort_values("abs_var", ascending=False).iloc[0].to_dict()
+        self.create_break_from_row(row, "GL vs SOR", "Created from dashboard")
+        QMessageBox.information(self, "Created", "Break created from largest variance.")
+
+    def create_breaks_from_selected(self):
+        if self.mode == "Auditor":
+            QMessageBox.information(self, "Read-only", "Auditor mode is read-only.")
+            return
+        sel = self.tbl_recon.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select rows", "Select reconciliation rows first.")
+            return
+        for s in sel:
+            self.create_break_from_row(self.m_recon.get_row(s.row()), "GL vs SOR", "")
+        QMessageBox.information(self, "Created", f"Created {len(sel)} break(s).")
+
+    def create_break_from_row(self, r: Dict[str, Any], recon_type: str, notes: str):
+        bid = new_id("BRK")
+        sla_days = 2 if recon_type == "GL vs SOR" else 1
+        age_days = 0
+        b = {
+            "break_id": bid,
+            "created_ts": now_str(),
+            "as_of": self.filters.as_of,
+            "recon_type": recon_type,
+            "legal_entity": self.filters.legal_entity,
+            "book": self.filters.book,
+            "ccy": self.filters.ccy,
+            "account": r.get("account",""),
+            "account_name": r.get("account_name",""),
+            "product": r.get("product",""),
+            "gl_amount": safe_float(r.get("gl_amount"), 0.0),
+            "other_amount": safe_float(r.get("sor_amount", r.get("cr360_amount", 0.0)), 0.0),
+            "variance": safe_float(r.get("variance"), 0.0),
+            "abs_var": abs(safe_float(r.get("variance"), 0.0)),
+            "severity": severity_from_amt(r.get("variance"), self.filters.materiality),
+            "root_cause": "UNCLASSIFIED",
+            "owner": "Recon Analyst",
+            "status": "OPEN",
+            "sla_days": sla_days,
+            "age_days": age_days,
+            "sla_status": sla_status(age_days, sla_days),
+            "notes": notes,
+            "evidence_ref": "",
+        }
+        self.breaks = pd.concat([self.breaks, pd.DataFrame([b])], ignore_index=True)
+        self.log("CREATE", "BREAK", bid, f"{recon_type} | {b['account']} {b['product']} | var={fmt_big(b['variance'])}")
+        self.refresh_breaks()
+        self.refresh_dashboard()
+        self.refresh_audit()
+
+    def open_break(self):
+        sel = self.tbl_breaks.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select break", "Select a break first.")
+            return
+        bid = self.m_breaks.get_row(sel[0].row()).get("break_id","")
+        idxs = self.breaks.index[self.breaks["break_id"] == bid]
+        if len(idxs) == 0:
+            return
+        row = self.breaks.loc[idxs[0]].to_dict()
+        dlg = BreakDialog(row, read_only=(self.mode == "Auditor"), parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            for k, v in dlg.row.items():
+                if k in self.breaks.columns:
+                    self.breaks.loc[idxs[0], k] = v
+            self.log("UPDATE", "BREAK", bid, f"status={dlg.row.get('status')} root={dlg.row.get('root_cause')}")
+            self.refresh_breaks()
+            self.refresh_dashboard()
+            self.refresh_audit()
+
+    def on_var_selected(self, idx: QModelIndex):
+        r = self.m_var.get_row(idx.row())
+        acc = str(r.get("account",""))
+        prod = str(r.get("product",""))
+        cur_key = f"{acc}|{prod}|{self.filters.as_of}|{self.filters.legal_entity}|{self.filters.book}|{self.filters.ccy}"
+        self._selected_variance_key = cur_key
+
+        self.lbl_var.setText(f"{acc} | {prod} | abs_var={fmt_money(r.get('abs_var',0.0))}")
+
+        # Load existing explanation (current close) if present
+        existing = self.variance_expl[self.variance_expl["key"] == cur_key].copy()
+        if not existing.empty:
+            ex = existing.iloc[0].to_dict()
+            # best-effort set reason if it exists in list
+            reason = str(ex.get("reason",""))
+            if reason:
+                self.cmb_reason.setCurrentText(reason) if reason in [self.cmb_reason.itemText(i) for i in range(self.cmb_reason.count())] else None
+            self.txt_var.setPlainText(str(ex.get("narrative","")))
+            if hasattr(self, "chk_var_carry"):
+                self.chk_var_carry.setChecked(bool(ex.get("carry_forward", True)))
+            if hasattr(self, "lbl_var_status"):
+                self.lbl_var_status.setText(f"Status: {ex.get('status','DRAFT')}")
+            return
+
+        # No current explanation; optionally auto-fill from prior close for user to review
+        self.txt_var.setPlainText("")
+        if hasattr(self, "chk_var_autofill") and self.chk_var_autofill.isChecked():
+            prior_key = f"{acc}|{prod}|{self.data['prior']}|{self.filters.legal_entity}|{self.filters.book}|{self.filters.ccy}"
+            prior = self.variance_expl[self.variance_expl["key"] == prior_key].copy()
+            if not prior.empty:
+                ex = prior.iloc[0].to_dict()
+                reason = str(ex.get("reason",""))
+                if reason:
+                    self.cmb_reason.setCurrentText(reason) if reason in [self.cmb_reason.itemText(i) for i in range(self.cmb_reason.count())] else None
+                self.txt_var.setPlainText(str(ex.get("narrative","")))
+                if hasattr(self, "chk_var_carry"):
+                    self.chk_var_carry.setChecked(bool(ex.get("carry_forward", True)))
+                if hasattr(self, "lbl_var_status"):
+                    self.lbl_var_status.setText("Status: —")
+                self.status.showMessage("Loaded prior-close explanation for preview (not saved).", 4500)
+
+    def save_var_expl(self):
+        """
+        Save Draft (Maker): captures explained variance + carry-forward flag.
+        Workflow: DRAFT → SUBMITTED → APPROVED/REJECTED
+        """
+        if self.mode != "Maker":
+            QMessageBox.information(self, "Not permitted", "Only Maker can save/edit narratives.")
+            return
+        if not self._selected_variance_key:
+            QMessageBox.information(self, "Select variance", "Select a variance row first.")
+            return
+
+        narrative = (self.txt_var.toPlainText() or "").strip()
+        if not narrative:
+            QMessageBox.warning(self, "Narrative required", "Enter an explanation narrative.")
+            return
+
+        existing = self.variance_expl[self.variance_expl["key"] == self._selected_variance_key].copy()
+        if not existing.empty:
+            st = str(existing.iloc[0].get("status","DRAFT"))
+            if st in ("SUBMITTED","APPROVED"):
+                QMessageBox.warning(self, "Locked", f"Item is {st}. Maker cannot edit unless it is rejected or recalled.")
+                return
+
+        now = now_str()
+        row = {
+            "key": self._selected_variance_key,
+            "as_of": self.filters.as_of,
+            "legal_entity": self.filters.legal_entity,
+            "book": self.filters.book,
+            "ccy": self.filters.ccy,
+            "reason": self.cmb_reason.currentText(),
+            "narrative": narrative,
+            "carry_forward": bool(self.chk_var_carry.isChecked()) if hasattr(self, "chk_var_carry") else True,
+            "status": "DRAFT",
+            "maker": self.current_user,
+            "ts_created": (existing.iloc[0].get("ts_created") if not existing.empty else now),
+            "ts_updated": now,
+            "submitted_ts": (existing.iloc[0].get("submitted_ts") if not existing.empty else ""),
+            "checker": (existing.iloc[0].get("checker") if not existing.empty else ""),
+            "approved_ts": (existing.iloc[0].get("approved_ts") if not existing.empty else ""),
+            "decision_notes": (existing.iloc[0].get("decision_notes") if not existing.empty else ""),
+        }
+
+        self.variance_expl = self.variance_expl[self.variance_expl["key"] != self._selected_variance_key]
+        self.variance_expl = pd.concat([self.variance_expl, pd.DataFrame([row])], ignore_index=True)
+        if hasattr(self, "lbl_var_status"): self.lbl_var_status.setText("Status: DRAFT")
+
+        self.log("SAVE_DRAFT", "VARIANCE", self._selected_variance_key, f"reason={row['reason']}; carry={row['carry_forward']}; narrative={narrative[:200]}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Saved", "Draft saved and audit logged.")
+
+    def submit_var_expl(self):
+        if self.mode != "Maker":
+            QMessageBox.information(self, "Not permitted", "Only Maker can submit.")
+            return
+        if not self._selected_variance_key:
+            QMessageBox.information(self, "Select variance", "Select a variance row first.")
+            return
+        ex = self.variance_expl[self.variance_expl["key"] == self._selected_variance_key].copy()
+        if ex.empty:
+            QMessageBox.warning(self, "No draft", "Save a draft first.")
+            return
+        st = str(ex.iloc[0].get("status","DRAFT"))
+        if st != "DRAFT":
+            QMessageBox.warning(self, "Wrong status", f"Only DRAFT can be submitted. Current: {st}")
+            return
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "status"] = "SUBMITTED"
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "submitted_ts"] = now_str()
+        if hasattr(self, "lbl_var_status"): self.lbl_var_status.setText("Status: SUBMITTED")
+        self.log("SUBMIT", "VARIANCE", self._selected_variance_key, "Submitted for approval")
+        self.refresh_audit()
+        QMessageBox.information(self, "Submitted", "Submitted to Checker.")
+
+    def approve_var_expl(self):
+        if self.mode != "Checker":
+            QMessageBox.information(self, "Not permitted", "Only Checker can approve.")
+            return
+        if not self._selected_variance_key:
+            QMessageBox.information(self, "Select variance", "Select a variance row first.")
+            return
+        ex = self.variance_expl[self.variance_expl["key"] == self._selected_variance_key].copy()
+        if ex.empty:
+            QMessageBox.warning(self, "No item", "No explanation found.")
+            return
+        st = str(ex.iloc[0].get("status",""))
+        if st != "SUBMITTED":
+            QMessageBox.warning(self, "Wrong status", f"Only SUBMITTED can be approved. Current: {st}")
+            return
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "status"] = "APPROVED"
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "checker"] = self.current_user
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "approved_ts"] = now_str()
+        if hasattr(self, "lbl_var_status"): self.lbl_var_status.setText("Status: APPROVED")
+        self.log("APPROVE", "VARIANCE", self._selected_variance_key, f"Approved by {self.current_user}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Approved", "Explanation approved.")
+
+    def reject_var_expl(self):
+        if self.mode != "Checker":
+            QMessageBox.information(self, "Not permitted", "Only Checker can reject.")
+            return
+        if not self._selected_variance_key:
+            QMessageBox.information(self, "Select variance", "Select a variance row first.")
+            return
+        ex = self.variance_expl[self.variance_expl["key"] == self._selected_variance_key].copy()
+        if ex.empty:
+            QMessageBox.warning(self, "No item", "No explanation found.")
+            return
+        st = str(ex.iloc[0].get("status",""))
+        if st != "SUBMITTED":
+            QMessageBox.warning(self, "Wrong status", f"Only SUBMITTED can be rejected. Current: {st}")
+            return
+        note, ok = QInputDialog.getText(self, "Reject explanation", "Reason / notes (required):")
+        if not ok or not (note or "").strip():
+            return
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "status"] = "REJECTED"
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "checker"] = self.current_user
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "approved_ts"] = now_str()
+        self.variance_expl.loc[self.variance_expl["key"] == self._selected_variance_key, "decision_notes"] = note.strip()
+        if hasattr(self, "lbl_var_status"): self.lbl_var_status.setText("Status: REJECTED")
+        self.log("REJECT", "VARIANCE", self._selected_variance_key, f"{self.current_user}: {note.strip()[:200]}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Rejected", "Explanation rejected and returned to Maker.")
+
+    def bulk_rollover_var(self):
+        """
+        Bulk create drafts for current close from PRIOR close explanations where:
+          - status == APPROVED
+          - carry_forward == True
+          - current key does not exist
+        """
+        if self.mode != "Maker":
+            QMessageBox.information(self, "Not permitted", "Only Maker can run bulk rollover.")
+            return
+
+        prior_asof = self.data["prior"]
+        cur_asof = self.filters.as_of
+        prior = self.variance_expl[
+            (self.variance_expl["as_of"] == prior_asof) &
+            (self.variance_expl["status"] == "APPROVED") &
+            (self.variance_expl["carry_forward"] == True)
+        ].copy()
+
+        if prior.empty:
+            QMessageBox.information(self, "Nothing to rollover", "No prior approved carry-forward explanations found.")
+            return
+
+        created = 0
+        now = now_str()
+        for _, r in prior.iterrows():
+            key = str(r["key"])
+            parts = key.split("|")
+            if len(parts) < 6:
+                continue
+            acc, prod, _, le, book, ccy = parts[:6]
+            new_key = f"{acc}|{prod}|{cur_asof}|{le}|{book}|{ccy}"
+            if not self.variance_expl[self.variance_expl["key"] == new_key].empty:
+                continue
+            row = r.to_dict()
+            row.update({
+                "key": new_key,
+                "as_of": cur_asof,
+                "status": "DRAFT",
+                "maker": self.current_user,
+                "ts_created": now,
+                "ts_updated": now,
+                "submitted_ts": "",
+                "checker": "",
+                "approved_ts": "",
+                "decision_notes": "",
+            })
+            self.variance_expl = pd.concat([self.variance_expl, pd.DataFrame([row])], ignore_index=True)
+            created += 1
+
+        self.log("BULK_ROLLOVER", "VARIANCE", str(cur_asof), f"Created {created} draft explanations from prior carry-forward")
+        self.refresh_audit()
+        QMessageBox.information(self, "Bulk rollover complete", f"Created {created} draft explanations for current close.")
+
+    def rollover_var_expl(self):
+        """User-controlled rollover: copy prior-close explanation text into the editor for review."""
+        if not self._selected_variance_key:
+            QMessageBox.information(self, "Select variance", "Select a variance row first.")
+            return
+
+        # current key includes current as-of; derive prior key by swapping date token
+        parts = self._selected_variance_key.split("|")
+        if len(parts) < 6:
+            QMessageBox.warning(self, "Key error", "Unexpected variance key format.")
+            return
+
+        acc, prod, _, le, book, ccy = parts[:6]
+        prior_key = f"{acc}|{prod}|{self.data['prior']}|{le}|{book}|{ccy}"
+        prior = self.variance_expl[self.variance_expl["key"] == prior_key].copy()
+        if prior.empty:
+            QMessageBox.information(self, "No prior explanation", "No prior-close explanation found for this slice.")
+            return
+
+        ex = prior.iloc[0].to_dict()
+        reason = str(ex.get("reason",""))
+        if reason:
+            # set current reason if available
+            if reason in [self.cmb_reason.itemText(i) for i in range(self.cmb_reason.count())]:
+                self.cmb_reason.setCurrentText(reason)
+        self.txt_var.setPlainText(str(ex.get("narrative","")))
+        if hasattr(self, "chk_var_carry"):
+            self.chk_var_carry.setChecked(bool(ex.get("carry_forward", True)))
+        self.status.showMessage("Prior explanation rolled into editor (preview). Click 'Save Draft' to persist for current close.", 5500)
+
+    def build_narrative(self):
+        rep = self.cmb_report.currentText()
+        rating, score, meta = self.confidence()
+        feeds_today = self.data["feed"][self.data["feed"]["as_of"] == self.filters.as_of].copy()
+        late = feeds_today[feeds_today["status"].isin(["LATE","FAILED"])][["source","status","latency_min","rejects"]].copy()
+
+        ex = self.variance_expl[
+            (self.variance_expl["as_of"] == self.filters.as_of) &
+            (self.variance_expl["legal_entity"] == self.filters.legal_entity) &
+            (self.variance_expl["book"] == self.filters.book) &
+            (self.variance_expl["ccy"] == self.filters.ccy)
+        ].copy()
+
+        b = self.breaks.copy()
+        open_b = b[b["status"].isin(["OPEN","IN REVIEW"])].copy() if not b.empty else pd.DataFrame()
+
+        lines: List[str] = []
+        lines.append("Regulatory / Close Narrative Draft")
+        lines.append(f"As-of: {self.filters.as_of} | Entity: {self.filters.legal_entity} | Book: {self.filters.book} | CCY: {self.filters.ccy}")
+        lines.append(f"Report Context: {rep}")
+        lines.append("")
+        lines.append("1) Overall Confidence")
+        lines.append(f"- Rating: {rating} (Score: {score}/100)")
+        lines.append(f"- Material breaks (detected): {meta['material_breaks']} | SLA breaches: {meta['sla_breaches']} | Late feeds: {meta['late_feeds']} | Rejects: {meta['rejects']}")
+        lines.append("")
+        lines.append("2) Timeliness & Data Quality (BCBS239)")
+        if late.empty:
+            lines.append("- All critical feeds met SLA.")
+        else:
+            lines.append("- Exceptions observed:")
+            for _, r in late.iterrows():
+                lines.append(f"  • {r['source']}: {r['status']} (latency {int(r['latency_min'])} min, rejects {int(r['rejects'])})")
+        lines.append("")
+        lines.append("3) Reconciliation Exceptions")
+        if open_b.empty:
+            lines.append("- No open breaks; reconciliation within tolerance.")
+        else:
+            lines.append(f"- Open breaks: {len(open_b)}")
+            top = open_b.sort_values("abs_var", ascending=False).head(5)
+            for _, r in top.iterrows():
+                lines.append(f"  • {r['break_id']} | {r['account']} {r.get('product','')} | abs_var {fmt_big(r['abs_var'])} | root {r['root_cause']} | SLA {r['sla_status']}")
+        lines.append("")
+        lines.append("4) Explainability Drivers")
+        if ex.empty:
+            lines.append("- No saved variance explanations for this slice.")
+        else:
+            for _, r in ex.sort_values("ts").iterrows():
+                lines.append(f"  • {r['reason']}: {r['narrative']}")
+        lines.append("")
+        lines.append("5) Governance & Controls")
+        lines.append("- All actions are audit logged (break lifecycle, certifications, incidents).")
+        lines.append("- Mapping changes require justification and maker-checker approval.")
+        lines.append("- Auditor mode provides read-only access.")
+        self.txt_narr.setPlainText("\n".join(lines))
+
+    def on_line_selected(self, idx: QModelIndex):
+        r = self.m_lines.get_row(idx.row())
+        line = r.get("report_line","")
+        if not line:
+            return
+        accs = self._accs_by_line.get(line, [])
+        gl = self.gl_filtered()
+        if gl.empty or not accs:
+            self.m_drill.set_df(pd.DataFrame(columns=["account","account_name","product","amount"]))
+            return
+        drill = gl[gl["account"].isin(accs)].groupby(["account","account_name","product"], as_index=False).agg(amount=("gl_amount","sum"))
+        self.m_drill.set_df(drill.sort_values("amount", ascending=False))
+
+    def impact_preview(self):
+        sel = self.tbl_lines.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select line", "Select a report line first.")
+            return
+        r = self.m_lines.get_row(sel[0].row())
+        line = r.get("report_line","")
+        rep = self.cmb_report.currentText()
+        accs = self._accs_by_line.get(line, [])
+        dlg = ImpactPreview(rep, line, accs, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.proposed:
+            cid = new_id("CHG")
+            self.log("PROPOSE", "MAPPING_CHANGE", cid, f"report={rep} line={line} accs={accs} just='{dlg.justification}'")
+            self.refresh_audit()
+            QMessageBox.information(self, "Proposed", f"Change proposed and audit logged: {cid}")
+
+    def certify_line(self):
+        if self.mode == "Auditor":
+            QMessageBox.information(self, "Read-only", "Auditor mode is read-only.")
+            return
+        sel = self.tbl_lines.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select line", "Select a line to certify.")
+            return
+        r = self.m_lines.get_row(sel[0].row())
+        line = r.get("report_line","")
+        rep = self.cmb_report.currentText()
+        self.log("CERTIFY", "REPORT_LINE", f"{rep}-{line}", f"Certified as_of={self.filters.as_of}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Certified", "Certified (audit logged).")
+
+    def lock_report(self):
+        if self.mode == "Auditor":
+            QMessageBox.information(self, "Read-only", "Auditor mode is read-only.")
+            return
+        rep = self.cmb_report.currentText()
+        self.log("LOCK", "REPORT", rep, f"Locked as_of={self.filters.as_of}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Locked", "Locked (audit logged).")
+
+    def rerun_feed(self):
+        if self.mode == "Auditor":
+            QMessageBox.information(self, "Read-only", "Auditor mode is read-only.")
+            return
+        src = (self.cmb_feed.currentText() or "").strip()
+        if not src:
+            return
+        self.log("RERUN", "FEED", src, f"Rerun requested as_of={self.filters.as_of}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Logged", "Rerun request logged.")
+
+    def create_incident(self):
+        if self.mode == "Auditor":
+            QMessageBox.information(self, "Read-only", "Auditor mode is read-only.")
+            return
+        src = (self.cmb_feed.currentText() or "").strip() or "(none)"
+        inc = new_id("INC")
+        self.log("CREATE", "INCIDENT", inc, f"Incident for feed={src} as_of={self.filters.as_of}")
+        self.refresh_audit()
+        QMessageBox.information(self, "Incident", f"Incident created: {inc}")
+
+    def copy_exec_summary(self):
+        rating, score, meta = self.confidence()
+        txt = (
+            "Executive Summary\n"
+            f"As-of: {self.filters.as_of} | Entity: {self.filters.legal_entity} | Book: {self.filters.book} | CCY: {self.filters.ccy}\n"
+            f"Confidence: {rating} ({score}/100)\n"
+            f"Material breaks: {meta['material_breaks']} | SLA breaches: {meta['sla_breaches']} | Late feeds: {meta['late_feeds']} | Rejects: {meta['rejects']}\n"
+        )
+        QGuiApplication.clipboard().setText(txt)
+        QMessageBox.information(self, "Copied", "Executive summary copied to clipboard.")
+
+    def reset_demo(self):
+        self.data = seed_data()
+        self.breaks = self.breaks.iloc[0:0].copy()
+        self.audit = self.audit.iloc[0:0].copy()
+        self.variance_expl = self.variance_expl.iloc[0:0].copy()
+        self.refresh_all()
+        QMessageBox.information(self, "Reset", "Demo reset completed.")
+
+    def advance_aging(self):
+        if self.breaks.empty:
+            QMessageBox.information(self, "Nothing to age", "No breaks exist yet.")
+            return
+        self.breaks["age_days"] = self.breaks["age_days"].apply(lambda x: int(x) + 1)
+        self.breaks["sla_status"] = self.breaks.apply(lambda r: sla_status(int(r["age_days"]), int(r["sla_days"])), axis=1)
+        self.log("SIMULATE", "SYSTEM", "AGING+1", "Advanced break aging by 1 day")
+        self.refresh_all()
+
+    def export_current_table(self):
+        if self.mode == "Auditor":
+            # auditors can still export in many orgs, but keep it strict here
+            QMessageBox.information(self, "Read-only", "Export disabled in Auditor mode for this prototype.")
+            return
+
+        # map current page to primary table/model
+        idx = self.stack.currentIndex()
+        mapping = {
+            0: ("dashboard_top_breaks.csv", self.m_top._df),
+            1: ("feeds.csv", self.m_feed._df),
+            2: ("gl_explorer.csv", self.m_gl._df),
+            3: ("recon.csv", self.m_recon._df),
+            4: ("variance.csv", self.m_var._df),
+            5: ("report_lines.csv", self.m_lines._df),
+            6: ("mapping.csv", self.m_map._df),
+            7: ("audit.csv", self.m_audit._df),
+        }
+        default_name, df = mapping.get(idx, ("export.csv", pd.DataFrame()))
+        if df is None or df.empty:
+            QMessageBox.information(self, "Nothing to export", "Current view has no rows.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", default_name, "CSV Files (*.csv)")
+        if not path:
+            return
+        df.to_csv(path, index=False)
+        self.log("EXPORT", "CSV", path, f"rows={len(df)}")
+        QMessageBox.information(self, "Exported", f"Saved: {path}")
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
+
+def main():
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
